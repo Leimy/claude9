@@ -1,0 +1,402 @@
+--- json.c
++++ json.c
+@@ -1,7 +1,10 @@
+ #include <u.h>
+ #include <libc.h>
+ #include "json.h"
+ 
+ static Json*	parseval(char**);
++static int	parseu4(char*, Rune*);
++static int	fmtjstr(Fmt*, char*);
++static int	isdelim(int);
+ 
+ static char*
+ skip(char *p)
+@@ -36,75 +39,108 @@
+ 	return -1;
+ }
+ 
++static int
++parseu4(char *p, Rune *rp)
++{
++	int i, h;
++	Rune r;
++
++	r = 0;
++	for(i = 0; i < 4; i++){
++		if(p[i] == '\0')
++			return -1;
++		h = hexval(p[i]);
++		if(h < 0)
++			return -1;
++		r = (r << 4) | h;
++	}
++	*rp = r;
++	return 0;
++}
++
+ static char*
+ parsestr(char **pp)
+ {
+ 	char *p, *q, *w, *s;
+-	int n, h, i;
+ 	Rune r, r2;
+ 
+ 	p = skip(*pp);
+ 	if(*p != '"'){
+ 		werrstr("expected '\"'");
+ 		return nil;
+ 	}
+ 	p++;
+ 
+-	/* first pass: compute length */
+-	n = 0;
+-	for(q = p; *q && *q != '"'; q++){
+-		if(*q == '\\'){
+-			q++;
+-			if(*q == 'u'){
+-				q += 4;
+-			}
+-		}
+-		n++;
+-	}
+-	if(*q != '"'){
+-		werrstr("unterminated string");
+-		return nil;
+-	}
+-
+-	s = malloc(n * UTFmax + 1);
++	/*
++	 * Safe upper bound: decoded output cannot exceed the remaining
++	 * bytes of input starting at p.
++	 */
++	s = malloc(strlen(p) + 1);
+ 	if(s == nil)
+ 		sysfatal("malloc: %r");
+ 
+-	/* second pass: decode */
+ 	w = s;
+-	for(q = p; *q != '"'; q++){
++	for(q = p; *q != '\0' && *q != '"'; ){
++		if((uchar)*q < 0x20){
++			free(s);
++			werrstr("unescaped control character in string");
++			return nil;
++		}
+ 		if(*q == '\\'){
+ 			q++;
++			if(*q == '\0'){
++				free(s);
++				werrstr("unterminated escape");
++				return nil;
++			}
+ 			switch(*q){
+ 			case '"': case '\\': case '/':
+ 				*w++ = *q;
++				q++;
+ 				break;
+-			case 'b': *w++ = '\b'; break;
+-			case 'f': *w++ = '\f'; break;
+-			case 'n': *w++ = '\n'; break;
+-			case 'r': *w++ = '\r'; break;
+-			case 't': *w++ = '\t'; break;
++			case 'b':
++				*w++ = '\b';
++				q++;
++				break;
++			case 'f':
++				*w++ = '\f';
++				q++;
++				break;
++			case 'n':
++				*w++ = '\n';
++				q++;
++				break;
++			case 'r':
++				*w++ = '\r';
++				q++;
++				break;
++			case 't':
++				*w++ = '\t';
++				q++;
++				break;
+ 			case 'u':
+-				r = 0;
+-				for(i = 0; i < 4; i++){
+-					h = hexval(q[1+i]);
+-					if(h < 0){
+-						free(s);
+-						werrstr("bad \\u escape");
+-						return nil;
+-					}
+-					r = r*16 + h;
+-				}
+-				q += 4;
+-				/* surrogate pair */
+-				if(0xD800 <= r && r <= 0xDBFF && q[1] == '\\' && q[2] == 'u'){
+-					r2 = 0;
+-					for(i = 0; i < 4; i++){
+-						h = hexval(q[3+i]);
+-						if(h < 0) break;
+-						r2 = r2*16 + h;
+-					}
+-					if(0xDC00 <= r2 && r2 <= 0xDFFF){
+-						r = 0x10000 + ((r - 0xD800) << 10) + (r2 - 0xDC00);
+-						q += 6;
++				if(parseu4(q+1, &r) < 0){
++					free(s);
++					werrstr("bad \\u escape");
++					return nil;
++				}
++				q += 5;	/* skip 'u' and 4 hex digits */
++				if(0xD800 <= r && r <= 0xDBFF){
++					if(q[0] != '\\' || q[1] != 'u' ||
++					   parseu4(q+2, &r2) < 0 ||
++					   r2 < 0xDC00 || r2 > 0xDFFF){
++						free(s);
++						werrstr("bad surrogate pair");
++						return nil;
+ 					}
++					r = 0x10000 + ((r - 0xD800) << 10) + (r2 - 0xDC00);
++					q += 6;	/* skip \uXXXX of low surrogate */
++				}else if(0xDC00 <= r && r <= 0xDFFF){
++					free(s);
++					werrstr("lone low surrogate");
++					return nil;
+ 				}
+ 				w += runetochar(w, &r);
+ 				break;
+ 			default:
+-				*w++ = *q;
+-				break;
++				free(s);
++				werrstr("bad escape");
++				return nil;
+ 			}
+-		} else
+-			*w++ = *q;
++		}else
++			*w++ = *q++;
++	}
++	if(*q != '"'){
++		free(s);
++		werrstr("unterminated string");
++		return nil;
+ 	}
+ 	*w = '\0';
+ 	*pp = q + 1;
+@@ -113,13 +149,22 @@
+ static Json*
+ parsenum(char **pp)
+ {
+-	char *p, *e;
++	char *p, *e, *buf;
+ 	Json *j;
+ 	int isfloat;
+ 
+ 	p = skip(*pp);
+ 	isfloat = 0;
+ 	e = p;
++
+ 	if(*e == '-')
+ 		e++;
+-	while(*e >= '0' && *e <= '9')
++
++	if(*e == '0'){
++		e++;
++		if(*e >= '0' && *e <= '9'){
++			werrstr("bad number");
++			return nil;
++		}
++	}else if(*e >= '1' && *e <= '9'){
++		while(*e >= '0' && *e <= '9')
++			e++;
++	}else{
++		werrstr("bad number");
++		return nil;
++	}
++
++	if(*e == '.'){
++		isfloat = 1;
+ 		e++;
+-	if(*e == '.'){
+-		isfloat = 1;
+-		e++;
++		if(!(*e >= '0' && *e <= '9')){
++			werrstr("bad number");
++			return nil;
++		}
+ 		while(*e >= '0' && *e <= '9')
+ 			e++;
+ 	}
+@@ -129,18 +174,30 @@
+ 		e++;
+ 		if(*e == '+' || *e == '-')
+ 			e++;
++		if(!(*e >= '0' && *e <= '9')){
++			werrstr("bad number");
++			return nil;
++		}
+ 		while(*e >= '0' && *e <= '9')
+ 			e++;
+ 	}
+-	if(e == p || (e == p+1 && *p == '-')){
++
++	if(!isdelim(*e)){
+ 		werrstr("bad number");
+ 		return nil;
+ 	}
++
++	buf = malloc(e - p + 1);
++	if(buf == nil)
++		sysfatal("malloc: %r");
++	memmove(buf, p, e - p);
++	buf[e - p] = '\0';
++
+ 	if(isfloat){
+ 		j = mkjson(Jreal);
+-		j->fval = strtod(p, nil);
++		j->fval = strtod(buf, nil);
+ 	} else {
+ 		j = mkjson(Jint);
+-		j->ival = strtoll(p, nil, 10);
++		j->ival = strtoll(buf, nil, 10);
+ 	}
++	free(buf);
+ 	*pp = e;
+ 	return j;
+ }
+@@ -227,6 +284,13 @@
+ 	}
+ }
+ 
++static int
++isdelim(int c)
++{
++	return c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
++	       c == ',' || c == ']' || c == '}';
++}
++
+ static Json*
+ parseval(char **pp)
+ {
+@@ -245,21 +309,21 @@
+ 	case '[':
+ 		return parsearray(pp);
+ 	case 't':
+-		if(strncmp(p, "true", 4) == 0){
++		if(strncmp(p, "true", 4) == 0 && isdelim(p[4])){
+ 			*pp = p + 4;
+ 			j = mkjson(Jbool);
+ 			j->ival = 1;
+ 			return j;
+ 		}
+ 		break;
+ 	case 'f':
+-		if(strncmp(p, "false", 5) == 0){
++		if(strncmp(p, "false", 5) == 0 && isdelim(p[5])){
+ 			*pp = p + 5;
+ 			j = mkjson(Jbool);
+ 			j->ival = 0;
+ 			return j;
+ 		}
+ 		break;
+ 	case 'n':
+-		if(strncmp(p, "null", 4) == 0){
++		if(strncmp(p, "null", 4) == 0 && isdelim(p[4])){
+ 			*pp = p + 4;
+ 			return mkjson(Jnull);
+ 		}
+@@ -277,10 +341,46 @@
+ Json*
+ jsonparse(char *s)
+ {
+ 	char *p;
++	Json *j;
+ 
+ 	p = s;
+-	return parseval(&p);
++	j = parseval(&p);
++	if(j == nil)
++		return nil;
++	p = skip(p);
++	if(*p != '\0'){
++		jsonfree(j);
++		werrstr("trailing garbage");
++		return nil;
++	}
++	return j;
++}
++
++static int
++fmtjstr(Fmt *f, char *s)
++{
++	Rune r;
++	int n;
++
++	fmtrune(f, '"');
++	while(*s){
++		n = chartorune(&r, s);
++		if(n <= 0)
++			break;
++		switch(r){
++		case '"':  fmtprint(f, "\\\""); break;
++		case '\\': fmtprint(f, "\\\\"); break;
++		case '\b': fmtprint(f, "\\b"); break;
++		case '\f': fmtprint(f, "\\f"); break;
++		case '\n': fmtprint(f, "\\n"); break;
++		case '\r': fmtprint(f, "\\r"); break;
++		case '\t': fmtprint(f, "\\t"); break;
++		default:
++			if(r < 0x20)
++				fmtprint(f, "\\u%04x", (uint)r);
++			else
++				fmtrune(f, r);
++			break;
++		}
++		s += n;
++	}
++	return fmtrune(f, '"');
+ }
+ 
+ /* access helpers */
+@@ -419,21 +519,7 @@
+ 	case Jreal:
+ 		return fmtprint(f, "%g", j->fval);
+ 	case Jstring:
+-		/* escape the string properly */
+-		fmtrune(f, '"');
+-		for(i = 0; j->str[i]; i++){
+-			switch(j->str[i]){
+-			case '"':  fmtprint(f, "\\\""); break;
+-			case '\\': fmtprint(f, "\\\\"); break;
+-			case '\b': fmtprint(f, "\\b"); break;
+-			case '\f': fmtprint(f, "\\f"); break;
+-			case '\n': fmtprint(f, "\\n"); break;
+-			case '\r': fmtprint(f, "\\r"); break;
+-			case '\t': fmtprint(f, "\\t"); break;
+-			default:
+-				if((uchar)j->str[i] < 0x20)
+-					fmtprint(f, "\\u%04x", (uchar)j->str[i]);
+-				else
+-					fmtrune(f, j->str[i]);
+-				break;
+-			}
+-		}
+-		return fmtrune(f, '"');
++		return fmtjstr(f, j->str);
+ 	case Jarray:
+ 		fmtrune(f, '[');
+ 		for(i = 0; i < j->nitem; i++){
+@@ -446,10 +532,7 @@
+ 		for(i = 0; i < j->nitem; i++){
+ 			if(i > 0)
+ 				fmtrune(f, ',');
+-			/* key */
+-			fmtrune(f, '"');
+-			fmtprint(f, "%s", j->names[i]);
+-			fmtrune(f, '"');
++			fmtjstr(f, j->names[i]);
+ 			fmtrune(f, ':');
+ 			jsonfmt(j->items[i], f);
+ 		}
