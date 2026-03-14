@@ -589,49 +589,90 @@ jset(Json *obj, char *name, Json *val)
 /* JSON serialization using Fmt */
 static int jsonprint(Fmt*);
 
+const char *hexdigits="0123456789abcdef";
+
 static int
 fmtjstr(Fmt *f, char *s)
 {
-	Rune r;
-	int n;
+    int extra = 0;
+    char *p;
 
-	fmtrune(f, '"');
-	while(*s){
-		n = chartorune(&r, s);
-		if(n <= 0)
-			break;
-		switch(r){
-		case '"':
-			fmtprint(f, "\\\"");
-			break;
-		case '\\':
-			fmtprint(f, "\\\\");
-			break;
-		case '\b':
-			fmtprint(f, "\\b");
-			break;
-		case '\f':
-			fmtprint(f, "\\f");
-			break;
-		case '\n':
-			fmtprint(f, "\\n");
-			break;
-		case '\r':
-			fmtprint(f, "\\r");
-			break;
-		case '\t':
-			fmtprint(f, "\\t");
-			break;
-		default:
-			if(r < 0x20)
-				fmtprint(f, "\\u%04x", (uint)r);
-			else
-				fmtrune(f, r);
-			break;
-		}
-		s += n;
-	}
-	return fmtrune(f, '"');
+    for (p = s; *p; p++) {
+        switch (*p) {
+        case '"':
+        case '\\':
+        case '\b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+            extra += 1;	/* \X is 2 bytes, original is 1, so 1 extra */
+            break;
+        default:
+            if (*p < 0x20) {
+                extra += 5;	/* \u00XX is 6 bytes, original is 1, so 5 extra */
+            }
+            break;
+        }
+    }
+
+    int len = p - s;
+    char *buf = malloc(len + extra + 3);	/* +3 for two quotes and NUL */
+    if (buf == nil)
+        sysfatal("malloc: %r");
+
+    char *q = buf;
+    *q++ = '"';
+    for (p = s; *p; p++) {
+        switch (*p) {
+        case '"':
+            *q++ = '\\';
+            *q++ = '"';
+            break;
+        case '\\':
+            *q++ = '\\';
+            *q++ = '\\';
+            break;
+        case '\b':
+            *q++ = '\\';
+            *q++ = 'b';
+            break;
+        case '\f':
+            *q++ = '\\';
+            *q++ = 'f';
+            break;
+        case '\n':
+            *q++ = '\\';
+            *q++ = 'n';
+            break;
+        case '\r':
+            *q++ = '\\';
+            *q++ = 'r';
+            break;
+        case '\t':
+            *q++ = '\\';
+            *q++ = 't';
+            break;
+        default:
+            if (*p < 0x20) {
+                *q++ = '\\';
+                *q++ = 'u';
+                *q++ = '0';
+                *q++ = '0';
+                *q++ = hexdigits[(*p >> 4) & 0xF];
+                *q++ = hexdigits[*p & 0xF];
+            } else {
+                *q++ = *p;
+            }
+            break;
+        }
+    }
+    *q++ = '"';
+    *q = '\0';
+
+    int result = fmtprint(f, "%s", buf);
+    free(buf);
+    return result;
 }
 
 static int
@@ -687,13 +728,11 @@ jsonprint(Fmt *f)
 char*
 jsonstr(Json *j)
 {
-	static int installed;
+	Fmt f;
 
-	if(!installed){
-		fmtinstall('J', jsonprint);
-		installed = 1;
-	}
-	return smprint("%J", j);
+	fmtstrinit(&f);
+	jsonfmt(j, &f);
+	return fmtstrflush(&f);
 }
 
 void
