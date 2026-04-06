@@ -2,12 +2,9 @@ P9=$PLAN9
 
 <$P9/src/mkhdr
 
-TARG=claude9
+ALL=claude9 claude9fs
 
-OFILES=\
-	chat.$O\
-	claude.$O\
-	json.$O\
+COMMONO=claude.$O json.$O
 
 HFILES=\
 	claude.h\
@@ -15,4 +12,21 @@ HFILES=\
 
 BIN=$HOME/bin
 
-<$P9/src/mkone
+default:V: $ALL
+
+claude9: chat.$O action.$O $COMMONO
+	$LD -o $target chat.$O action.$O $COMMONO
+
+claude9fs: claude9fs.$O $COMMONO
+	$LD -o $target claude9fs.$O $COMMONO
+
+%.$O: %.c $HFILES
+	$CC $CFLAGS $stem.c
+
+clean:V:
+	rm -f *.o claude9 claude9fs
+
+install:V: $ALL
+	mkdir -p $BIN
+	cp claude9 $BIN/
+	cp claude9fs $BIN/
