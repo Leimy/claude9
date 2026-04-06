@@ -1,38 +1,26 @@
 </$objtype/mkfile
 
-BIN=/$objtype/bin
-CFLAGS=-FTVw
-HFILES=json.h claude.h
+BIN=$home/bin/$objtype
 
-OFILES=\
-	chat.$O\
-	claude.$O\
-	json.$O\
-	action.$O\
+TARG=claude9 claude9fs
 
-COMMON=claude.$O json.$O
+COMMONO=claude.$O json.$O
 
-TARG=claude9 debugpatch
+claude9:V: chat.$O action.$O $COMMONO
+	$LD $LDFLAGS -o $target chat.$O action.$O $COMMONO
 
-%.$O: $HFILES
+claude9fs:V: claude9fs.$O $COMMONO
+	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO
 
 %.$O: %.c
 	$CC $CFLAGS $stem.c
 
-claude9: chat.$O action.$O $COMMON
-	$LD $LDFLAGS -o $target $prereq
-
-debugpatch: debugpatch.$O action.$O $COMMON
-	$LD $LDFLAGS -o $target $prereq
-
-install:V:
-	cp claude9 $BIN/claude9
-
-installall:V:
-	for(objtype in $CPUS) mk $MKFLAGS install
-
 clean:V:
-	rm -f *.[$OS] [$OS].* $TARG
+	rm -f *.[$OS] claude9 claude9fs
 
-%.acid: %.c $HFILES
-	$CC $CFLAGS -a $stem.c >$target
+install:V: claude9 claude9fs
+	cp claude9 $BIN/
+	cp claude9fs $BIN/
+
+nuke:V: clean
+	rm -f $BIN/claude9 $BIN/claude9fs

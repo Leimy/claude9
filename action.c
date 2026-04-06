@@ -270,28 +270,6 @@ showaction(Action *a, int n)
 		fprint(2, "  [%d] %s %s\n", n, typ, a->path);
 }
 
-void
-mkparents(char *path)
-{
-	char *p, *s;
-	int fd;
-
-	s = strdup(path);
-	if(s == nil)
-		sysfatal("strdup: %r");
-
-	for(p = s; *p != '\0'; p++){
-		if(*p == '/' && p != s){
-			*p = '\0';
-			fd = create(s, OREAD, DMDIR|0777);
-			if(fd >= 0)
-				close(fd);
-			*p = '/';
-		}
-	}
-	free(s);
-}
-
 static char**
 splitlines(char *s, int *nout)
 {
