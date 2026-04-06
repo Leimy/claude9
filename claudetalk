@@ -1,0 +1,136 @@
+#!/bin/rc
+# claudetalk - interactive Claude chat via claude9fs
+# usage: claudetalk [-m model] [-t tokens]
+
+rfork e
+
+flagfmt='m:model,t:tokens'
+args='[-m model] [-t tokens]'
+if(! ifs=() eval `{aux/getflags $*}){
+	echo usage: claudetalk $args >[1=2]
+	exit usage
+}
+
+mnt=/mnt/claude
+if(! test -f $mnt/clone){
+	echo 'claude9fs not mounted on '$mnt >[1=2]
+	exit 'no fs'
+}
+
+n=`{cat $mnt/clone}
+if(~ $#n 0){
+	echo 'failed to allocate session' >[1=2]
+	exit 'clone failed'
+}
+sess=$mnt/$n
+
+if(! ~ $#model 0)
+	echo -n $model > $sess/model
+
+if(! ~ $#tokens 0)
+	echo -n $tokens > $sess/tokens
+
+fn sigexit {
+	echo hangup > $sess/ctl >[2]/dev/null
+}
+
+curmodel=`{cat $sess/model}
+curtokens=`{cat $sess/tokens}
+echo 'claude9 session '$n' - '$curmodel >[1=2]
+echo 'commands: /models /model [name] /clear /status /usage /help /quit' >[1=2]
+echo 'type message, end with ^D on empty line, ^C to quit' >[1=2]
+echo '' >[1=2]
+
+fn docmd {
+	cmd=$1
+	if(~ $cmd /clear){
+		echo clear > $sess/ctl
+		echo 'cleared' >[1=2]
+	}
+	if not if(~ $cmd /models){
+		echo 'fetching models...' >[1=2]
+		cat $mnt/models >[1=2]
+	}
+	if not if(~ $cmd /model){
+		if(~ $#* 1){
+			echo 'model: '^`{cat $sess/model} >[1=2]
+		}
+		if not {
+			shift
+			echo -n $"* > $sess/model
+			echo 'model: '^`{cat $sess/model} >[1=2]
+		}
+	}
+	if not if(~ $cmd /status){
+		cat $sess/ctl >[1=2]
+	}
+	if not if(~ $cmd /usage){
+		cat $sess/usage >[1=2]
+	}
+	if not if(~ $cmd /help){
+		echo 'commands:' >[1=2]
+		echo '  /models        list available models' >[1=2]
+		echo '  /model         show current model' >[1=2]
+		echo '  /model <name>  switch model' >[1=2]
+		echo '  /clear         clear conversation' >[1=2]
+		echo '  /status        show session info' >[1=2]
+		echo '  /usage         show token usage' >[1=2]
+		echo '  /save <path>   save conversation' >[1=2]
+		echo '  /load <path>   load conversation' >[1=2]
+		echo '  /quit          exit' >[1=2]
+	}
+	if not if(~ $cmd /save){
+		shift
+		if(! ~ $#* 0){
+			echo 'save '$"* > $sess/ctl
+			echo 'saved to '$"* >[1=2]
+		}
+		if not
+			echo 'usage: /save <path>' >[1=2]
+	}
+	if not if(~ $cmd /load){
+		shift
+		if(! ~ $#* 0){
+			echo 'load '$"* > $sess/ctl
+			echo 'loaded '$"* >[1=2]
+		}
+		if not
+			echo 'usage: /load <path>' >[1=2]
+	}
+	if not {
+		echo 'unknown command: '$cmd >[1=2]
+	}
+}
+
+while(){
+	curmodel=`{cat $sess/model}
+	curtokens=`{cat $sess/tokens}
+	prompt=$curmodel/$curtokens'> '
+	echo -n $prompt >[1=2]
+
+	msg=`{cat}
+	if(~ $#msg 0)
+		break
+
+	first=$msg(1)
+	if(~ $first /quit /exit)
+		break
+
+	if(~ $first /*)
+		docmd $msg
+	if not {
+		echo '...' >[1=2]
+		if(echo -n $"msg > $sess/prompt){
+			cat $sess/prompt
+			echo '' >[1=2]
+			cat $sess/usage >[1=2]
+		}
+		if not {
+			echo 'error:' >[1=2]
+			cat $sess/error >[1=2]
+		}
+		echo '' >[1=2]
+	}
+}
+
+echo hangup > $sess/ctl >[2]/dev/null
