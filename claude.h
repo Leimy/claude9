@@ -98,3 +98,10 @@ void	freeactions(Action *a);
 void	showaction(Action *a, int n);
 int	applyaction(Action *a);
 char*	stripactions(char *text);
+/*
+ * Apply a unified diff to the file at path using the in-tree
+ * fuzzy applier. Returns a malloc'd status string describing
+ * success ("patched foo.c (N hunks)") or failure ("error: ...").
+ * Never returns nil.
+ */
+char*	applydiff(char *path, char *diff);

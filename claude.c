@@ -231,7 +231,24 @@ mktools(void)
 	t = jobject();
 	jset(t, "name", jstring("patch_file"));
 	jset(t, "description", jstring(
-		"Apply a unified diff patch to an existing file."));
+		"Apply a unified diff to an existing file.\n"
+		"\n"
+		"Accepts standard unified diff syntax with one or more "
+		"hunks. Each hunk starts with a '@@' header and contains "
+		"lines prefixed ' ' (context), '-' (remove), or '+' (add).\n"
+		"\n"
+		"The diff is applied by an in-tree fuzzy matcher that "
+		"anchors each hunk by its context lines, so:\n"
+		"  - '--- a/path' / '+++ b/path' headers are optional "
+		"(the target file is given by the path parameter);\n"
+		"  - line numbers in '@@ -a,b +c,d @@' are used as hints "
+		"but do not have to be exact;\n"
+		"  - a bare '@@' with no line numbers is accepted;\n"
+		"  - whitespace-only differences inside a line are tolerated.\n"
+		"\n"
+		"Include at least one unchanged context line before and "
+		"after each edit so the hunk can be located unambiguously. "
+		"Hunks are applied in order."));
 	input = jobject();
 	jset(input, "type", jstring("object"));
 	props = jobject();
@@ -859,62 +876,15 @@ exectool(ToolCall *tc)
 			tc->path, (int)strlen(tc->body));
 
 	case Apatch:
-		{
-		char *tmp, *patchout;
-		int tfd, pfd[2], n;
-		char outbuf[1024];
-
-		tmp = smprint("/tmp/claude9.patch.%d", getpid());
-		tfd = create(tmp, OWRITE, 0600);
-		if(tfd < 0){
-			free(tmp);
-			return smprint("error: create temp: %r");
-		}
-		write(tfd, tc->body, strlen(tc->body));
-		close(tfd);
-
-		if(pipe(pfd) < 0){
-			remove(tmp);
-			free(tmp);
-			return smprint("error: pipe: %r");
-		}
-
-		switch(fork()){
-		case -1:
-			close(pfd[0]);
-			close(pfd[1]);
-			remove(tmp);
-			free(tmp);
-			return smprint("error: fork: %r");
-		case 0:
-			close(pfd[0]);
-			dup(pfd[1], 1);
-			dup(pfd[1], 2);
-			close(pfd[1]);
-			execl("/bin/ape/patch", "patch",
-				tc->path, tmp, nil);
-			execl("/bin/patch", "patch",
-				tc->path, tmp, nil);
-			exits("exec");
-		}
-		close(pfd[1]);
-
-		n = read(pfd[0], outbuf, sizeof outbuf - 1);
-		if(n < 0) n = 0;
-		outbuf[n] = '\0';
-		close(pfd[0]);
-		waitpid();
-
-		remove(tmp);
-		free(tmp);
-
-		if(n > 0)
-			patchout = smprint("patched %s: %s",
-				tc->path, outbuf);
-		else
-			patchout = smprint("patched %s", tc->path);
-		return patchout;
-		}
+		/*
+		 * Use the in-tree fuzzy unified-diff applier
+		 * (action.c:applydiff). Previously this shelled out to
+		 * /bin/ape/patch or /bin/patch, which would reject any
+		 * diff without perfect --- / +++ headers and exact line
+		 * numbers, emitting "Only garbage was found in the
+		 * patch input." See PATCH-TOOL-BUG.md.
+		 */
+		return applydiff(tc->path, tc->body);
 
 	case Adelete:
 		if(remove(tc->path) < 0)

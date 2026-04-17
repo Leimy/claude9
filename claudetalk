@@ -37,7 +37,7 @@ fn sigexit {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /models /model [name] /clear /status /usage /help /quit' >[1=2]
+echo 'commands: /models /model [name] /tokens [n] /clear /status /usage /help /quit' >[1=2]
 echo 'type message, end with ^D on empty line, ^C to quit' >[1=2]
 echo '' >[1=2]
 
@@ -61,6 +61,16 @@ fn docmd {
 			echo 'model: '^`{cat $sess/model} >[1=2]
 		}
 	}
+	if not if(~ $cmd /tokens){
+		if(~ $#* 1){
+			echo 'tokens: '^`{cat $sess/tokens} >[1=2]
+		}
+		if not {
+			shift
+			echo -n $"* > $sess/tokens
+			echo 'tokens: '^`{cat $sess/tokens} >[1=2]
+		}
+	}
 	if not if(~ $cmd /status){
 		cat $sess/ctl >[1=2]
 	}
@@ -72,6 +82,8 @@ fn docmd {
 		echo '  /models        list available models' >[1=2]
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
+		echo '  /tokens        show max output tokens' >[1=2]
+		echo '  /tokens <n>    set max output tokens' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /status        show session info' >[1=2]
 		echo '  /usage         show token usage' >[1=2]

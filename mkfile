@@ -4,10 +4,10 @@ BIN=$home/bin/$objtype
 
 TARG=claude9 claude9fs
 
-COMMONO=claude.$O json.$O
+COMMONO=claude.$O action.$O json.$O
 
-claude9:V: chat.$O action.$O $COMMONO
-	$LD $LDFLAGS -o $target chat.$O action.$O $COMMONO
+claude9:V: chat.$O $COMMONO
+	$LD $LDFLAGS -o $target chat.$O $COMMONO
 
 claude9fs:V: claude9fs.$O $COMMONO
 	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO

@@ -4,7 +4,7 @@ P9=$PLAN9
 
 ALL=claude9 claude9fs
 
-COMMONO=claude.$O json.$O
+COMMONO=claude.$O action.$O json.$O
 
 HFILES=\
 	claude.h\
@@ -14,8 +14,8 @@ BIN=$HOME/bin
 
 default:V: $ALL
 
-claude9: chat.$O action.$O $COMMONO
-	$LD -o $target chat.$O action.$O $COMMONO
+claude9: chat.$O $COMMONO
+	$LD -o $target chat.$O $COMMONO
 
 claude9fs: claude9fs.$O $COMMONO
 	$LD -o $target claude9fs.$O $COMMONO

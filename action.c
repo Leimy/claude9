@@ -302,7 +302,7 @@ splitlines(char *s, int *nout)
 
 typedef struct Hunk Hunk;
 struct Hunk {
-	int oldstart;
+	int oldstart;	/* 1-based, or 0 meaning "unknown, search" */
 	int oldcount;
 	int newstart;
 	int newcount;
@@ -337,17 +337,44 @@ wsmatch(char *a, char *b)
 	return *a == '\0' && *b == '\0';
 }
 
+/*
+ * Parse a unified-diff hunk header.
+ *
+ * Accepts, in order of preference:
+ *   @@ -a,b +c,d @@ optional text
+ *   @@ -a +c @@
+ *   @@                          (bare marker - oldstart/newstart = 0)
+ *   @@@ ... @@@                 (combined diff style, treated as bare)
+ *
+ * A zero oldstart means "we don't know where this hunk goes;
+ * locate it by searching for its context".
+ */
 static int
 parsehunkhdr(char *line, Hunk *h)
 {
 	char *p;
+
 	p = line;
+	/* must start with at least "@@" */
 	if(p[0] != '@' || p[1] != '@')
 		return 0;
-	p += 2;
-	while(*p == ' ') p++;
-	if(*p != '-') return 0;
+	while(*p == '@')
+		p++;
+	while(*p == ' ' || *p == '\t')
+		p++;
+
+	h->oldstart = 0;
+	h->oldcount = -1;
+	h->newstart = 0;
+	h->newcount = -1;
+
+	/* no numbers? bare header, fine. */
+	if(*p != '-')
+		return 1;
+
 	p++;
+	if(*p < '0' || *p > '9')
+		return 0;
 	h->oldstart = atoi(p);
 	while(*p >= '0' && *p <= '9') p++;
 	if(*p == ','){
@@ -356,9 +383,12 @@ parsehunkhdr(char *line, Hunk *h)
 		while(*p >= '0' && *p <= '9') p++;
 	} else
 		h->oldcount = 1;
-	while(*p == ' ') p++;
-	if(*p != '+') return 0;
+	while(*p == ' ' || *p == '\t') p++;
+	if(*p != '+')
+		return 0;
 	p++;
+	if(*p < '0' || *p > '9')
+		return 0;
 	h->newstart = atoi(p);
 	while(*p >= '0' && *p <= '9') p++;
 	if(*p == ','){
@@ -369,6 +399,10 @@ parsehunkhdr(char *line, Hunk *h)
 	return 1;
 }
 
+/*
+ * Does hunk h's leading old-side context (space and minus lines)
+ * match the file at position pos?
+ */
 static int
 matchcontext(Hunk *h, char **orig, int norig, int pos)
 {
@@ -384,6 +418,21 @@ matchcontext(Hunk *h, char **orig, int norig, int pos)
 		o++;
 	}
 	return 1;
+}
+
+/*
+ * Count how many non-'+' lines (space or minus) the hunk has,
+ * i.e. how many lines of the original file it consumes.
+ */
+static int
+hunkoldlen(Hunk *h)
+{
+	int i, n;
+	n = 0;
+	for(i = 0; i < h->nlines; i++)
+		if(h->lines[i][0] != '+')
+			n++;
+	return n;
 }
 
 typedef struct Outbuf Outbuf;
@@ -456,40 +505,62 @@ writeline(Outbuf *o, char *line)
 	outbufwrite(o, "\n", 1);
 }
 
+/*
+ * Try to locate hunk h in orig[]. Strategy:
+ *   1. If the hunk header gave a line number, try it with small fuzz.
+ *   2. Otherwise, scan forward from *origpos for the first place the
+ *      leading context matches.
+ * On success returns the 0-based line index; on failure returns -1.
+ */
 static int
-applyhunk(Outbuf *ob, Hunk *h, char **orig, int norig, int *origpos)
+locatehunk(Hunk *h, char **orig, int norig, int origpos)
 {
-	int target, fuzz, pos, i, o;
-	char prefix;
-	char *content;
+	int target, fuzz, i;
 
-	target = h->oldstart - 1;
-	pos = -1;
-
-	for(fuzz = 0; fuzz <= 3 && pos < 0; fuzz++){
-		if(target - fuzz >= *origpos && target - fuzz >= 0)
-			if(matchcontext(h, orig, norig, target - fuzz)){
-				pos = target - fuzz;
-				break;
-			}
-		if(fuzz > 0 && target + fuzz >= *origpos && target + fuzz < norig)
-			if(matchcontext(h, orig, norig, target + fuzz)){
-				pos = target + fuzz;
-				break;
-			}
-	}
-
-	if(pos < 0){
-		for(i = *origpos; i < norig; i++){
-			if(matchcontext(h, orig, norig, i)){
-				pos = i;
-				break;
-			}
+	if(h->oldstart > 0){
+		target = h->oldstart - 1;
+		for(fuzz = 0; fuzz <= 3; fuzz++){
+			if(target - fuzz >= origpos && target - fuzz >= 0
+			&& matchcontext(h, orig, norig, target - fuzz))
+				return target - fuzz;
+			if(fuzz > 0 && target + fuzz >= origpos && target + fuzz < norig
+			&& matchcontext(h, orig, norig, target + fuzz))
+				return target + fuzz;
 		}
 	}
 
-	if(pos < 0)
-		return 0;
+	/* fall through: search from origpos to end of file */
+	for(i = origpos; i < norig; i++)
+		if(matchcontext(h, orig, norig, i))
+			return i;
+	return -1;
+}
+
+static int
+applyhunk(Outbuf *ob, Hunk *h, char **orig, int norig, int *origpos)
+{
+	int pos, i, o;
+	char prefix;
+	char *content;
+
+	/* a hunk with no non-'+' lines is a pure insertion; it has
+	 * no context to match, so apply it wherever oldstart points
+	 * (or at origpos if oldstart is unknown). */
+	if(hunkoldlen(h) == 0){
+		if(h->oldstart > 0){
+			pos = h->oldstart - 1;
+			if(pos < *origpos)
+				pos = *origpos;
+			if(pos > norig)
+				pos = norig;
+		} else
+			pos = *origpos;
+	} else {
+		pos = locatehunk(h, orig, norig, *origpos);
+		if(pos < 0)
+			return 0;
+	}
+
 	while(*origpos < pos){
 		writeline(ob, orig[*origpos]);
 		(*origpos)++;
@@ -536,37 +607,46 @@ freehunks(Hunk *hunks, int nhunks)
 	free(hunks);
 }
 
-static int
-applypatch(Action *a)
+/*
+ * Core diff applier. Reads path, parses diff, applies hunks in
+ * memory, writes back on success. Returns a malloc'd status
+ * string. *okp is set to 1 on success, 0 on failure.
+ */
+static char*
+applydiff1(char *path, char *diff, int *okp)
 {
-	char *orig, *diffbuf;
+	char *orig, *diffbuf, *msg;
 	char **olines, **dlines;
 	int norig, ndiff;
 	Hunk *hunks;
 	int nhunks, ahunks;
-	int i, fd;
+	int i, j, fd;
 	int origpos;
 	Outbuf *ob;
 	char **synth;
 	int nsynth, asynth;
+	char ctx[128];
 
-	if(a->body == nil){
-		fprint(2, "action: patch %s: no diff\n", a->path);
-		return 0;
+	*okp = 0;
+
+	if(diff == nil || diff[0] == '\0'){
+		msg = smprint("error: patch %s: empty diff", path);
+		return msg;
 	}
-	fd = open(a->path, OREAD);
+
+	fd = open(path, OREAD);
 	if(fd < 0){
-		fprint(2, "action: patch %s: %r\n", a->path);
-		return 0;
+		msg = smprint("error: patch %s: open: %r", path);
+		return msg;
 	}
 	orig = readfile(fd);
 	close(fd);
 	if(orig == nil){
-		fprint(2, "action: patch %s: read: %r\n", a->path);
-		return 0;
+		msg = smprint("error: patch %s: read: %r", path);
+		return msg;
 	}
 
-	diffbuf = strdup(a->body);
+	diffbuf = strdup(diff);
 	if(diffbuf == nil)
 		sysfatal("strdup: %r");
 
@@ -591,10 +671,15 @@ applypatch(Action *a)
 			continue;
 		if(strncmp(dlines[i], "+++ ", 4) == 0)
 			continue;
+		/* skip "diff --git", "index ...", and "\ No newline" markers */
+		if(strncmp(dlines[i], "diff ", 5) == 0)
+			continue;
+		if(strncmp(dlines[i], "index ", 6) == 0)
+			continue;
 		if(dlines[i][0] == '\\')
 			continue;
 
-		if(strncmp(dlines[i], "@@", 2) == 0){
+		if(dlines[i][0] == '@' && dlines[i][1] == '@'){
 			if(nhunks >= ahunks){
 				ahunks *= 2;
 				hunks = realloc(hunks, ahunks * sizeof(Hunk));
@@ -603,9 +688,9 @@ applypatch(Action *a)
 			}
 			memset(&hunks[nhunks], 0, sizeof(Hunk));
 			if(!parsehunkhdr(dlines[i], &hunks[nhunks])){
-				fprint(2, "action: patch %s: bad hunk header: %s\n",
-					a->path, dlines[i]);
-				goto fail;
+				msg = smprint("error: patch %s: bad hunk header: %s",
+					path, dlines[i]);
+				goto done;
 			}
 			nhunks++;
 			continue;
@@ -635,8 +720,10 @@ applypatch(Action *a)
 	}
 
 	if(nhunks == 0){
-		fprint(2, "action: patch %s: no hunks found\n", a->path);
-		goto fail;
+		msg = smprint("error: patch %s: no hunks found "
+			"(diff must contain at least one '@@' header "
+			"followed by ' ', '-', '+' context lines)", path);
+		goto done;
 	}
 
 	/* apply to memory buffer first so we don't destroy the file on failure */
@@ -644,10 +731,19 @@ applypatch(Action *a)
 	origpos = 0;
 	for(i = 0; i < nhunks; i++){
 		if(!applyhunk(ob, &hunks[i], olines, norig, &origpos)){
-			fprint(2, "action: patch %s: hunk %d/%d failed at line %d\n",
-				a->path, i + 1, nhunks, hunks[i].oldstart);
+			ctx[0] = '\0';
+			for(j = 0; j < hunks[i].nlines; j++){
+				if(hunks[i].lines[j][0] == ' ' || hunks[i].lines[j][0] == '-'){
+					snprint(ctx, sizeof ctx,
+						"%.60s", hunks[i].lines[j]);
+					break;
+				}
+			}
+			msg = smprint("error: patch %s: hunk %d/%d could not be "
+				"located in file (context not found: %s)",
+				path, i + 1, nhunks, ctx[0] ? ctx : "<empty>");
 			outbuffree(ob);
-			goto fail;
+			goto done;
 		}
 	}
 	while(origpos < norig){
@@ -656,18 +752,22 @@ applypatch(Action *a)
 	}
 
 	/* all hunks succeeded, now write the file */
-	fd = create(a->path, OWRITE, 0666);
+	fd = create(path, OWRITE, 0666);
 	if(fd < 0){
-		fprint(2, "action: patch %s: create: %r\n", a->path);
+		msg = smprint("error: patch %s: create: %r", path);
 		outbuffree(ob);
-		goto fail;
+		goto done;
 	}
 	if(ob->len > 0)
 		write(fd, ob->buf, ob->len);
 	outbuffree(ob);
 	close(fd);
-	fprint(2, "  patched %s (%d hunks)\n", a->path, nhunks);
 
+	msg = smprint("patched %s (%d hunk%s)", path, nhunks,
+		nhunks == 1 ? "" : "s");
+	*okp = 1;
+
+done:
 	free(olines);
 	free(orig);
 	free(dlines);
@@ -676,18 +776,44 @@ applypatch(Action *a)
 	for(i = 0; i < nsynth; i++)
 		free(synth[i]);
 	free(synth);
-	return 1;
+	return msg;
+}
 
-fail:
-	free(olines);
-	free(orig);
-	free(dlines);
-	free(diffbuf);
-	freehunks(hunks, nhunks);
-	for(i = 0; i < nsynth; i++)
-		free(synth[i]);
-	free(synth);
-	return 0;
+/*
+ * Public entry point used by the tool-use API in claude.c.
+ * Always returns a malloc'd message.
+ */
+char*
+applydiff(char *path, char *diff)
+{
+	int ok;
+	char *msg;
+
+	msg = applydiff1(path, diff, &ok);
+	if(msg == nil)
+		msg = smprint("error: patch %s: unknown failure", path);
+	return msg;
+}
+
+static int
+applypatch(Action *a)
+{
+	char *msg;
+	int ok;
+
+	if(a->body == nil){
+		fprint(2, "action: patch %s: no diff\n", a->path);
+		return 0;
+	}
+	msg = applydiff1(a->path, a->body, &ok);
+	if(msg != nil){
+		if(ok)
+			fprint(2, "  %s\n", msg);
+		else
+			fprint(2, "action: %s\n", msg);
+		free(msg);
+	}
+	return ok;
 }
 
 int
