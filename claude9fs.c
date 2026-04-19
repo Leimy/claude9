@@ -21,6 +21,7 @@ enum {
 	Qsystem,
 	Qusage,
 	Qerror,
+	Qstream,
 };
 
 #define QPATH(sid, type)	((uvlong)(sid)<<8 | (type))
@@ -35,12 +36,23 @@ struct Session {
 	char *lasterror;
 	Usage usage;
 	QLock lk;
+	/* streaming */
+	QLock streamlk;
+	Rendez streamrz;
+	char *streambuf;
+	int streamlen;
+	int streamcap;
+	int streamdone;
+	int streamgen;
 	Session *next;
 };
 
 typedef struct Faux Faux;
 struct Faux {
 	Session *clone;
+	int streamoff;
+	int streamgen;
+	int streamgenset;
 };
 
 static Srv clsrv;
@@ -65,6 +77,8 @@ newsession(void)
 	qlock(&sessionlk);
 	s->id = nextsid++;
 	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt);
+	s->streamrz.l = &s->streamlk;
+	s->streamdone = 1;
 	s->next = sessions;
 	sessions = s;
 	qunlock(&sessionlk);
@@ -93,6 +107,7 @@ freesession(Session *s)
 	free(s->lastreply);
 	free(s->lasterror);
 	free(s->usage.stop_reason);
+	free(s->streambuf);
 	free(s);
 }
 
@@ -112,6 +127,67 @@ delsession(int id)
 		}
 	}
 	qunlock(&sessionlk);
+}
+
+/*
+ * Streaming helpers.  Text deltas from claudeconverse_stream
+ * are appended to s->streambuf; blocked readers on Qstream are
+ * woken via s->streamrz.  All state guarded by s->streamlk.
+ */
+static void
+streamreset(Session *s)
+{
+	qlock(&s->streamlk);
+	s->streamlen = 0;
+	if(s->streambuf != nil)
+		s->streambuf[0] = '\0';
+	s->streamdone = 0;
+	s->streamgen++;
+	rwakeupall(&s->streamrz);
+	qunlock(&s->streamlk);
+}
+
+static void
+streamappend(Session *s, char *data, int n)
+{
+	int need;
+
+	qlock(&s->streamlk);
+	need = s->streamlen + n + 1;
+	if(need > s->streamcap){
+		while(need > s->streamcap)
+			s->streamcap = s->streamcap ? s->streamcap * 2 : 4096;
+		s->streambuf = realloc(s->streambuf, s->streamcap);
+		if(s->streambuf == nil)
+			sysfatal("realloc: %r");
+	}
+	memmove(s->streambuf + s->streamlen, data, n);
+	s->streamlen += n;
+	s->streambuf[s->streamlen] = '\0';
+	rwakeupall(&s->streamrz);
+	qunlock(&s->streamlk);
+}
+
+static void
+streamfinish(Session *s)
+{
+	qlock(&s->streamlk);
+	s->streamdone = 1;
+	rwakeupall(&s->streamrz);
+	qunlock(&s->streamlk);
+}
+
+/*
+ * Callback invoked by claudeconverse_stream with each incremental
+ * text chunk (either SSE text_delta text or an internal
+ * "[running ...]" marker between tool rounds).
+ */
+static void
+streamcb(char *chunk, void *aux)
+{
+	Session *s;
+	s = aux;
+	streamappend(s, chunk, strlen(chunk));
 }
 
 static char *msgsep = "---msg";
@@ -335,10 +411,10 @@ rootgen(int i, Dir *d, void *v)
 }
 
 static char *sessfiles[] = {
-	"ctl", "prompt", "conv", "model", "tokens", "system", "usage", "error",
+	"ctl", "prompt", "conv", "model", "tokens", "system", "usage", "error", "stream",
 };
 static int sesstypes[] = {
-	Qctl, Qprompt, Qconv, Qmodel, Qtokens, Qsystem, Qusage, Qerror,
+	Qctl, Qprompt, Qconv, Qmodel, Qtokens, Qsystem, Qusage, Qerror, Qstream,
 };
 
 static int
@@ -586,6 +662,10 @@ fsstat(Req *r)
 		r->d.name = estrdup9p("error");
 		r->d.mode = 0444;
 		break;
+	case Qstream:
+		r->d.name = estrdup9p("stream");
+		r->d.mode = 0444;
+		break;
 	default:
 		respond(r, "unknown file");
 		return;
@@ -637,6 +717,87 @@ modelstext(Req *r)
 	readstr(r, buf);
 	free(buf);
 	respond(r, nil);
+}
+
+/*
+ * Blocking read on Qstream.  Returns new bytes past fa->streamoff,
+ * or EOF when the current round's stream is done, or blocks
+ * waiting for data / end-of-round / start-of-next-round.
+ *
+ * Special case: a newly-opened fid (streamoff==0) whose session
+ * is idle (streamdone && streamlen==0) blocks until the next
+ * prompt write starts producing text.
+ */
+static void
+streamread(Req *r, Session *s, Faux *fa)
+{
+	long avail, want, off;
+	char *data;
+
+	qlock(&s->streamlk);
+	/*
+	 * On first read pin this fid to the current generation.
+	 * If the session is idle (streamdone && streamlen==0),
+	 * defer pinning until a round actually starts, so that a
+	 * cat of stream launched before the prompt write still
+	 * ends up reading the new round rather than the old one.
+	 */
+	if(!fa->streamgenset){
+		/*
+		 * If the session is currently idle with no buffered
+		 * text (no round has streamed yet, or the buffer was
+		 * reset), wait for the next round to start.  If there
+		 * is buffered text from a completed round, pin to the
+		 * current generation so the reader sees that text
+		 * and then EOF -- useful for "cat stream" after the
+		 * fact.
+		 */
+		while(s->streamdone && s->streamlen == 0)
+			rsleep(&s->streamrz);
+		fa->streamgen = s->streamgen;
+		fa->streamgenset = 1;
+	}
+	for(;;){
+		/* fid's generation retired -- EOF */
+		if(fa->streamgen != s->streamgen){
+			qunlock(&s->streamlk);
+			r->ofcall.count = 0;
+			respond(r, nil);
+			return;
+		}
+		if(fa->streamoff < s->streamlen){
+			avail = s->streamlen - fa->streamoff;
+			want = r->ifcall.count;
+			if(want > avail) want = avail;
+			data = malloc(want);
+			if(data == nil){
+				qunlock(&s->streamlk);
+				respond(r, "out of memory");
+				return;
+			}
+			memmove(data, s->streambuf + fa->streamoff, want);
+			off = fa->streamoff;
+			fa->streamoff += want;
+			qunlock(&s->streamlk);
+			memmove(r->ofcall.data, data, want);
+			r->ofcall.count = want;
+			free(data);
+			USED(off);
+			respond(r, nil);
+			return;
+		}
+		if(s->streamdone){
+			/*
+			 * Our generation is done and we've read all its
+			 * bytes.  EOF.
+			 */
+			qunlock(&s->streamlk);
+			r->ofcall.count = 0;
+			respond(r, nil);
+			return;
+		}
+		rsleep(&s->streamrz);
+	}
 }
 
 static void
@@ -746,6 +907,11 @@ fsread(Req *r)
 		qunlock(&s->lk);
 		respond(r, nil);
 		return;
+	case Qstream:
+		srvrelease(&clsrv);
+		streamread(r, s, fa);
+		srvacquire(&clsrv);
+		return;
 	}
 	respond(r, "bug in fsread");
 }
@@ -768,6 +934,14 @@ handlectl(Session *s, char *cmd, int *hangup)
 		s->lastreply = nil;
 		free(s->lasterror);
 		s->lasterror = nil;
+		qlock(&s->streamlk);
+		s->streamlen = 0;
+		if(s->streambuf != nil)
+			s->streambuf[0] = '\0';
+		s->streamdone = 1;
+		s->streamgen++;
+		rwakeupall(&s->streamrz);
+		qunlock(&s->streamlk);
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangup = 1;
 	} else if(strncmp(cmd, "save ", 5) == 0){
@@ -825,17 +999,30 @@ fswrite(Req *r)
 			return;
 		}
 		srvrelease(&clsrv);
-		qlock(&s->lk);
 
+		qlock(&s->lk);
 		free(s->lasterror);
 		s->lasterror = nil;
 		free(s->usage.stop_reason);
 		memset(&s->usage, 0, sizeof s->usage);
-
 		convappend(s->conv, msgnew(Muser, data));
 		free(data);
+		qunlock(&s->lk);
 
-		reply = claudeconverse(s->conv, &s->usage);
+		/*
+		 * Reset streaming buffer *before* we kick off the work
+		 * so any cat of $sess/stream started in parallel with
+		 * us will block on new data rather than see stale text
+		 * or an immediate EOF.
+		 */
+		streamreset(s);
+
+		reply = claudeconverse_stream(s->conv, &s->usage,
+			streamcb, s);
+
+		streamfinish(s);
+
+		qlock(&s->lk);
 		if(reply == nil){
 			char errbuf[256];
 			rerrstr(errbuf, sizeof errbuf);
@@ -852,7 +1039,6 @@ fswrite(Req *r)
 		free(s->lastreply);
 		s->lastreply = estrdup9p(reply);
 		free(reply);
-
 		qunlock(&s->lk);
 		srvacquire(&clsrv);
 		r->ofcall.count = r->ifcall.count;

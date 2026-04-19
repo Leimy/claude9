@@ -131,13 +131,19 @@ while(){
 	if(~ $first /*)
 		docmd $msg
 	if not {
-		echo '...' >[1=2]
+		# Start the streaming reader first so it is blocked in
+		# open() before we write the prompt.  The read on stream
+		# waits for the next round to begin, streams text as it
+		# arrives, then EOFs when the round is complete.
+		cat $sess/stream &
+		cpid=$apid
 		if(echo -n $"msg > $sess/prompt){
-			cat $sess/prompt
+			wait $cpid
 			echo '' >[1=2]
 			cat $sess/usage >[1=2]
 		}
 		if not {
+			wait $cpid
 			echo 'error:' >[1=2]
 			cat $sess/error >[1=2]
 		}

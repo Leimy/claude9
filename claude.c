@@ -567,6 +567,98 @@ curlsend(Conv *c, char *body)
 	return data;
 }
 
+/*
+ * Streaming variant of webfssend.  Performs the same clone /
+ * ctl / postbody dance as webfssend but leaves the body file
+ * open for incremental reads and returns the open fd.
+ * Webfs's body file hands out response bytes as they arrive
+ * from the HTTP socket, so reading it line by line gives us
+ * Server-Sent Events in real time.
+ *
+ * On success, returns the read fd of the body file and stores
+ * the clone fd in *clonefdp -- the caller must close both
+ * (body fd first, then clone fd) when done to release the
+ * webfs connection.
+ *
+ * On failure returns -1 with werrstr set.
+ */
+static int
+webfssend_stream(Conv *c, char *body, int *clonefdp)
+{
+	int clonefd, fd, n;
+	char buf[256];
+	char *clone, *ctl, *bodyf, *page;
+
+	clone = "/mnt/web/clone";
+	clonefd = open(clone, ORDWR);
+	if(clonefd < 0){
+		werrstr("open %s: %r", clone);
+		return -1;
+	}
+
+	n = read(clonefd, buf, sizeof buf - 1);
+	if(n <= 0){
+		close(clonefd);
+		werrstr("read clone: %r");
+		return -1;
+	}
+	buf[n] = '\0';
+	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
+		buf[--n] = '\0';
+
+	free(c->webdir);
+	c->webdir = smprint("/mnt/web/%s", buf);
+
+	ctl = smprint("%s/ctl", c->webdir);
+	fd = open(ctl, OWRITE);
+	free(ctl);
+	if(fd < 0){
+		close(clonefd);
+		werrstr("open ctl: %r");
+		return -1;
+	}
+	if(fprint(fd, "url %s\n", apiurl) < 0
+	|| fprint(fd, "request POST\n") < 0
+	|| fprint(fd, "headers Content-Type: application/json\r\n") < 0
+	|| fprint(fd, "headers Accept: text/event-stream\r\n") < 0
+	|| fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
+		close(fd);
+		close(clonefd);
+		werrstr("write ctl: %r");
+		return -1;
+	}
+	close(fd);
+
+	bodyf = smprint("%s/postbody", c->webdir);
+	fd = open(bodyf, OWRITE);
+	free(bodyf);
+	if(fd < 0){
+		close(clonefd);
+		werrstr("open postbody: %r");
+		return -1;
+	}
+	if(writeall(fd, body, strlen(body)) < 0){
+		close(fd);
+		close(clonefd);
+		werrstr("write postbody: %r");
+		return -1;
+	}
+	close(fd);
+
+	page = smprint("%s/body", c->webdir);
+	fd = open(page, OREAD);
+	free(page);
+	if(fd < 0){
+		close(clonefd);
+		werrstr("open body: %r");
+		return -1;
+	}
+
+	*clonefdp = clonefd;
+	return fd;
+}
+
 static int
 haswebfs(void)
 {
@@ -854,6 +946,61 @@ toollist(char *path)
 }
 
 /*
+ * Read up to maxlen bytes from fd, returning a malloc'd NUL-
+ * terminated string.  If the stream has more than maxlen bytes,
+ * the excess is drained and discarded and the buffer ends with
+ * a truncation marker.
+ */
+static char*
+readallcapped(int fd, int maxlen)
+{
+	char *buf, *tmp;
+	int len, cap, truncated;
+	long n;
+	char waste[4096];
+	static char trunc[] = "\n...[output truncated]\n";
+
+	cap = 8192;
+	if(cap > maxlen + 1)
+		cap = maxlen + 1;
+	buf = malloc(cap);
+	if(buf == nil)
+		sysfatal("malloc: %r");
+	len = 0;
+	truncated = 0;
+	for(;;){
+		if(len >= maxlen){
+			truncated = 1;
+			while(read(fd, waste, sizeof waste) > 0)
+				;
+			break;
+		}
+		if(len + 1 >= cap){
+			cap = cap * 2;
+			if(cap > maxlen + 1)
+				cap = maxlen + 1;
+			tmp = realloc(buf, cap);
+			if(tmp == nil)
+				sysfatal("realloc: %r");
+			buf = tmp;
+		}
+		n = read(fd, buf + len, cap - 1 - len);
+		if(n <= 0)
+			break;
+		len += n;
+	}
+	buf[len] = '\0';
+	if(truncated){
+		tmp = realloc(buf, len + sizeof trunc);
+		if(tmp == nil)
+			sysfatal("realloc: %r");
+		buf = tmp;
+		memmove(buf + len, trunc, sizeof trunc);
+	}
+	return buf;
+}
+
+/*
  * Execute a tool call. Returns result string (caller frees).
  */
 static char*
@@ -999,6 +1146,474 @@ claudeconverse(Conv *c, Usage *usage)
 			tc->result = exectool(tc);
 
 		/* build tool_result message */
+		resultjson = mktoolresults(r->tools);
+		convappend(c, msgnewraw(Muser, "", resultjson));
+		free(resultjson);
+
+		replyfree(r);
+	}
+
+	return alltext;
+}
+
+/*
+ * Streaming path.
+ *
+ * We reuse buildreq() but set "stream":true, then parse
+ * Server-Sent Events from webfs's body file.  For each
+ * incremental text delta we invoke cb(chunk, aux).  The assistant's full
+ * content array is reconstructed locally (text blocks and
+ * tool_use blocks with their JSON input) so that the existing
+ * tool-loop logic still works: we build a Reply just like
+ * sendonce() would have, and let claudeconverse_stream drive
+ * the rounds.
+ *
+ * Only a small subset of the SSE event stream matters to us:
+ *
+ *   content_block_start  -- announces a new block; if type is
+ *                           tool_use, remember id/name/index
+ *   content_block_delta  -- text_delta carries text to emit;
+ *                           input_json_delta carries partial
+ *                           tool input JSON to accumulate
+ *   content_block_stop   -- finalize current block
+ *   message_delta        -- carries stop_reason and usage
+ *   message_stop         -- end of message
+ *   error / overloaded_error -- propagate as werrstr
+ *
+ * Anything else is ignored.
+ */
+
+enum {
+	Maxblocks = 64,
+};
+
+typedef struct Sblock Sblock;
+struct Sblock {
+	int istool;
+	/* text block */
+	char *text;
+	int textlen;
+	int textcap;
+	/* tool_use block */
+	char *toolid;
+	char *toolname;
+	char *tooljson;	/* accumulated input_json_delta partials */
+	int tooljsonlen;
+	int tooljsoncap;
+};
+
+static void
+sblock_appendtext(Sblock *b, char *s, int n)
+{
+	int need;
+
+	need = b->textlen + n + 1;
+	if(need > b->textcap){
+		while(need > b->textcap)
+			b->textcap = b->textcap ? b->textcap * 2 : 256;
+		b->text = realloc(b->text, b->textcap);
+		if(b->text == nil) sysfatal("realloc: %r");
+	}
+	memmove(b->text + b->textlen, s, n);
+	b->textlen += n;
+	b->text[b->textlen] = '\0';
+}
+
+static void
+sblock_appendjson(Sblock *b, char *s, int n)
+{
+	int need;
+
+	need = b->tooljsonlen + n + 1;
+	if(need > b->tooljsoncap){
+		while(need > b->tooljsoncap)
+			b->tooljsoncap = b->tooljsoncap ? b->tooljsoncap * 2 : 256;
+		b->tooljson = realloc(b->tooljson, b->tooljsoncap);
+		if(b->tooljson == nil) sysfatal("realloc: %r");
+	}
+	memmove(b->tooljson + b->tooljsonlen, s, n);
+	b->tooljsonlen += n;
+	b->tooljson[b->tooljsonlen] = '\0';
+}
+
+/*
+ * Convert accumulated Sblocks into a Reply (text + tools +
+ * rawjson) shaped exactly like sendonce() returns.
+ */
+static Reply*
+blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
+{
+	Reply *r;
+	Json *content, *block, *input;
+	ToolCall *head, *tail, *tc;
+	char *alltext, *tmp;
+	int i, j, ttype, alllen, tlen;
+
+	r = mallocz(sizeof *r, 1);
+	if(r == nil) sysfatal("malloc: %r");
+
+	/* build rawjson content array */
+	content = jarray();
+	alltext = strdup("");
+	alllen = 0;
+	head = tail = nil;
+
+	for(i = 0; i < nblocks; i++){
+		if(!blocks[i].istool){
+			block = jobject();
+			jset(block, "type", jstring("text"));
+			jset(block, "text",
+				jstring(blocks[i].text ? blocks[i].text : ""));
+			jappend(content, block);
+			if(blocks[i].text != nil){
+				tlen = blocks[i].textlen;
+				tmp = realloc(alltext, alllen + tlen + 1);
+				if(tmp == nil) sysfatal("realloc: %r");
+				alltext = tmp;
+				memmove(alltext + alllen, blocks[i].text, tlen);
+				alllen += tlen;
+				alltext[alllen] = '\0';
+			}
+			continue;
+		}
+
+		/* tool_use */
+		block = jobject();
+		jset(block, "type", jstring("tool_use"));
+		jset(block, "id",
+			jstring(blocks[i].toolid ? blocks[i].toolid : ""));
+		jset(block, "name",
+			jstring(blocks[i].toolname ? blocks[i].toolname : ""));
+		if(blocks[i].tooljson != nil && blocks[i].tooljsonlen > 0)
+			input = jsonparse(blocks[i].tooljson);
+		else
+			input = nil;
+		if(input == nil)
+			input = jobject();
+		jset(block, "input", input);
+		jappend(content, block);
+
+		ttype = -1;
+		for(j = 0; j < nelem(toolnames); j++){
+			if(blocks[i].toolname != nil
+			&& strcmp(blocks[i].toolname, toolnames[j]) == 0){
+				ttype = tooltypes[j];
+				break;
+			}
+		}
+		if(ttype < 0)
+			continue;
+
+		tc = mallocz(sizeof *tc, 1);
+		if(tc == nil) sysfatal("malloc: %r");
+		tc->id = strdup(blocks[i].toolid ? blocks[i].toolid : "");
+		tc->type = ttype;
+		switch(ttype){
+		case Acreate: {
+			char *s;
+			s = jstr(input, "path");
+			tc->path = strdup(s ? s : "");
+			s = jstr(input, "contents");
+			tc->body = strdup(s ? s : "");
+			break;
+		}
+		case Apatch: {
+			char *s;
+			s = jstr(input, "path");
+			tc->path = strdup(s ? s : "");
+			s = jstr(input, "diff");
+			tc->body = strdup(s ? s : "");
+			break;
+		}
+		case Adelete:
+		case Aread:
+		case Alist: {
+			char *s;
+			s = jstr(input, "path");
+			tc->path = strdup(s ? s : "");
+			tc->body = strdup("");
+			break;
+		}
+		}
+		if(tail == nil) head = tc;
+		else tail->next = tc;
+		tail = tc;
+	}
+
+	r->text = alltext;
+	r->tools = head;
+	r->rawjson = jsonstr(content);
+	jsonfree(content);
+	if(stop_reason != nil && strcmp(stop_reason, "tool_use") == 0)
+		r->stopped = 0;
+	else
+		r->stopped = 1;
+	return r;
+}
+
+static void
+freeblocks(Sblock *blocks, int nblocks)
+{
+	int i;
+	for(i = 0; i < nblocks; i++){
+		free(blocks[i].text);
+		free(blocks[i].toolid);
+		free(blocks[i].toolname);
+		free(blocks[i].tooljson);
+	}
+}
+
+/*
+ * Parse a single SSE "data: ..." JSON payload and update state.
+ * Returns 0 normally, -1 on API error (werrstr set), 1 on
+ * message_stop.
+ */
+static int
+ssehandle(char *json, Sblock *blocks, int *nblocksp,
+	char **stopreasonp, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Json *ev, *delta, *cb0, *msg, *uobj;
+	char *etype, *dtype;
+	int idx;
+
+	ev = jsonparse(json);
+	if(ev == nil) return 0;
+	etype = jstr(ev, "type");
+	if(etype == nil){ jsonfree(ev); return 0; }
+
+	if(strcmp(etype, "message_stop") == 0){
+		jsonfree(ev);
+		return 1;
+	}
+	if(strcmp(etype, "error") == 0){
+		Json *eo;
+		char *em;
+		eo = jget(ev, "error");
+		em = jstr(eo, "message");
+		werrstr("API error: %s", em ? em : "unknown");
+		jsonfree(ev);
+		return -1;
+	}
+	if(strcmp(etype, "message_start") == 0){
+		msg = jget(ev, "message");
+		uobj = jget(msg, "usage");
+		if(usage != nil && uobj != nil)
+			usage->input_tokens += jint(uobj, "input_tokens");
+		jsonfree(ev);
+		return 0;
+	}
+	if(strcmp(etype, "message_delta") == 0){
+		delta = jget(ev, "delta");
+		if(delta != nil){
+			char *sr;
+			sr = jstr(delta, "stop_reason");
+			if(sr != nil){
+				free(*stopreasonp);
+				*stopreasonp = strdup(sr);
+			}
+		}
+		uobj = jget(ev, "usage");
+		if(usage != nil && uobj != nil)
+			usage->output_tokens += jint(uobj, "output_tokens");
+		jsonfree(ev);
+		return 0;
+	}
+	if(strcmp(etype, "content_block_start") == 0){
+		idx = jint(ev, "index");
+		if(idx < 0 || idx >= Maxblocks){ jsonfree(ev); return 0; }
+		if(idx >= *nblocksp) *nblocksp = idx + 1;
+		cb0 = jget(ev, "content_block");
+		dtype = jstr(cb0, "type");
+		if(dtype != nil && strcmp(dtype, "tool_use") == 0){
+			char *s;
+			blocks[idx].istool = 1;
+			s = jstr(cb0, "id");
+			blocks[idx].toolid = strdup(s ? s : "");
+			s = jstr(cb0, "name");
+			blocks[idx].toolname = strdup(s ? s : "");
+		}
+		jsonfree(ev);
+		return 0;
+	}
+	if(strcmp(etype, "content_block_delta") == 0){
+		idx = jint(ev, "index");
+		if(idx < 0 || idx >= Maxblocks){ jsonfree(ev); return 0; }
+		if(idx >= *nblocksp) *nblocksp = idx + 1;
+		delta = jget(ev, "delta");
+		dtype = jstr(delta, "type");
+		if(dtype == nil){ jsonfree(ev); return 0; }
+		if(strcmp(dtype, "text_delta") == 0){
+			char *t;
+			t = jstr(delta, "text");
+			if(t != nil){
+				sblock_appendtext(&blocks[idx], t, strlen(t));
+				if(cb != nil) cb(t, aux);
+			}
+		} else if(strcmp(dtype, "input_json_delta") == 0){
+			char *pj;
+			pj = jstr(delta, "partial_json");
+			if(pj != nil)
+				sblock_appendjson(&blocks[idx], pj, strlen(pj));
+		}
+		jsonfree(ev);
+		return 0;
+	}
+	/* content_block_stop, ping, etc. -- ignore */
+	jsonfree(ev);
+	return 0;
+}
+
+static Reply*
+sendonce_stream(Conv *c, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Json *req;
+	char *body, *stopreason, *line;
+	Biobuf *bp;
+	int fd, clonefd, rc, done, err;
+	Sblock blocks[Maxblocks];
+	int nblocks;
+	Reply *r;
+
+	req = buildreq(c);
+	jset(req, "stream", jbool(1));
+	body = jsonstr(req);
+	jsonfree(req);
+	if(body == nil){
+		werrstr("failed to serialize request");
+		return nil;
+	}
+
+	fd = webfssend_stream(c, body, &clonefd);
+	free(body);
+	if(fd < 0)
+		return nil;
+
+	bp = Bfdopen(fd, OREAD);
+	if(bp == nil){
+		close(fd);
+		close(clonefd);
+		werrstr("Bfdopen: %r");
+		return nil;
+	}
+
+	memset(blocks, 0, sizeof blocks);
+	nblocks = 0;
+	stopreason = nil;
+	done = 0;
+	err = 0;
+
+	while(!done && (line = Brdstr(bp, '\n', 1)) != nil){
+		/* SSE: we only care about "data: ..." lines */
+		if(strncmp(line, "data:", 5) != 0){
+			free(line);
+			continue;
+		}
+		char *p;
+		p = line + 5;
+		while(*p == ' ') p++;
+		if(*p == '\0'){ free(line); continue; }
+		rc = ssehandle(p, blocks, &nblocks, &stopreason,
+			usage, cb, aux);
+		free(line);
+		if(rc < 0){ err = 1; break; }
+		if(rc > 0) done = 1;
+	}
+
+	Bterm(bp);
+	close(fd);
+	close(clonefd);
+
+	if(err){
+		freeblocks(blocks, nblocks);
+		free(stopreason);
+		return nil;
+	}
+
+	if(stopreason != nil && usage != nil){
+		free(usage->stop_reason);
+		usage->stop_reason = strdup(stopreason);
+	}
+
+	r = blocks2reply(blocks, nblocks, stopreason);
+	freeblocks(blocks, nblocks);
+	free(stopreason);
+	return r;
+}
+
+char*
+claudeconverse_stream(Conv *c, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Reply *r;
+	ToolCall *tc;
+	char *resultjson, *alltext, *tmp, marker[256];
+	int round, alllen, tlen;
+
+	/*
+	 * Streaming requires webfs (body file delivers bytes as
+	 * they arrive).  On systems without webfs (e.g. plan9port
+	 * with only curl), fall back to the non-streaming path --
+	 * the caller still gets a complete reply, just all at once
+	 * when the round finishes.  We invoke the callback with
+	 * the entire final text so readers of the stream file
+	 * see the reply too (just not incrementally).
+	 */
+	if(!haswebfs()){
+		alltext = claudeconverse(c, usage);
+		if(alltext != nil && alltext[0] != '\0' && cb != nil)
+			cb(alltext, aux);
+		return alltext;
+	}
+
+	alltext = strdup("");
+	alllen = 0;
+
+	for(round = 0; round < 20; round++){
+		r = sendonce_stream(c, usage, cb, aux);
+		if(r == nil){
+			if(alllen > 0) return alltext;
+			free(alltext);
+			return nil;
+		}
+
+		if(r->text != nil && r->text[0] != '\0'){
+			tlen = strlen(r->text);
+			tmp = realloc(alltext, alllen + tlen + 2);
+			if(tmp == nil) sysfatal("realloc: %r");
+			alltext = tmp;
+			if(alllen > 0) alltext[alllen++] = '\n';
+			memmove(alltext + alllen, r->text, tlen);
+			alllen += tlen;
+			alltext[alllen] = '\0';
+		}
+
+		convappend(c, msgnewraw(Massistant,
+			r->text ? r->text : "", r->rawjson));
+
+		if(r->stopped || r->tools == nil){
+			replyfree(r);
+			return alltext;
+		}
+
+		for(tc = r->tools; tc != nil; tc = tc->next){
+			/* emit a marker so the user sees why text paused */
+			if(cb != nil){
+				snprint(marker, sizeof marker,
+					"\n[running %s %s]\n",
+					tc->type == Acreate ? "create_file" :
+					tc->type == Apatch  ? "patch_file"  :
+					tc->type == Adelete ? "delete_file" :
+					tc->type == Aread   ? "read_file"   :
+					tc->type == Alist   ? "list_directory" :
+					"tool",
+					tc->path);
+				cb(marker, aux);
+			}
+			tc->result = exectool(tc);
+		}
+
 		resultjson = mktoolresults(r->tools);
 		convappend(c, msgnewraw(Muser, "", resultjson));
 		free(resultjson);

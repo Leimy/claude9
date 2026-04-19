@@ -17,9 +17,9 @@ enum {
 typedef struct ToolCall ToolCall;
 struct ToolCall {
 	char *id;		/* tool_use_id */
-	int type;		/* Acreate, Apatch, Adelete */
-	char *path;
-	char *body;
+	int type;		/* Acreate, Apatch, Adelete, Aread, Alist */
+	char *path;		/* file path */
+	char *body;		/* contents / diff */
 	char *result;		/* result text after execution */
 	ToolCall *next;
 };
@@ -86,6 +86,16 @@ void	convappend(Conv *c, Msg *m);
 char*	claudesend(Conv *c, Usage *usage);
 Reply*	claudechat(Conv *c, Usage *usage);
 char*	claudeconverse(Conv *c, Usage *usage);
+/*
+ * Like claudeconverse, but invokes cb(chunk, aux) with each
+ * incremental text delta as it arrives from the API.  Between
+ * tool-use rounds, cb may be called with a short marker string
+ * such as "\n[running tool: ...]\n" so the user sees progress.
+ * Returns the full concatenated assistant text (caller frees),
+ * same as claudeconverse.
+ */
+char*	claudeconverse_stream(Conv *c, Usage *usage,
+		void (*cb)(char *chunk, void *aux), void *aux);
 void	replyfree(Reply *r);
 void	toolfree(ToolCall *t);
 char*	readfile(int fd);
