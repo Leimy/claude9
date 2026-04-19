@@ -1071,6 +1071,16 @@ main(int argc, char **argv)
 		input = readinput(&bin, c->model, c->maxtokens);
 		if(input == nil)
 			break;
+		/*
+		 * On Plan 9, ctrl-D at the start of a line signals end of the
+		 * current message by delivering a zero-length read, which Bio
+		 * latches as EOF on the Biobuf. The fd itself is still open,
+		 * so reset the Biobuf state to clear EOF before the next
+		 * readinput() call -- otherwise Brdstr() would immediately
+		 * return nil again and we'd exit after a single exchange.
+		 */
+		Bterm(&bin);
+		Binit(&bin, 0, OREAD);
 		if(handlecmd(c, input)){
 			free(input);
 			continue;

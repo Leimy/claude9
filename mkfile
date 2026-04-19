@@ -24,3 +24,6 @@ install:V: claude9 claude9fs
 
 nuke:V: clean
 	rm -f $BIN/claude9 $BIN/claude9fs
+
+rebuild:V: clean claude9fs
+	echo rebuilt

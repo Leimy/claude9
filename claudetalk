@@ -34,6 +34,22 @@ fn sigexit {
 	echo hangup > $sess/ctl >[2]/dev/null
 }
 
+# Plan 9 rc maps the 'interrupt' note (delete key / ctrl-C) to
+# sigint, and 'hangup' to sighup.  Without explicit handlers rc
+# just keeps looping because the outer `{cat} subprocess absorbs
+# the note and exits, leaving rc to go round again and print a
+# fresh prompt.  Define handlers that tear down the session and
+# exit so del/^C actually quits the client.
+fn sigint {
+	echo hangup > $sess/ctl >[2]/dev/null
+	exit interrupt
+}
+
+fn sighup {
+	echo hangup > $sess/ctl >[2]/dev/null
+	exit hangup
+}
+
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]

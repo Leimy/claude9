@@ -53,6 +53,8 @@ struct Faux {
 	int streamoff;
 	int streamgen;
 	int streamgenset;
+	int streamopengen;	/* s->streamgen captured at open time */
+	int streamopendone;	/* s->streamdone captured at open time */
 };
 
 static Srv clsrv;
@@ -138,9 +140,12 @@ static void
 streamreset(Session *s)
 {
 	qlock(&s->streamlk);
+	/* Completely clear the buffer */
 	s->streamlen = 0;
-	if(s->streambuf != nil)
+	if(s->streambuf != nil){
 		s->streambuf[0] = '\0';
+		memset(s->streambuf, 0, s->streamcap);
+	}
 	s->streamdone = 0;
 	s->streamgen++;
 	rwakeupall(&s->streamrz);
@@ -724,9 +729,13 @@ modelstext(Req *r)
  * or EOF when the current round's stream is done, or blocks
  * waiting for data / end-of-round / start-of-next-round.
  *
- * Special case: a newly-opened fid (streamoff==0) whose session
- * is idle (streamdone && streamlen==0) blocks until the next
- * prompt write starts producing text.
+ * A newly-opened fid whose session was idle at open time (as
+ * captured by fsopen into fa->streamopendone) blocks until the
+ * next round starts.  To see the last round's text after the
+ * fact, read the prompt file instead.  This matches the design
+ * in STREAMING.md and is what claudetalk relies on: it opens the
+ * stream file and backgrounds the reader before writing to
+ * prompt, expecting the reader to receive the new round's text.
  */
 static void
 streamread(Req *r, Session *s, Faux *fa)
@@ -736,24 +745,31 @@ streamread(Req *r, Session *s, Faux *fa)
 
 	qlock(&s->streamlk);
 	/*
-	 * On first read pin this fid to the current generation.
-	 * If the session is idle (streamdone && streamlen==0),
-	 * defer pinning until a round actually starts, so that a
-	 * cat of stream launched before the prompt write still
-	 * ends up reading the new round rather than the old one.
+	 * On first read, decide which generation this fid belongs
+	 * to.  If the session was idle at open time, wait for the
+	 * next round to start -- regardless of whether there is
+	 * still buffered text from the previous round.  That
+	 * buffered text belongs to the PREVIOUS reader, not us;
+	 * replaying it would make claudetalk print the last reply
+	 * again when the user sends a new message.
+	 *
+	 * If the session was already mid-round at open time, pin
+	 * to that live generation so we stream its output.
 	 */
 	if(!fa->streamgenset){
-		/*
-		 * If the session is currently idle with no buffered
-		 * text (no round has streamed yet, or the buffer was
-		 * reset), wait for the next round to start.  If there
-		 * is buffered text from a completed round, pin to the
-		 * current generation so the reader sees that text
-		 * and then EOF -- useful for "cat stream" after the
-		 * fact.
-		 */
-		while(s->streamdone && s->streamlen == 0)
-			rsleep(&s->streamrz);
+		if(fa->streamopendone){
+			/*
+			 * Opened against an idle session: wait for
+			 * a new round (streamgen must advance AND
+			 * streamdone must have flipped to 0).  The
+			 * streamreset() call in fswrite does both
+			 * atomically under streamlk, so one wakeup
+			 * is enough.
+			 */
+			while(s->streamgen == fa->streamopengen
+			   && s->streamdone)
+				rsleep(&s->streamrz);
+		}
 		fa->streamgen = s->streamgen;
 		fa->streamgenset = 1;
 	}
@@ -798,6 +814,47 @@ streamread(Req *r, Session *s, Faux *fa)
 		}
 		rsleep(&s->streamrz);
 	}
+}
+
+/*
+ * On open, allocate Faux and snapshot session state so that
+ * streamread can tell whether this fid opened against an idle
+ * session (in which case it should wait for the next round) or
+ * mid-round (in which case it should stream the current round).
+ * This eliminates the race window between "cat stream &" and
+ * "echo > prompt" in claudetalk: whichever 9p op lands first
+ * here will see a consistent snapshot under streamlk.
+ */
+static void
+fsopen(Req *r)
+{
+	Faux *fa;
+	uvlong path;
+	int type, sid;
+	Session *s;
+
+	fa = r->fid->aux;
+	if(fa == nil){
+		fa = mallocz(sizeof *fa, 1);
+		if(fa == nil)
+			sysfatal("malloc: %r");
+		r->fid->aux = fa;
+	}
+
+	path = r->fid->qid.path;
+	type = QTYPE(path);
+	sid = QSID(path);
+
+	if(type == Qstream){
+		s = findsession(sid);
+		if(s != nil){
+			qlock(&s->streamlk);
+			fa->streamopengen = s->streamgen;
+			fa->streamopendone = s->streamdone;
+			qunlock(&s->streamlk);
+		}
+	}
+	respond(r, nil);
 }
 
 static void
@@ -1011,7 +1068,7 @@ fswrite(Req *r)
 
 		/*
 		 * Reset streaming buffer *before* we kick off the work
-		 * so any cat of $sess/stream started in parallel with
+		 * so any cat of$sess/stream started in parallel with
 		 * us will block on new data rather than see stale text
 		 * or an immediate EOF.
 		 */
@@ -1114,6 +1171,7 @@ initclsrv(void)
 	memset(&clsrv, 0, sizeof clsrv);
 	clsrv.attach = fsattach;
 	clsrv.walk1 = fswalk1;
+	clsrv.open = fsopen;
 	clsrv.stat = fsstat;
 	clsrv.read = fsread;
 	clsrv.write = fswrite;
@@ -1157,7 +1215,7 @@ threadmain(int argc, char **argv)
 
 	apikey = getenv("ANTHROPIC_API_KEY");
 	if(apikey == nil || apikey[0] == '\0'){
-		fprint(2, "set $ANTHROPIC_API_KEY\n");
+		fprint(2, "set$ANTHROPIC_API_KEY\n");
 		exits("no api key");
 	}
 
