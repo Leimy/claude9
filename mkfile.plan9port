@@ -2,9 +2,9 @@ P9=$PLAN9
 
 <$P9/src/mkhdr
 
-ALL=claude9 claude9fs
+ALL=claude9fs
 
-COMMONO=claude.$O action.$O json.$O
+COMMONO=claude.$O patch.$O json.$O
 
 HFILES=\
 	claude.h\
@@ -12,21 +12,31 @@ HFILES=\
 
 BIN=$HOME/bin
 
+# claude9fs uses libthread and lib9p, both shipped with plan9port.
+# On a system without webfs (typical Mac/Linux plan9port install),
+# claude.c falls back to invoking /usr/bin/curl for HTTP, and
+# claudeconverse_stream falls back to claudeconverse (no SSE
+# streaming), so the stream file emits its output in one burst at
+# end of round.  Otherwise claude9fs and claudetalk behave the
+# same as on 9front.
+
+LIB=\
+	$PLAN9/lib/lib9p.a\
+	$PLAN9/lib/libthread.a\
+	$PLAN9/lib/lib9.a\
+
 default:V: $ALL
 
-claude9: chat.$O $COMMONO
-	$LD -o $target chat.$O $COMMONO
-
 claude9fs: claude9fs.$O $COMMONO
-	$LD -o $target claude9fs.$O $COMMONO
+	$LD -o $target claude9fs.$O $COMMONO $LIB
 
 %.$O: %.c $HFILES
 	$CC $CFLAGS $stem.c
 
 clean:V:
-	rm -f *.o claude9 claude9fs
+	rm -f *.o claude9fs
 
 install:V: $ALL
 	mkdir -p $BIN
-	cp claude9 $BIN/
 	cp claude9fs $BIN/
+	cp claudetalk $BIN/

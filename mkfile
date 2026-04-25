@@ -2,12 +2,9 @@
 
 BIN=$home/bin/$objtype
 
-TARG=claude9 claude9fs
+TARG=claude9fs
 
-COMMONO=claude.$O action.$O json.$O
-
-claude9:V: chat.$O $COMMONO
-	$LD $LDFLAGS -o $target chat.$O $COMMONO
+COMMONO=claude.$O patch.$O json.$O
 
 claude9fs:V: claude9fs.$O $COMMONO
 	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO
@@ -16,14 +13,14 @@ claude9fs:V: claude9fs.$O $COMMONO
 	$CC $CFLAGS $stem.c
 
 clean:V:
-	rm -f *.[$OS] claude9 claude9fs
+	rm -f *.[$OS] claude9fs
 
-install:V: claude9 claude9fs
-	cp claude9 $BIN/
+install:V: claude9fs
 	cp claude9fs $BIN/
+	cp claudetalk $BIN/
 
 nuke:V: clean
-	rm -f $BIN/claude9 $BIN/claude9fs
+	rm -f $BIN/claude9fs $BIN/claudetalk
 
 rebuild:V: clean claude9fs
 	echo rebuilt

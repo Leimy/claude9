@@ -8,20 +8,125 @@ static char *apiurl = "https://api.anthropic.com/v1/messages";
 static char *modelsurl = "https://api.anthropic.com/v1/models?limit=100";
 static char *apiversion = "2023-06-01";
 
-static char *toolnames[] = {
-	"create_file",
-	"patch_file",
-	"delete_file",
-	"read_file",
-	"list_directory",
+/*
+ * Single source of truth for the tools we expose to Claude.
+ *
+ * Every tool takes a "path" parameter; tools that also need a
+ * second parameter (file contents, unified diff) declare it in
+ * the bodyparam / bodydesc fields.  mktools() turns this table
+ * into the Anthropic tools schema, parseinput() extracts the
+ * path/body fields out of a tool_use block's input JSON, and
+ * findtool() / findtooltype() let the rest of the code walk
+ * between API names and the Acreate/Apatch/... enum.
+ */
+typedef struct Tooldef Tooldef;
+struct Tooldef {
+	int type;
+	char *name;
+	char *desc;
+	char *pathdesc;
+	char *bodyparam;	/* nil for path-only tools */
+	char *bodydesc;
 };
-static int tooltypes[] = {
-	Acreate,
-	Apatch,
-	Adelete,
-	Aread,
-	Alist,
+
+static Tooldef tools[] = {
+	{ Acreate, "create_file",
+		"Create or overwrite a file with the given contents. "
+		"Parent directories are created automatically.",
+		"File path to create",
+		"contents", "Complete file contents" },
+
+	{ Apatch, "patch_file",
+		"Apply a unified diff to an existing file.\n"
+		"\n"
+		"Accepts standard unified diff syntax with one or more "
+		"hunks. Each hunk starts with a '@@' header and contains "
+		"lines prefixed ' ' (context), '-' (remove), or '+' (add).\n"
+		"\n"
+		"The diff is applied by an in-tree fuzzy matcher that "
+		"anchors each hunk by its context lines, so:\n"
+		"  - '--- a/path' / '+++ b/path' headers are optional "
+		"(the target file is given by the path parameter);\n"
+		"  - line numbers in '@@ -a,b +c,d @@' are used as hints "
+		"but do not have to be exact;\n"
+		"  - a bare '@@' with no line numbers is accepted;\n"
+		"  - whitespace-only differences inside a line are tolerated.\n"
+		"\n"
+		"Include at least one unchanged context line before and "
+		"after each edit so the hunk can be located unambiguously. "
+		"Hunks are applied in order.",
+		"File path to patch",
+		"diff", "Unified diff to apply" },
+
+	{ Adelete, "delete_file",
+		"Delete a file.",
+		"File path to delete",
+		nil, nil },
+
+	{ Aread, "read_file",
+		"Read the contents of a file and return them.",
+		"File path to read",
+		nil, nil },
+
+	{ Alist, "list_directory",
+		"List the contents of a directory. "
+		"Returns one entry per line.",
+		"Directory path to list",
+		nil, nil },
 };
+
+/*
+ * Look up a tool by its API name.  Returns nil if name is not
+ * one of ours.
+ */
+static Tooldef*
+findtool(char *name)
+{
+	int i;
+
+	if(name == nil)
+		return nil;
+	for(i = 0; i < nelem(tools); i++)
+		if(strcmp(name, tools[i].name) == 0)
+			return &tools[i];
+	return nil;
+}
+
+/*
+ * Look up a tool by its internal Acreate/Apatch/... type.
+ * Returns nil if no match.
+ */
+static Tooldef*
+findtooltype(int type)
+{
+	int i;
+
+	for(i = 0; i < nelem(tools); i++)
+		if(tools[i].type == type)
+			return &tools[i];
+	return nil;
+}
+
+/*
+ * Pull "path" and (if applicable) the body parameter out of a
+ * tool_use block's "input" object, copying both into the given
+ * ToolCall.  Always sets path and body to non-nil malloc'd
+ * strings, possibly empty.
+ */
+static void
+parseinput(ToolCall *tc, Tooldef *td, Json *input)
+{
+	char *s;
+
+	s = jstr(input, "path");
+	tc->path = strdup(s ? s : "");
+	if(td->bodyparam != nil){
+		s = jstr(input, td->bodyparam);
+		tc->body = strdup(s ? s : "");
+	} else {
+		tc->body = strdup("");
+	}
+}
 
 /*
  * Create parent directories for path, like mkdir -p.
@@ -198,134 +303,44 @@ convappend(Conv *c, Msg *m)
 static Json*
 mktools(void)
 {
-	Json *tools, *t, *input, *props, *p, *req;
+	Json *arr, *t, *input, *props, *p, *req;
+	Tooldef *td;
+	int i;
 
-	tools = jarray();
+	arr = jarray();
+	for(i = 0; i < nelem(tools); i++){
+		td = &tools[i];
 
-	/* create_file(path, contents) */
-	t = jobject();
-	jset(t, "name", jstring("create_file"));
-	jset(t, "description", jstring(
-		"Create or overwrite a file with the given contents. "
-		"Parent directories are created automatically."));
-	input = jobject();
-	jset(input, "type", jstring("object"));
-	props = jobject();
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("File path to create"));
-	jset(props, "path", p);
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("Complete file contents"));
-	jset(props, "contents", p);
-	jset(input, "properties", props);
-	req = jarray();
-	jappend(req, jstring("path"));
-	jappend(req, jstring("contents"));
-	jset(input, "required", req);
-	jset(t, "input_schema", input);
-	jappend(tools, t);
+		t = jobject();
+		jset(t, "name", jstring(td->name));
+		jset(t, "description", jstring(td->desc));
 
-	/* patch_file(path, diff) */
-	t = jobject();
-	jset(t, "name", jstring("patch_file"));
-	jset(t, "description", jstring(
-		"Apply a unified diff to an existing file.\n"
-		"\n"
-		"Accepts standard unified diff syntax with one or more "
-		"hunks. Each hunk starts with a '@@' header and contains "
-		"lines prefixed ' ' (context), '-' (remove), or '+' (add).\n"
-		"\n"
-		"The diff is applied by an in-tree fuzzy matcher that "
-		"anchors each hunk by its context lines, so:\n"
-		"  - '--- a/path' / '+++ b/path' headers are optional "
-		"(the target file is given by the path parameter);\n"
-		"  - line numbers in '@@ -a,b +c,d @@' are used as hints "
-		"but do not have to be exact;\n"
-		"  - a bare '@@' with no line numbers is accepted;\n"
-		"  - whitespace-only differences inside a line are tolerated.\n"
-		"\n"
-		"Include at least one unchanged context line before and "
-		"after each edit so the hunk can be located unambiguously. "
-		"Hunks are applied in order."));
-	input = jobject();
-	jset(input, "type", jstring("object"));
-	props = jobject();
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("File path to patch"));
-	jset(props, "path", p);
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("Unified diff to apply"));
-	jset(props, "diff", p);
-	jset(input, "properties", props);
-	req = jarray();
-	jappend(req, jstring("path"));
-	jappend(req, jstring("diff"));
-	jset(input, "required", req);
-	jset(t, "input_schema", input);
-	jappend(tools, t);
+		input = jobject();
+		jset(input, "type", jstring("object"));
 
-	/* read_file(path) */
-	t = jobject();
-	jset(t, "name", jstring("read_file"));
-	jset(t, "description", jstring(
-		"Read the contents of a file and return them."));
-	input = jobject();
-	jset(input, "type", jstring("object"));
-	props = jobject();
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("File path to read"));
-	jset(props, "path", p);
-	jset(input, "properties", props);
-	req = jarray();
-	jappend(req, jstring("path"));
-	jset(input, "required", req);
-	jset(t, "input_schema", input);
-	jappend(tools, t);
+		props = jobject();
+		p = jobject();
+		jset(p, "type", jstring("string"));
+		jset(p, "description", jstring(td->pathdesc));
+		jset(props, "path", p);
 
-	/* list_directory(path) */
-	t = jobject();
-	jset(t, "name", jstring("list_directory"));
-	jset(t, "description", jstring(
-		"List the contents of a directory. "
-		"Returns one entry per line."));
-	input = jobject();
-	jset(input, "type", jstring("object"));
-	props = jobject();
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("Directory path to list"));
-	jset(props, "path", p);
-	jset(input, "properties", props);
-	req = jarray();
-	jappend(req, jstring("path"));
-	jset(input, "required", req);
-	jset(t, "input_schema", input);
-	jappend(tools, t);
+		req = jarray();
+		jappend(req, jstring("path"));
 
-	/* delete_file(path) */
-	t = jobject();
-	jset(t, "name", jstring("delete_file"));
-	jset(t, "description", jstring("Delete a file."));
-	input = jobject();
-	jset(input, "type", jstring("object"));
-	props = jobject();
-	p = jobject();
-	jset(p, "type", jstring("string"));
-	jset(p, "description", jstring("File path to delete"));
-	jset(props, "path", p);
-	jset(input, "properties", props);
-	req = jarray();
-	jappend(req, jstring("path"));
-	jset(input, "required", req);
-	jset(t, "input_schema", input);
-	jappend(tools, t);
+		if(td->bodyparam != nil){
+			p = jobject();
+			jset(p, "type", jstring("string"));
+			jset(p, "description", jstring(td->bodydesc));
+			jset(props, td->bodyparam, p);
+			jappend(req, jstring(td->bodyparam));
+		}
 
-	return tools;
+		jset(input, "properties", props);
+		jset(input, "required", req);
+		jset(t, "input_schema", input);
+		jappend(arr, t);
+	}
+	return arr;
 }
 
 static Json*
@@ -702,8 +717,9 @@ parsetools(Json *content)
 {
 	ToolCall *head, *tail, *tc;
 	Json *block, *input;
-	char *type, *name, *id, *s;
-	int i, j, ttype;
+	char *type, *name, *id;
+	Tooldef *td;
+	int i;
 
 	head = nil;
 	tail = nil;
@@ -721,14 +737,8 @@ parsetools(Json *content)
 		if(name == nil || id == nil)
 			continue;
 
-		ttype = -1;
-		for(j = 0; j < nelem(toolnames); j++){
-			if(strcmp(name, toolnames[j]) == 0){
-				ttype = tooltypes[j];
-				break;
-			}
-		}
-		if(ttype < 0)
+		td = findtool(name);
+		if(td == nil)
 			continue;
 
 		input = jget(block, "input");
@@ -739,29 +749,8 @@ parsetools(Json *content)
 		if(tc == nil)
 			sysfatal("malloc: %r");
 		tc->id = strdup(id);
-		tc->type = ttype;
-
-		switch(ttype){
-		case Acreate:
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			s = jstr(input, "contents");
-			tc->body = strdup(s ? s : "");
-			break;
-		case Apatch:
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			s = jstr(input, "diff");
-			tc->body = strdup(s ? s : "");
-			break;
-		case Adelete:
-		case Aread:
-		case Alist:
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			tc->body = strdup("");
-			break;
-		}
+		tc->type = td->type;
+		parseinput(tc, td, input);
 
 		if(tail == nil)
 			head = tc;
@@ -946,61 +935,6 @@ toollist(char *path)
 }
 
 /*
- * Read up to maxlen bytes from fd, returning a malloc'd NUL-
- * terminated string.  If the stream has more than maxlen bytes,
- * the excess is drained and discarded and the buffer ends with
- * a truncation marker.
- */
-static char*
-readallcapped(int fd, int maxlen)
-{
-	char *buf, *tmp;
-	int len, cap, truncated;
-	long n;
-	char waste[4096];
-	static char trunc[] = "\n...[output truncated]\n";
-
-	cap = 8192;
-	if(cap > maxlen + 1)
-		cap = maxlen + 1;
-	buf = malloc(cap);
-	if(buf == nil)
-		sysfatal("malloc: %r");
-	len = 0;
-	truncated = 0;
-	for(;;){
-		if(len >= maxlen){
-			truncated = 1;
-			while(read(fd, waste, sizeof waste) > 0)
-				;
-			break;
-		}
-		if(len + 1 >= cap){
-			cap = cap * 2;
-			if(cap > maxlen + 1)
-				cap = maxlen + 1;
-			tmp = realloc(buf, cap);
-			if(tmp == nil)
-				sysfatal("realloc: %r");
-			buf = tmp;
-		}
-		n = read(fd, buf + len, cap - 1 - len);
-		if(n <= 0)
-			break;
-		len += n;
-	}
-	buf[len] = '\0';
-	if(truncated){
-		tmp = realloc(buf, len + sizeof trunc);
-		if(tmp == nil)
-			sysfatal("realloc: %r");
-		buf = tmp;
-		memmove(buf + len, trunc, sizeof trunc);
-	}
-	return buf;
-}
-
-/*
  * Execute a tool call. Returns result string (caller frees).
  */
 static char*
@@ -1025,11 +959,9 @@ exectool(ToolCall *tc)
 	case Apatch:
 		/*
 		 * Use the in-tree fuzzy unified-diff applier
-		 * (action.c:applydiff). Previously this shelled out to
-		 * /bin/ape/patch or /bin/patch, which would reject any
-		 * diff without perfect --- / +++ headers and exact line
-		 * numbers, emitting "Only garbage was found in the
-		 * patch input." See PATCH-TOOL-BUG.md.
+		 * (patch.c:applydiff). Tolerant of off-by-one line
+		 * numbers, missing --- / +++ headers, and minor
+		 * whitespace drift.
 		 */
 		return applydiff(tc->path, tc->body);
 
@@ -1052,14 +984,14 @@ exectool(ToolCall *tc)
  * Build a tool_result user message JSON content array.
  */
 static char*
-mktoolresults(ToolCall *tools)
+mktoolresults(ToolCall *calls)
 {
 	Json *content, *block;
 	ToolCall *tc;
 	char *s;
 
 	content = jarray();
-	for(tc = tools; tc != nil; tc = tc->next){
+	for(tc = calls; tc != nil; tc = tc->next){
 		block = jobject();
 		jset(block, "type", jstring("tool_result"));
 		jset(block, "tool_use_id", jstring(tc->id));
@@ -1070,27 +1002,6 @@ mktoolresults(ToolCall *tools)
 	s = jsonstr(content);
 	jsonfree(content);
 	return s;
-}
-
-char*
-claudesend(Conv *c, Usage *usage)
-{
-	Reply *r;
-	char *text;
-
-	r = sendonce(c, usage);
-	if(r == nil)
-		return nil;
-	text = r->text;
-	r->text = nil;
-	replyfree(r);
-	return text;
-}
-
-Reply*
-claudechat(Conv *c, Usage *usage)
-{
-	return sendonce(c, usage);
 }
 
 /*
@@ -1247,7 +1158,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 	Json *content, *block, *input;
 	ToolCall *head, *tail, *tc;
 	char *alltext, *tmp;
-	int i, j, ttype, alllen, tlen;
+	Tooldef *td;
+	int i, alllen, tlen;
 
 	r = mallocz(sizeof *r, 1);
 	if(r == nil) sysfatal("malloc: %r");
@@ -1293,48 +1205,15 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		jset(block, "input", input);
 		jappend(content, block);
 
-		ttype = -1;
-		for(j = 0; j < nelem(toolnames); j++){
-			if(blocks[i].toolname != nil
-			&& strcmp(blocks[i].toolname, toolnames[j]) == 0){
-				ttype = tooltypes[j];
-				break;
-			}
-		}
-		if(ttype < 0)
+		td = findtool(blocks[i].toolname);
+		if(td == nil)
 			continue;
 
 		tc = mallocz(sizeof *tc, 1);
 		if(tc == nil) sysfatal("malloc: %r");
 		tc->id = strdup(blocks[i].toolid ? blocks[i].toolid : "");
-		tc->type = ttype;
-		switch(ttype){
-		case Acreate: {
-			char *s;
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			s = jstr(input, "contents");
-			tc->body = strdup(s ? s : "");
-			break;
-		}
-		case Apatch: {
-			char *s;
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			s = jstr(input, "diff");
-			tc->body = strdup(s ? s : "");
-			break;
-		}
-		case Adelete:
-		case Aread:
-		case Alist: {
-			char *s;
-			s = jstr(input, "path");
-			tc->path = strdup(s ? s : "");
-			tc->body = strdup("");
-			break;
-		}
-		}
+		tc->type = td->type;
+		parseinput(tc, td, input);
 		if(tail == nil) head = tc;
 		else tail->next = tc;
 		tail = tc;
@@ -1600,15 +1479,13 @@ claudeconverse_stream(Conv *c, Usage *usage,
 		for(tc = r->tools; tc != nil; tc = tc->next){
 			/* emit a marker so the user sees why text paused */
 			if(cb != nil){
+				Tooldef *td;
+				char *tname;
+				td = findtooltype(tc->type);
+				tname = td != nil ? td->name : "tool";
 				snprint(marker, sizeof marker,
 					"\n[running %s %s]\n",
-					tc->type == Acreate ? "create_file" :
-					tc->type == Apatch  ? "patch_file"  :
-					tc->type == Adelete ? "delete_file" :
-					tc->type == Aread   ? "read_file"   :
-					tc->type == Alist   ? "list_directory" :
-					"tool",
-					tc->path);
+					tname, tc->path);
 				cb(marker, aux);
 			}
 			tc->result = exectool(tc);

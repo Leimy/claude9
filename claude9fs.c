@@ -8,6 +8,22 @@
 #include "json.h"
 #include "claude.h"
 
+/*
+ * srvrelease/srvacquire are 9front-only helpers that let the 9P
+ * service proc yield while we do slow I/O (HTTP to the API),
+ * so other 9P requests on the same connection can be handled
+ * meanwhile.  plan9port's lib9p has no equivalent; under
+ * plan9port we instead set Srv.srvforker = threadsrvforker so
+ * each request runs in its own proc and blocking is harmless,
+ * and stub these out.
+ *
+ * plan9port's <u.h> defines PLAN9PORT; native 9front does not.
+ */
+#ifdef PLAN9PORT
+#define srvrelease(s) USED(s)
+#define srvacquire(s) USED(s)
+#endif
+
 enum {
 	Qroot,
 	Qclone,
@@ -1176,13 +1192,21 @@ initclsrv(void)
 	clsrv.read = fsread;
 	clsrv.write = fswrite;
 	clsrv.destroyfid = fsdestroyfid;
+#ifdef PLAN9PORT
+	/*
+	 * Under plan9port we have no srvrelease/srvacquire, so let
+	 * lib9p fork a proc per request; that way an API call on
+	 * one fid doesn't block 9P traffic on others.
+	 */
+	clsrv.srvforker = threadsrvforker;
+#endif
 }
 
 static void
 usage(void)
 {
 	fprint(2, "usage: %s [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
-	exits("usage");
+	threadexitsall("usage");
 }
 
 void
@@ -1216,7 +1240,7 @@ threadmain(int argc, char **argv)
 	apikey = getenv("ANTHROPIC_API_KEY");
 	if(apikey == nil || apikey[0] == '\0'){
 		fprint(2, "set$ANTHROPIC_API_KEY\n");
-		exits("no api key");
+		threadexitsall("no api key");
 	}
 
 	initclsrv();

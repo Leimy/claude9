@@ -24,7 +24,12 @@ struct ToolCall {
 	ToolCall *next;
 };
 
-/* result of claudechat - may contain text and/or tool calls */
+/*
+ * Reply assembled from a single API round (with or without
+ * streaming).  May contain text, tool_use blocks, and a raw
+ * JSON snapshot of the assistant's content array suitable for
+ * appending back into a follow-up request.
+ */
 typedef struct Reply Reply;
 struct Reply {
 	char *text;		/* concatenated text blocks */
@@ -37,7 +42,6 @@ typedef struct Msg Msg;
 typedef struct Conv Conv;
 typedef struct Usage Usage;
 typedef struct ModelInfo ModelInfo;
-typedef struct Action Action;
 
 struct Msg {
 	int role;
@@ -68,13 +72,6 @@ struct ModelInfo {
 	int max_output_tokens;
 };
 
-struct Action {
-	int type;		/* "create", "patch", "delete" */
-	char *path;
-	char *body;
-	Action *next;
-};
-
 /* claude.c */
 Conv*	convnew(char *apikey, char *model, int maxtokens, char *sysprompt);
 void	convfree(Conv *c);
@@ -83,8 +80,13 @@ long	convsize(Conv *c);
 Msg*	msgnew(int role, char *text);
 Msg*	msgnewraw(int role, char *text, char *rawjson);
 void	convappend(Conv *c, Msg *m);
-char*	claudesend(Conv *c, Usage *usage);
-Reply*	claudechat(Conv *c, Usage *usage);
+/*
+ * Run the full tool loop: send the conversation, execute any
+ * tool calls Claude makes, send the results back, repeat until
+ * a non-tool stop_reason.  Appends all rounds (assistant +
+ * tool_result) to the conversation.  Returns the final
+ * assistant text (caller frees) or nil on error.
+ */
 char*	claudeconverse(Conv *c, Usage *usage);
 /*
  * Like claudeconverse, but invokes cb(chunk, aux) with each
@@ -92,7 +94,9 @@ char*	claudeconverse(Conv *c, Usage *usage);
  * tool-use rounds, cb may be called with a short marker string
  * such as "\n[running tool: ...]\n" so the user sees progress.
  * Returns the full concatenated assistant text (caller frees),
- * same as claudeconverse.
+ * same as claudeconverse.  Falls back to claudeconverse when
+ * webfs is not available (e.g. plan9port with only curl); in
+ * that case cb is called once with the entire final text.
  */
 char*	claudeconverse_stream(Conv *c, Usage *usage,
 		void (*cb)(char *chunk, void *aux), void *aux);
@@ -102,12 +106,7 @@ char*	readfile(int fd);
 void	mkparents(char *path);
 int	fetchmodels(char *apikey, ModelInfo **out);
 
-/* action.c */
-Action*	parseactions(char *text);
-void	freeactions(Action *a);
-void	showaction(Action *a, int n);
-int	applyaction(Action *a);
-char*	stripactions(char *text);
+/* patch.c */
 /*
  * Apply a unified diff to the file at path using the in-tree
  * fuzzy applier. Returns a malloc'd status string describing

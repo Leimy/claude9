@@ -1,39 +1,41 @@
 # claude9
 
-An interactive Claude AI client for Plan 9 from Bell Labs.
+A Claude AI client for Plan 9 from Bell Labs, exposed as a 9P
+filesystem.
 
-claude9 consists of three components:
+claude9 consists of two components:
 
-- **claude9** - a terminal-based chat interface with file actions,
-  conversation save/load, and bead-based context chaining.
-- **claude9fs** - a 9P filesystem server that exposes Claude sessions
-  as files, suitable for scripting and integration with other tools.
-- **claudetalk** - an rc shell script that provides an interactive
-  chat interface via claude9fs.
+- **claude9fs** - a 9P filesystem server that exposes Claude
+  sessions as files, suitable for scripting and integration with
+  any tool that can read and write files.
+- **claudetalk** - an rc shell script that drives claude9fs to
+  give you an interactive chat interface in the terminal.
 
-All components use the Anthropic Claude API over HTTP.
+Together they replace the older standalone `claude9` chat
+client; everything that program did can be done through the
+filesystem instead, and the filesystem composes with the rest
+of the system in the usual Plan 9 way.
 
 ## Building
 
 ### Plan 9 / 9front
 
-Build with mk:
-
 	mk
 	mk install
 
-This builds both claude9 and claude9fs and installs them to
-$home/bin/$objtype.
+This builds claude9fs and installs it (along with the claudetalk
+script) to `$home/bin/$objtype`.
 
-### plan9port
-
-Build with mk using the plan9port makefile:
+### plan9port (Mac / Linux)
 
 	mk -f mkfile.plan9port
+	mk -f mkfile.plan9port install
 
-This builds claude9 (the interactive chat client) and installs
-it to $HOME/bin. claude9fs requires the Plan 9 thread and 9p
-libraries and is not built under plan9port.
+This builds claude9fs against plan9port's libthread and lib9p.
+On systems without webfs, claude9fs falls back to invoking
+`/usr/bin/curl` for HTTP, so streaming is delivered in one burst
+at end of round rather than incrementally.  Everything else
+works the same.
 
 ## Setup
 
@@ -41,62 +43,8 @@ Set your Anthropic API key in the environment:
 
 	ANTHROPIC_API_KEY=sk-ant-...
 
-HTTP requests are made via webfs (/mnt/web). Make sure webfs is mounted.
-On systems without webfs (e.g. plan9port), curl is used as a fallback.
-
-## claude9 - Interactive Chat
-
-	claude9 [-m model] [-s sysprompt] [-t maxtokens]
-
-Flags:
-
-	-m model       model name or alias (default: claude-opus-4-6)
-	-s sysprompt   custom system prompt
-	-t maxtokens   maximum output tokens (default: 65536)
-
-Messages are entered at the prompt and terminated by a line containing
-only a period (.). Single-line commands starting with / are executed
-immediately.
-
-### Commands
-
-	/help                                   show available commands
-	/models                                 list available models from the API
-	/model                                  show current model
-	/model <name>                           switch model (alias or full ID)
-	/read <file> [file ...] [-- comment]    read files into context and send
-	/save <file>                            save conversation to file
-	/load <file>                            load conversation from file
-	/beadsave <file>                        save condensed bead (summary + file refs)
-	/beadload <file>                        load bead, re-reading files from disk
-	/clear                                  clear conversation history
-	/tokens                                 show current max tokens
-	/tokens <n>                             set max tokens
-	/apply [all|N]                          apply file actions from last response
-
-### File Actions
-
-Claude can propose file changes using structured action blocks in its
-responses. These are parsed automatically and presented for review.
-Use "/apply all" to apply all proposed changes, or "/apply N" to apply
-a specific one.
-
-Supported action types:
-
-	file:create    create a new file with the given contents
-	file:delete    remove a file
-	file:patch     apply a unified diff to an existing file
-
-Patches are applied with fuzzy context matching (up to 3 lines of fuzz)
-and whitespace-tolerant line comparison.
-
-### Beads
-
-The /beadsave and /beadload commands implement a lightweight context
-chaining mechanism. A bead captures a Claude-generated summary of the
-conversation along with references to the files discussed. When loaded
-with /beadload, the files are re-read from disk, giving Claude fresh
-context without replaying the entire conversation history.
+HTTP requests prefer webfs (`/mnt/web`) when available; on
+systems without webfs, curl is used.
 
 ## claude9fs - 9P Filesystem
 
@@ -109,9 +57,9 @@ Flags:
 	-M model       default model (default: claude-sonnet-4-20250514)
 	-t maxtokens   default max tokens (default: 16384)
 
-claude9fs serves a 9P filesystem where each Claude conversation is
-a numbered directory. Reading clone allocates a new session and returns
-its number.
+claude9fs serves a 9P filesystem where each Claude conversation
+is a numbered directory.  Reading clone allocates a new session
+and returns its number.
 
 ### Filesystem Layout
 
@@ -120,7 +68,8 @@ its number.
 		models        read to list available models from the API
 		<n>/          session directory
 			ctl       read for session info; write commands
-			prompt    write a message, read the reply
+			prompt    write a message; read the last final reply
+			stream    read incremental text deltas of current round
 			conv      read full conversation history
 			model     read/write the model name
 			tokens    read/write max output tokens
@@ -137,24 +86,42 @@ its number.
 
 ### Tool Use
 
-When accessed through claude9fs, Claude has access to file tools
-(create_file, patch_file, read_file, list_directory, delete_file)
-which are executed automatically during conversation turns. The full
-tool loop runs when writing to prompt: Claude's tool calls are
-executed and results sent back until Claude produces a final response.
+When you write to `prompt`, claude9fs runs the full tool loop:
+Claude has access to file tools (`create_file`, `patch_file`,
+`read_file`, `list_directory`, `delete_file`) which are executed
+automatically as part of the round, with results sent back to
+Claude until it produces a final response.
 
-## claudetalk - RC Shell Client
+The `patch_file` tool uses the in-tree fuzzy unified-diff applier
+(see `patch.c`), which tolerates off-by-one line numbers, missing
+`---`/`+++` headers, and minor whitespace drift.
+
+### Streaming
+
+The `stream` file emits text deltas incrementally as the model
+generates them.  A reader opened against an idle session blocks
+until the next round starts; once the round finishes, the reader
+hits EOF.  See `STREAMING.md` for details.
+
+To see the last round's text after the fact, read `prompt`
+instead.
+
+## claudetalk - rc Shell Client
 
 	claudetalk [-m model] [-t tokens]
 
-claudetalk is an rc script that provides an interactive chat interface
-using claude9fs. It requires claude9fs to be mounted on /mnt/claude.
+claudetalk is an rc script that talks to a running claude9fs
+mounted on `/mnt/claude`.  It prints incremental text by reading
+the session's `stream` file in the background while writing to
+`prompt`.
 
 ### Commands
 
 	/models        list available models
 	/model         show current model
 	/model <name>  switch model
+	/tokens        show current max tokens
+	/tokens <n>    set max tokens
 	/clear         clear conversation
 	/status        show session info
 	/usage         show token usage
@@ -162,35 +129,9 @@ using claude9fs. It requires claude9fs to be mounted on /mnt/claude.
 	/load <path>   load conversation
 	/quit          exit
 
-Messages are entered and sent with ^D (end of file) on an empty line.
+Messages are entered and sent with `^D` on an empty line.
 
-## Example Session (claude9)
-
-	% claude9
-	claude9 - opus4.6 (claude-opus-4-6)
-	type /help for commands, end messages with '.' on its own line
-
-	opus4.6/65536> /read main.c util.c -- explain this code
-	  added main.c
-	  added util.c
-	sending 2 messages (4832 bytes)... 8s
-	[tokens: 1200 in, 350 out, 1550 total, stop: end_turn]
-	...
-
-	opus4.6/65536> refactor the error handling
-	.
-
-	...
-	actions:
-	  [1] patch main.c (12 lines diff)
-	  [2] patch util.c (8 lines diff)
-	use /apply to apply, /apply N for selective
-
-	opus4.6/65536> /apply all
-	  patched main.c (1 hunks)
-	  patched util.c (1 hunks)
-
-## Example Session (claudetalk)
+## Example Session
 
 	% claude9fs -s claude
 	% claudetalk
@@ -200,7 +141,6 @@ Messages are entered and sent with ^D (end of file) on an empty line.
 
 	claude-sonnet-4-20250514/16384> hello
 	^D
-	...
 	Hello! How can I help you today?
 
 	claude-sonnet-4-20250514/16384> /usage
@@ -211,29 +151,27 @@ Messages are entered and sent with ^D (end of file) on an empty line.
 
 ## File Format
 
-Saved conversations use a simple line-oriented text format with headers
-for metadata (model, maxtokens, sysprompt) and message separators.
-Lines in message bodies that start with "---" are escaped with a
-leading space.
+Saved conversations use a simple line-oriented text format with
+headers for metadata (model, maxtokens, sysprompt) and message
+separators.  Lines in message bodies that start with `---` are
+escaped with a leading space.
 
 ## Source Files
 
-	claude.c       API client: conversation management, HTTP, tool execution
+	claude.c       API client: conversation, HTTP (webfs/curl), tool execution
 	claude.h       shared data structures and function declarations
+	patch.c        in-tree fuzzy unified-diff applier (patch_file tool)
 	json.c         JSON parser and serializer
 	json.h         JSON type definitions
-	chat.c         interactive terminal client (claude9)
-	action.c       action block parser and patch application for claude9
 	claude9fs.c    9P filesystem server (claude9fs)
 	claudetalk     rc script client for claude9fs
 
 ## Dependencies
 
-	Plan 9 C compiler and libraries (libc, bio)
-	thread and 9p libraries (for claude9fs, Plan 9 only)
-	webfs for HTTP (or curl as fallback on plan9port)
+	C compiler and Plan 9 / plan9port libraries (libc, bio, thread, 9p)
+	webfs for streaming HTTP (or curl as fallback)
 	Anthropic API key
 
 ## License
 
-MIT License. See the LICENSE file for details.
+MIT License.  See the LICENSE file for details.
