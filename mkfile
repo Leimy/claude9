@@ -1,6 +1,7 @@
 </$objtype/mkfile
 
 BIN=$home/bin/$objtype
+RCBIN=/rc/bin
 
 TARG=claude9fs
 
@@ -17,10 +18,10 @@ clean:V:
 
 install:V: claude9fs
 	cp claude9fs $BIN/
-	cp claudetalk $BIN/
+	cp claudetalk $RCBIN/
 
 nuke:V: clean
-	rm -f $BIN/claude9fs $BIN/claudetalk
+	rm -f $BIN/claude9fs $RCBIN/claudetalk
 
 rebuild:V: clean claude9fs
 	echo rebuilt

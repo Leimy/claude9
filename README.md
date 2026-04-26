@@ -16,6 +16,69 @@ client; everything that program did can be done through the
 filesystem instead, and the filesystem composes with the rest
 of the system in the usual Plan 9 way.
 
+## Safety and risks - read this first
+
+**claude9fs gives the model the ability to read, write, patch,
+and delete files on your machine.**  When you write to `prompt`,
+claude9fs runs a tool loop in which Claude can call any of the
+following tools without asking you for confirmation each time:
+
+- `create_file` - create or overwrite a file at any path the
+  process can write to.
+- `patch_file` - apply a fuzzy unified diff to an existing file.
+- `read_file` - read any file the process can read.
+- `list_directory` - list any directory the process can read.
+- `delete_file` - remove a file at any path the process can
+  write to.
+
+There is no sandbox.  Tool calls run with the full authority of
+the user that started claude9fs.  On Plan 9 that typically means
+your whole home tree, anything mounted in your namespace
+(including `/mnt/term/...` if you are a drawterm/cpu client into
+your own files), and on plan9port it means your real Unix user
+account.
+
+### Worst case
+
+The worst realistic outcome is that the model, either through
+a mistake, a confused instruction, or content injected from a
+file or web page you asked it to look at, **destroys or
+corrupts files you care about, or leaks their contents back
+through the API**.  Concretely that includes things like:
+
+- overwriting or deleting source files, dotfiles, mail, or
+  notes;
+- writing new files (for example into `$home/bin` or `lib/profile`)
+  that then run the next time you log in;
+- reading secrets (ssh/factotum-adjacent files, API keys,
+  private mail) and sending their contents to Anthropic as
+  part of a tool result;
+- following an instruction smuggled into a document
+  ("prompt injection") that turns a request like "summarise
+  this file" into "delete the following files".
+
+It cannot escape the permissions of the user running
+claude9fs, and it does not get raw shell or network access -
+the only side effects are the five file tools above plus the
+HTTPS calls claude9fs itself makes to the Anthropic API.  But
+within those limits it can do real damage.
+
+### Recommendations
+
+- Run claude9fs as an unprivileged user, ideally in a
+  namespace where only the trees you actually want it to touch
+  are visible (`rfork n`, bind only what is needed, then
+  `mk install`).
+- Keep the source trees you let it edit under version control
+  and commit before each session.
+- Do not run it as a user that has your long-term secrets in
+  readable files.
+- Treat anything the model is asked to read - web pages,
+  issue trackers, third-party source - as potentially
+  hostile input that may try to redirect its tool use.
+- Read `claude.c` if you want to see exactly what each tool
+  does; it is short.
+
 ## Building
 
 ### Plan 9 / 9front
@@ -23,8 +86,12 @@ of the system in the usual Plan 9 way.
 	mk
 	mk install
 
-This builds claude9fs and installs it (along with the claudetalk
-script) to `$home/bin/$objtype`.
+This builds claude9fs and installs it to `$home/bin/$objtype`.
+The `claudetalk` rc script is installed to `/rc/bin`, which is
+the canonical location for system-wide rc scripts on Plan 9 and
+9front; `mk install` therefore needs write permission there
+(run it as the appropriate user, e.g. `glenda` on a default
+9front install, or adjust `RCBIN` in the mkfile).
 
 ### plan9port (Mac / Linux)
 
