@@ -6,6 +6,7 @@ enum {
 	Aread,
 	Alist,
 	Adelete,
+	Amanpage,
 };
 
 enum {
@@ -17,7 +18,7 @@ enum {
 typedef struct ToolCall ToolCall;
 struct ToolCall {
 	char *id;		/* tool_use_id */
-	int type;		/* Acreate, Apatch, Adelete, Aread, Alist */
+	int type;		/* Acreate, Apatch, Adelete, Aread, Alist, Amanpage */
 	char *path;		/* file path */
 	char *body;		/* contents / diff */
 	char *result;		/* result text after execution */

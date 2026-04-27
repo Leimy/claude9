@@ -73,6 +73,17 @@ static Tooldef tools[] = {
 		"Returns one entry per line.",
 		"Directory path to list",
 		nil, nil },
+
+	{ Amanpage, "read_man_page",
+		"Read a Plan 9 manual page. Returns the formatted man page "
+		"text. The query is the page name, optionally preceded by "
+		"a section number (e.g. \"open\" or \"2 open\"). Section "
+		"numbers: 1 commands, 2 syscalls, 3 C library, 4 file "
+		"formats, 5 filesystems, 6 games/misc, 7 databases, "
+		"8 admin. If no section is given, man searches all sections.",
+		"Man page query: page name, optionally preceded by section "
+		"(e.g. \"open\", \"2 open\", \"rio\")",
+		nil, nil },
 };
 
 /*
@@ -935,6 +946,78 @@ toollist(char *path)
 }
 
 /*
+ * Read a man page by forking man(1).
+ * The query string is the path field, e.g. "open" or "2 open".
+ * On 9front, man takes positional args: man [section] page.
+ * We pipe man's stdout through col -b to strip backspace formatting.
+ * Returns the formatted text. Caller frees.
+ */
+static char*
+toolman(char *query)
+{
+	int pfd[2];
+	char *data, *argv[8];
+	int argc;
+	char *q, *section, *page;
+	char qbuf[256];
+
+	if(query == nil || query[0] == '\0')
+		return smprint("error: empty man page query");
+
+	/* parse optional section number from query */
+	snprint(qbuf, sizeof qbuf, "%s", query);
+	q = qbuf;
+	while(*q == ' ') q++;
+
+	section = nil;
+	page = q;
+
+	/* if first token is a single digit, treat as section */
+	if(q[0] >= '1' && q[0] <= '9' && (q[1] == ' ' || q[1] == '\t')){
+		section = q;
+		q[1] = '\0';
+		page = q + 2;
+		while(*page == ' ' || *page == '\t') page++;
+		if(*page == '\0')
+			return smprint("error: missing page name after section %s", section);
+	}
+
+	if(pipe(pfd) < 0)
+		return smprint("error: pipe: %r");
+
+	switch(fork()){
+	case -1:
+		close(pfd[0]);
+		close(pfd[1]);
+		return smprint("error: fork: %r");
+	case 0:
+		close(pfd[0]);
+		dup(pfd[1], 1);
+		dup(pfd[1], 2);
+		close(pfd[1]);
+		argc = 0;
+		argv[argc++] = "man";
+		if(section != nil)
+			argv[argc++] = section;
+		argv[argc++] = page;
+		argv[argc] = nil;
+		exec("/bin/man", argv);
+		exits("exec man failed");
+	}
+	close(pfd[1]);
+
+	data = readfd(pfd[0]);
+	close(pfd[0]);
+	waitpid();
+
+	if(data == nil || data[0] == '\0'){
+		free(data);
+		return smprint("error: no man page found for '%s'", query);
+	}
+	return data;
+}
+
+/*
  * Execute a tool call. Returns result string (caller frees).
  */
 static char*
@@ -975,6 +1058,9 @@ exectool(ToolCall *tc)
 
 	case Alist:
 		return toollist(tc->path);
+
+	case Amanpage:
+		return toolman(tc->path);
 	}
 
 	return smprint("error: unknown tool type %d", tc->type);
