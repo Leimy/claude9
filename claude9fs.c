@@ -1239,7 +1239,7 @@ threadmain(int argc, char **argv)
 
 	apikey = getenv("ANTHROPIC_API_KEY");
 	if(apikey == nil || apikey[0] == '\0'){
-		fprint(2, "set$ANTHROPIC_API_KEY\n");
+		fprint(2, "set $ANTHROPIC_API_KEY\n");
 		threadexitsall("no api key");
 	}
 
