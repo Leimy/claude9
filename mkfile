@@ -19,10 +19,10 @@ clean:V:
 install:V: claude9fs
 	cp claude9fs $BIN/
 	cp claudetalk $RCBIN/
-	cp claudebox $RCBIN/
+	chmod +x /bin/claudetalk
 
 nuke:V: clean
-	rm -f $BIN/claude9fs $RCBIN/claudetalk $RCBIN/claudebox
+	rm -f $BIN/claude9fs $RCBIN/claudetalk
 
 rebuild:V: clean claude9fs
 	echo rebuilt
