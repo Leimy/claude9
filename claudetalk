@@ -1,15 +1,7 @@
 #!/bin/rc
 # claudetalk - interactive Claude chat via claude9fs
-# usage: claudetalk [-m model] [-t tokens]
 
 rfork e
-
-flagfmt='m:model,t:tokens'
-args='[-m model] [-t tokens]'
-if(! ifs=() eval `{aux/getflags $*}){
-	echo usage: claudetalk $args >[1=2]
-	exit usage
-}
 
 mnt=/mnt/claude
 if(! test -f $mnt/clone){
@@ -23,12 +15,6 @@ if(~ $#n 0){
 	exit 'clone failed'
 }
 sess=$mnt/$n
-
-if(! ~ $#model 0)
-	echo -n $model > $sess/model
-
-if(! ~ $#tokens 0)
-	echo -n $tokens > $sess/tokens
 
 fn sigexit {
 	echo hangup > $sess/ctl >[2]/dev/null

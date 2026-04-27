@@ -182,7 +182,7 @@ instead.
 
 ## claudetalk - rc Shell Client
 
-	claudetalk [-m model] [-t tokens]
+	claudetalk
 
 claudetalk is an rc script that talks to a running claude9fs
 mounted on `/mnt/claude`.  It prints incremental text by reading
