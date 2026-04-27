@@ -3,13 +3,16 @@
 A Claude AI client for Plan 9 from Bell Labs, exposed as a 9P
 filesystem.
 
-claude9 consists of two components:
+claude9 consists of three components:
 
 - **claude9fs** - a 9P filesystem server that exposes Claude
   sessions as files, suitable for scripting and integration with
   any tool that can read and write files.
 - **claudetalk** - an rc shell script that drives claude9fs to
   give you an interactive chat interface in the terminal.
+- **claudebox** - an rc shell script that runs claude9fs and
+  claudetalk inside a restricted namespace that hides
+  `/mnt/term` and limits the visible filesystem.
 
 Together they replace the older standalone `claude9` chat
 client; everything that program did can be done through the
@@ -31,12 +34,11 @@ following tools without asking you for confirmation each time:
 - `delete_file` - remove a file at any path the process can
   write to.
 
-There is no sandbox.  Tool calls run with the full authority of
-the user that started claude9fs.  On Plan 9 that typically means
-your whole home tree, anything mounted in your namespace
-(including `/mnt/term/...` if you are a drawterm/cpu client into
-your own files), and on plan9port it means your real Unix user
-account.
+Tool calls run with the full authority of the user that started
+claude9fs.  On Plan 9 that typically means your whole home tree,
+anything mounted in your namespace (including `/mnt/term/...` if
+you are a drawterm/cpu client into your own files), and on
+plan9port it means your real Unix user account.
 
 ### Worst case
 
@@ -65,10 +67,8 @@ within those limits it can do real damage.
 
 ### Recommendations
 
-- Run claude9fs as an unprivileged user, ideally in a
-  namespace where only the trees you actually want it to touch
-  are visible (`rfork n`, bind only what is needed, then
-  `mk install`).
+- Use `claudebox` (described below) to hide `/mnt/term` and
+  scope the working directory to a specific project tree.
 - Keep the source trees you let it edit under version control
   and commit before each session.
 - Do not run it as a user that has your long-term secrets in
@@ -78,6 +78,79 @@ within those limits it can do real damage.
   hostile input that may try to redirect its tool use.
 - Read `claude.c` if you want to see exactly what each tool
   does; it is short.
+- For a stronger boundary, run the whole thing as a dedicated
+  user whose only file permissions are on the project tree.
+
+## claudebox - restricted namespace
+
+	claudebox projectdir
+
+`claudebox` is an rc script (installed to `/rc/bin` alongside
+`claudetalk`) that wraps `claude9fs` + `claudetalk` in a
+restricted namespace.  Inside the box:
+
+- the directory you pass on the command line is bound at
+  `/n/proj` and is the working directory at startup;
+- system trees (`/bin`, `/lib`, `/$cputype`) are bound in
+  from the parent namespace so tools and compilers work;
+- kernel device trees and IPC mounts (`/dev`, `/proc`, `/fd`,
+  `/net`, `/srv`) are bound in directly;
+- `/mnt` is a **private ramfs** with only `/mnt/web`,
+  `/mnt/factotum`, and `/mnt/webcookies` selectively bound
+  in from the parent -- this is the key security measure;
+- `/tmp` is a private ramfs that evaporates when the box
+  exits;
+- `/env` is bound writable from `#e` so child processes can
+  set variables normally.
+
+### What is excluded
+
+- **`/mnt/term`** -- the drawterm host filesystem.  This is
+  the big one.  Without claudebox, a drawterm user's entire
+  host machine (Mac, Linux, Windows) is reachable at
+  `/mnt/term/...`, and the model's tool calls can read and
+  write there freely.  claudebox hides it.
+- **`/mnt/wsys`**, **`/mnt/plumb`**, and any other mounts
+  under the parent's `/mnt` that are not explicitly brought
+  in.
+- **`/usr/$user`** -- the user's home tree is not bound in.
+  The model cannot read `$home/lib/profile`, mail, or other
+  personal files (unless they happen to live under the
+  project directory).
+
+### What this does NOT protect
+
+This is a namespace sandbox, not a permission sandbox.
+
+- **If you are hostowner, the model can write to `/bin`,
+  `/lib`, and other system trees** that are bound into the
+  box.  Plan 9's `bind(1)` has no read-only flag; a bind
+  preserves whatever access rights the underlying server
+  grants.  `srvfs -R` (read-only re-export via exportfs)
+  would fix this in theory but deadlocks in practice when
+  the pivot rewrites the namespace the exportfs depends on.
+- **The model can read anything bound into the box.**  That
+  includes system source, libraries, and whatever is visible
+  under `/dev`, `/proc`, and `/net`.
+- **`/net` is not filtered.**  The model can in principle ask
+  webfs to dial any host the machine can reach.  If that
+  matters, run claudebox on a host with a restrictive
+  firewall, or inside `vmx(1)`.
+- **For a real permission boundary**, run as a dedicated user
+  whose only write permissions are on the project tree.
+  Then namespace restriction plus filesystem permissions
+  together give you both path hiding and write protection.
+
+### Typical use
+
+	% claudebox $home/src/myproj
+	claude9 session 0 - claude-sonnet-4-20250514
+	...
+	claude-sonnet-4-20250514/16384> add a TODO comment to main.c
+	^D
+
+The model sees `main.c` at `/n/proj/main.c`; on the host that
+is `$home/src/myproj/main.c`.
 
 ## Building
 
@@ -87,9 +160,10 @@ within those limits it can do real damage.
 	mk install
 
 This builds claude9fs and installs it to `$home/bin/$objtype`.
-The `claudetalk` rc script is installed to `/rc/bin`, which is
-the canonical location for system-wide rc scripts on Plan 9 and
-9front; `mk install` therefore needs write permission there
+The `claudetalk` and `claudebox` rc scripts are installed to
+`/rc/bin`, which is the canonical location for system-wide rc
+scripts on Plan 9 and 9front; `mk install` therefore needs
+write permission there
 (run it as the appropriate user, e.g. `glenda` on a default
 9front install, or adjust `RCBIN` in the mkfile).
 
@@ -232,6 +306,7 @@ escaped with a leading space.
 	json.h         JSON type definitions
 	claude9fs.c    9P filesystem server (claude9fs)
 	claudetalk     rc script client for claude9fs
+	claudebox      rc script: run claude9fs+claudetalk in a restricted ns
 
 ## Dependencies
 
