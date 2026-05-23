@@ -506,16 +506,20 @@ convtext(Conv *c)
 static char*
 usagetext(Session *s)
 {
-	char buf[256];
+	char buf[512];
 
 	snprint(buf, sizeof buf,
 		"input_tokens %d\n"
 		"output_tokens %d\n"
 		"total_tokens %d\n"
+		"cache_creation_input_tokens %d\n"
+		"cache_read_input_tokens %d\n"
 		"stop_reason %s\n",
 		s->usage.input_tokens,
 		s->usage.output_tokens,
 		s->usage.input_tokens + s->usage.output_tokens,
+		s->usage.cache_creation_input_tokens,
+		s->usage.cache_read_input_tokens,
 		s->usage.stop_reason ? s->usage.stop_reason : "none");
 	return estrdup9p(buf);
 }

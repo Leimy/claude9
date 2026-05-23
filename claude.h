@@ -7,6 +7,8 @@ enum {
 	Alist,
 	Adelete,
 	Amanpage,
+	Amemcheck,
+	Amk,
 };
 
 enum {
@@ -18,7 +20,7 @@ enum {
 typedef struct ToolCall ToolCall;
 struct ToolCall {
 	char *id;		/* tool_use_id */
-	int type;		/* Acreate, Apatch, Adelete, Aread, Alist, Amanpage */
+	int type;		/* Acreate, Apatch, Adelete, Aread, Alist, Amanpage, Amemcheck, Amk */
 	char *path;		/* file path */
 	char *body;		/* contents / diff */
 	char *result;		/* result text after execution */
@@ -64,6 +66,8 @@ struct Conv {
 struct Usage {
 	int input_tokens;
 	int output_tokens;
+	int cache_creation_input_tokens;
+	int cache_read_input_tokens;
 	char *stop_reason;
 };
 

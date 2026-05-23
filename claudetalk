@@ -9,6 +9,19 @@ if(! test -f $mnt/clone){
 	exit 'no fs'
 }
 
+# Memory store check: beads gives Claude persistent, structured
+# memory across sessions.  If $beads is set we use that path,
+# otherwise default to /n/beads.  Absence is non-fatal; tools
+# that touch the store will just see ENOENT.
+if(~ $#beads 0)
+	beads=/n/beads
+if(! test -d $beads/by-id){
+	echo 'memory: '$beads' not mounted (beadsfs disabled)' >[1=2]
+	echo 'hint: beadsfs -s beads -m '$beads' <store>' >[1=2]
+}
+if not
+	echo 'memory: '$beads >[1=2]
+
 n=`{cat $mnt/clone}
 if(~ $#n 0){
 	echo 'failed to allocate session' >[1=2]

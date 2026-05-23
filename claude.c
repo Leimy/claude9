@@ -84,6 +84,37 @@ static Tooldef tools[] = {
 		"Man page query: page name, optionally preceded by section "
 		"(e.g. \"open\", \"2 open\", \"rio\")",
 		nil, nil },
+
+	{ Amemcheck, "memory_check",
+		"Report on the persistent memory store (beadsfs).  "
+		"Returns whether memory is mounted, the total bead count, "
+		"the type distribution, and a preview of the most recent "
+		"beads.  Memory is a graph of small notes ('beads') with "
+		"typed directed edges that survives across sessions.  "
+		"Beads live at the given mount point (default /n/beads); "
+		"interact with them using the file tools: "
+		"read_file /n/beads/by-id/N/info to inspect a bead, "
+		"list_directory /n/beads/by-id to enumerate, "
+		"create_file /n/beads/new to add a bead, "
+		"create_file /n/beads/link 'FROM EDGETYPE TO' to link two beads, "
+		"create_file /n/beads/by-id/N/ctl 'type X' to retype, "
+		"delete_file /n/beads/by-id/N to remove a bead and its edges.",
+		"Memory mount point (use /n/beads unless told otherwise)",
+		nil, nil },
+
+	{ Amk, "mk",
+		"Run mk(1) in a working directory and return the combined "
+		"stdout+stderr output.  Use this to check your own work: "
+		"after editing source, run mk to see whether it still "
+		"builds and to read any compiler diagnostics.  The "
+		"'path' parameter is the directory to run mk in (an "
+		"empty string means the current directory).  The "
+		"'targets' parameter is a space-separated list of mk "
+		"targets and/or arguments (e.g. \"\", \"clean\", "
+		"\"clean all\", \"beadsfs\"); empty means the default "
+		"target.  Output is truncated if it grows very large.",
+		"Directory to run mk in (empty for current directory)",
+		"targets", "Space-separated mk targets/args, or empty for the default target" },
 };
 
 /*
@@ -222,7 +253,59 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt)
 			"You are a coding assistant running on Plan 9 (9front). "
 			"You have tools to create, patch, and delete files. "
 			"Use the tools when the user asks you to make changes. "
-			"Use only ASCII characters in your responses.");
+			"Use only ASCII characters in your responses.\n"
+			"\n"
+			"Checking your work\n"
+			"------------------\n"
+			"You have an 'mk' tool that runs mk(1) in a given "
+			"directory and returns its combined output.  After "
+			"editing source in a project that builds with mk, "
+			"run it to verify the build still succeeds and to "
+			"read any diagnostics.  Treat compile errors as real "
+			"bugs to fix, not noise.\n"
+			"\n"
+			"Environment\n"
+			"-----------\n"
+			"You may have a persistent memory store mounted at "
+			"/n/beads, served by beadsfs.  Use the memory_check "
+			"tool at the start of a session to see if it is "
+			"available and to learn what is already there.  If "
+			"it is, treat it as your project notebook across "
+			"sessions.\n"
+			"\n"
+			"Memory is a graph of small notes called 'beads'.  "
+			"Each bead has a numeric id, a one-letter type "
+			"(t=task, n=note, d=decision, a=artifact, l=log), "
+			"and a payload of up to about 500 bytes.  Beads can "
+			"be linked with typed directed edges "
+			"(d=depends, r=references, c=child, s=supersedes).\n"
+			"\n"
+			"Interact with memory using the normal file tools:\n"
+			"  list_directory /n/beads/by-id          -- list all beads\n"
+			"  read_file /n/beads/by-id/N/info        -- inspect a bead\n"
+			"  read_file /n/beads/by-id/N/payload     -- raw payload\n"
+			"  list_directory /n/beads/search/<q>     -- search by substring\n"
+			"  list_directory /n/beads/by-type/<t>    -- filter by type letter\n"
+			"  create_file /n/beads/new <content>     -- create a note bead\n"
+			"  create_file /n/beads/link 'A d B'      -- link bead A to bead B (depends)\n"
+			"  create_file /n/beads/by-id/N/payload   -- replace payload\n"
+			"  create_file /n/beads/by-id/N/ctl 'type X' -- retype to X\n"
+			"  delete_file /n/beads/by-id/N           -- delete bead (and its edges)\n"
+			"\n"
+			"Memory etiquette:\n"
+			"  - At session start, run memory_check.  If beads "
+			"exist, browse for context relevant to the user's "
+			"request before making changes.\n"
+			"  - When you finish a meaningful chunk of work or "
+			"make a decision worth remembering, write a short "
+			"bead summarising it and link it to whatever "
+			"motivated the work.\n"
+			"  - Aim for one idea per bead; a bead should be a "
+			"sentence or two, not an essay.  If a thought "
+			"doesn't fit, split it across linked beads using "
+			"child ('c') edges.\n"
+			"  - If /n/beads is not mounted, proceed without it "
+			"and do not mention it to the user.");
 	return c;
 }
 
@@ -314,7 +397,7 @@ convappend(Conv *c, Msg *m)
 static Json*
 mktools(void)
 {
-	Json *arr, *t, *input, *props, *p, *req;
+	Json *arr, *t, *input, *props, *p, *req, *cc;
 	Tooldef *td;
 	int i;
 
@@ -349,6 +432,14 @@ mktools(void)
 		jset(input, "properties", props);
 		jset(input, "required", req);
 		jset(t, "input_schema", input);
+
+		/* mark the last tool with cache_control for prompt caching */
+		if(i == nelem(tools) - 1){
+			cc = jobject();
+			jset(cc, "type", jstring("ephemeral"));
+			jset(t, "cache_control", cc);
+		}
+
 		jappend(arr, t);
 	}
 	return arr;
@@ -357,15 +448,24 @@ mktools(void)
 static Json*
 buildreq(Conv *c)
 {
-	Json *req, *msgs, *msg, *content, *block;
+	Json *req, *msgs, *msg, *content, *block, *sys, *cc;
 	Msg *m;
 
 	req = jobject();
 	jset(req, "model", jstring(c->model));
 	jset(req, "max_tokens", jintval(c->maxtokens));
 
-	if(c->sysprompt)
-		jset(req, "system", jstring(c->sysprompt));
+	if(c->sysprompt){
+		sys = jarray();
+		block = jobject();
+		jset(block, "type", jstring("text"));
+		jset(block, "text", jstring(c->sysprompt));
+		cc = jobject();
+		jset(cc, "type", jstring("ephemeral"));
+		jset(block, "cache_control", cc);
+		jappend(sys, block);
+		jset(req, "system", sys);
+	}
 
 	jset(req, "tools", mktools());
 
@@ -392,6 +492,22 @@ buildreq(Conv *c)
 		jset(msg, "content", content);
 		jappend(msgs, msg);
 	}
+
+	/*
+	 * Mark the last message's content with cache_control so the
+	 * entire conversation prefix is cached on subsequent requests.
+	 */
+	if(msgs->nitem > 0){
+		msg = jidx(msgs, msgs->nitem - 1);
+		content = jget(msg, "content");
+		if(content != nil && content->nitem > 0){
+			block = jidx(content, content->nitem - 1);
+			cc = jobject();
+			jset(cc, "type", jstring("ephemeral"));
+			jset(block, "cache_control", cc);
+		}
+	}
+
 	jset(req, "messages", msgs);
 	return req;
 }
@@ -449,7 +565,8 @@ webfssend(Conv *c, char *body)
 	|| fprint(fd, "request POST\n") < 0
 	|| fprint(fd, "headers Content-Type: application/json\r\n") < 0
 	|| fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
+	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
 		close(fd);
 		close(clonefd);
 		werrstr("write ctl: %r");
@@ -505,6 +622,7 @@ curlconfig(char *apikey)
 	fprint(fd, "header \"Content-Type: application/json\"\n");
 	fprint(fd, "header \"x-api-key: %s\"\n", apikey);
 	fprint(fd, "header \"anthropic-version: %s\"\n", apiversion);
+	fprint(fd, "header \"anthropic-beta: prompt-caching-2024-07-31\"\n");
 	close(fd);
 	return path;
 }
@@ -648,7 +766,8 @@ webfssend_stream(Conv *c, char *body, int *clonefdp)
 	|| fprint(fd, "headers Content-Type: application/json\r\n") < 0
 	|| fprint(fd, "headers Accept: text/event-stream\r\n") < 0
 	|| fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
+	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
 		close(fd);
 		close(clonefd);
 		werrstr("write ctl: %r");
@@ -850,6 +969,8 @@ sendonce(Conv *c, Usage *usage)
 		if(uobj != nil){
 			usage->input_tokens += jint(uobj, "input_tokens");
 			usage->output_tokens += jint(uobj, "output_tokens");
+			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
+			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
 		}
 	}
 
@@ -1018,6 +1139,270 @@ toolman(char *query)
 }
 
 /*
+ * memory_check: report on a beadsfs mount.
+ * path is the mount root (e.g. /n/beads); empty -> /n/beads.
+ * Returns a human-readable summary:
+ *   - mount status
+ *   - bead count
+ *   - type distribution (one line per type letter)
+ *   - last few beads with id, type, payload preview
+ * Always returns a malloc'd string.  Errors are reported in
+ * the returned text so Claude sees them as tool output.
+ */
+static char*
+toolmemcheck(char *root)
+{
+	char *mount, *byid, *p, *out;
+	int fd, n, i, total, npreview, previewmax;
+	Dir *d;
+	vlong *ids;
+	int nids, idcap;
+	int counts[128];
+	char line[1024];
+	int outlen, outcap;
+	char *tmp;
+
+	if(root == nil || root[0] == '\0')
+		mount = strdup("/n/beads");
+	else
+		mount = strdup(root);
+
+	byid = smprint("%s/by-id", mount);
+	fd = open(byid, OREAD);
+	if(fd < 0){
+		out = smprint("memory not mounted at %s: %r\n"
+			"hint: beadsfs -s beads -m %s <store>\n",
+			mount, mount);
+		free(mount);
+		free(byid);
+		return out;
+	}
+
+	/* enumerate ids */
+	ids = nil;
+	nids = 0;
+	idcap = 0;
+	memset(counts, 0, sizeof counts);
+	while((n = dirread(fd, &d)) > 0){
+		for(i = 0; i < n; i++){
+			if(nids >= idcap){
+				idcap = idcap ? idcap * 2 : 64;
+				ids = realloc(ids, idcap * sizeof *ids);
+				if(ids == nil)
+					sysfatal("realloc: %r");
+			}
+			ids[nids++] = strtoll(d[i].name, nil, 10);
+		}
+		free(d);
+	}
+	close(fd);
+	total = nids;
+
+	/* read each bead's type to build type histogram */
+	for(i = 0; i < nids; i++){
+		char *tpath, *tbuf;
+		int tfd, m;
+		char tb[16];
+		tpath = smprint("%s/by-id/%lld/type", mount, ids[i]);
+		tfd = open(tpath, OREAD);
+		free(tpath);
+		if(tfd < 0)
+			continue;
+		m = read(tfd, tb, sizeof tb - 1);
+		close(tfd);
+		if(m <= 0)
+			continue;
+		tb[m] = '\0';
+		tbuf = tb;
+		while(*tbuf == ' ' || *tbuf == '\n') tbuf++;
+		if(*tbuf != '\0' && (uchar)*tbuf < 128)
+			counts[(uchar)*tbuf]++;
+	}
+
+	/* build output */
+	outcap = 4096;
+	out = malloc(outcap);
+	if(out == nil)
+		sysfatal("malloc: %r");
+	outlen = 0;
+	outlen += snprint(out + outlen, outcap - outlen,
+		"memory mounted at %s\n", mount);
+	outlen += snprint(out + outlen, outcap - outlen,
+		"beads: %d\n", total);
+	if(total > 0){
+		outlen += snprint(out + outlen, outcap - outlen, "types:\n");
+		for(i = 0; i < 128; i++){
+			if(counts[i] == 0)
+				continue;
+			outlen += snprint(out + outlen, outcap - outlen,
+				"  %c %d\n", i, counts[i]);
+		}
+	}
+
+	/* sort ids ascending (dirread order isn't guaranteed) */
+	for(i = 1; i < nids; i++){
+		vlong v = ids[i];
+		int j = i - 1;
+		while(j >= 0 && ids[j] > v){
+			ids[j+1] = ids[j];
+			j--;
+		}
+		ids[j+1] = v;
+	}
+
+	/* preview last 5 by id */
+	previewmax = 5;
+	npreview = total < previewmax ? total : previewmax;
+	if(npreview > 0){
+		outlen += snprint(out + outlen, outcap - outlen,
+			"recent:\n");
+		for(i = nids - npreview; i < nids; i++){
+			char *ipath, *info;
+			int ifd, m;
+			char ibuf[1024];
+			ipath = smprint("%s/by-id/%lld/info", mount, ids[i]);
+			ifd = open(ipath, OREAD);
+			free(ipath);
+			if(ifd < 0)
+				continue;
+			m = read(ifd, ibuf, sizeof ibuf - 1);
+			close(ifd);
+			if(m <= 0)
+				continue;
+			ibuf[m] = '\0';
+			/* trim to first 160 chars and strip trailing newline */
+			if(m > 160){
+				ibuf[160] = '\0';
+				m = 160;
+			}
+			while(m > 0 && (ibuf[m-1] == '\n' || ibuf[m-1] == ' '))
+				ibuf[--m] = '\0';
+			/* collapse newlines inside info for compactness */
+			info = ibuf;
+			for(p = info; *p != '\0'; p++)
+				if(*p == '\n') *p = ' ';
+			/* grow out as needed */
+			snprint(line, sizeof line, "  %s\n", info);
+			n = strlen(line);
+			while(outlen + n + 1 > outcap){
+				outcap *= 2;
+				tmp = realloc(out, outcap);
+				if(tmp == nil)
+					sysfatal("realloc: %r");
+				out = tmp;
+			}
+			memmove(out + outlen, line, n);
+			outlen += n;
+			out[outlen] = '\0';
+		}
+	}
+
+	free(ids);
+	free(byid);
+	free(mount);
+	return out;
+}
+
+/*
+ * toolmk: run mk(1) in the given directory and return its
+ * combined stdout+stderr.  dir == nil or "" means cwd.  args
+ * is a single string of space-separated mk arguments/targets;
+ * we split on runs of whitespace.  Output is capped so a
+ * runaway build can't blow the conversation budget.
+ */
+enum {
+	Mkmaxout = 64*1024,	/* truncate beyond this many bytes */
+	Mkmaxargs = 64,
+};
+
+static char*
+toolmk(char *dir, char *args)
+{
+	int pfd[2];
+	char *data, *argv[Mkmaxargs], *buf, *p, *out;
+	int argc, outlen;
+
+	if(args == nil)
+		args = "";
+
+	if(pipe(pfd) < 0)
+		return smprint("error: pipe: %r");
+
+	/* duplicate args so we can chop it up in place */
+	buf = strdup(args);
+	if(buf == nil){
+		close(pfd[0]);
+		close(pfd[1]);
+		return smprint("error: strdup: %r");
+	}
+
+	switch(fork()){
+	case -1:
+		close(pfd[0]);
+		close(pfd[1]);
+		free(buf);
+		return smprint("error: fork: %r");
+	case 0:
+		close(pfd[0]);
+		dup(pfd[1], 1);
+		dup(pfd[1], 2);
+		close(pfd[1]);
+
+		if(dir != nil && dir[0] != '\0'){
+			if(chdir(dir) < 0){
+				fprint(2, "chdir %s: %r\n", dir);
+				exits("chdir");
+			}
+		}
+
+		argc = 0;
+		argv[argc++] = "mk";
+		p = buf;
+		while(argc < Mkmaxargs - 1){
+			while(*p == ' ' || *p == '\t' || *p == '\n')
+				p++;
+			if(*p == '\0')
+				break;
+			argv[argc++] = p;
+			while(*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n')
+				p++;
+			if(*p == '\0')
+				break;
+			*p++ = '\0';
+		}
+		argv[argc] = nil;
+		exec("/bin/mk", argv);
+		fprint(2, "exec mk: %r\n");
+		exits("exec mk failed");
+	}
+	close(pfd[1]);
+	free(buf);
+
+	data = readfd(pfd[0]);
+	close(pfd[0]);
+	waitpid();
+
+	if(data == nil)
+		return smprint("mk (in %s): no output, error reading: %r",
+			dir != nil && dir[0] ? dir : ".");
+
+	outlen = strlen(data);
+	if(outlen > Mkmaxout){
+		out = smprint("mk (in %s): output truncated to %d of %d bytes\n%.*s\n[... truncated ...]\n",
+			dir != nil && dir[0] ? dir : ".",
+			Mkmaxout, outlen, Mkmaxout, data);
+		free(data);
+		return out;
+	}
+	if(outlen == 0){
+		free(data);
+		return smprint("mk (in %s): ok (no output)",
+			dir != nil && dir[0] ? dir : ".");
+	}
+	return data;
+}
+
+/*
  * Execute a tool call. Returns result string (caller frees).
  */
 static char*
@@ -1061,6 +1446,12 @@ exectool(ToolCall *tc)
 
 	case Amanpage:
 		return toolman(tc->path);
+
+	case Amemcheck:
+		return toolmemcheck(tc->path);
+
+	case Amk:
+		return toolmk(tc->path, tc->body);
 	}
 
 	return smprint("error: unknown tool type %d", tc->type);
@@ -1363,8 +1754,11 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 	if(strcmp(etype, "message_start") == 0){
 		msg = jget(ev, "message");
 		uobj = jget(msg, "usage");
-		if(usage != nil && uobj != nil)
+		if(usage != nil && uobj != nil){
 			usage->input_tokens += jint(uobj, "input_tokens");
+			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
+			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
+		}
 		jsonfree(ev);
 		return 0;
 	}
@@ -1379,8 +1773,11 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			}
 		}
 		uobj = jget(ev, "usage");
-		if(usage != nil && uobj != nil)
+		if(usage != nil && uobj != nil){
 			usage->output_tokens += jint(uobj, "output_tokens");
+			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
+			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
+		}
 		jsonfree(ev);
 		return 0;
 	}
@@ -1622,7 +2019,8 @@ webfsget(char *apikey, char *url)
 	if(fprint(fd, "url %s\n", url) < 0
 	|| fprint(fd, "request GET\n") < 0
 	|| fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
+	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
 		close(fd);
 		close(clonefd);
 		free(webdir);
