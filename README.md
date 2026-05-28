@@ -128,7 +128,7 @@ Flags:
 
 	-s srvname     post to /srv with this name
 	-m mtpt        mount point (default: /mnt/claude)
-	-M model       default model (default: claude-sonnet-4-20250514)
+	-M model       default model (default: claude-opus-4-6)
 	-t maxtokens   default max tokens (default: 16384)
 
 claude9fs serves a 9P filesystem where each Claude conversation
@@ -209,7 +209,7 @@ Messages are entered and sent with `^D` on an empty line.
 
 	% claude9fs -s claude
 	% claudetalk
-	claude9 session 0 - claude-sonnet-4-20250514
+	claude9 session 0 - claude-opus-4-6
 	commands: /models /model [name] /clear /status /usage /help /quit
 	type message, end with ^D on empty line, ^C to quit
 

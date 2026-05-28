@@ -76,7 +76,7 @@ struct Faux {
 static Srv clsrv;
 
 static char *apikey;
-static char *defmodel = "claude-sonnet-4-20250514";
+static char *defmodel = "claude-opus-4-6";
 static int defmaxtokens = 16384;
 static char *defsysprompt = nil;
 
