@@ -113,8 +113,8 @@ int	fetchmodels(char *apikey, ModelInfo **out);
 
 /* patch.c */
 /*
- * Apply a unified diff to the file at path using the in-tree
- * fuzzy applier. Returns a malloc'd status string describing
+ * Apply a unified diff to the file at path by invoking
+ * /bin/patch. Returns a malloc'd status string describing
  * success ("patched foo.c (N hunks)") or failure ("error: ...").
  * Never returns nil.
  */
