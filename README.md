@@ -1,7 +1,6 @@
 # claude9
 
-A Claude AI client for Plan 9 from Bell Labs, exposed as a 9P
-filesystem.
+A Claude AI client for 9front, exposed as a 9P filesystem.
 
 claude9 consists of two components:
 
@@ -34,8 +33,7 @@ following tools without asking you for confirmation each time:
 Tool calls run with the full authority of the user that started
 claude9fs.  On Plan 9 that typically means your whole home tree,
 anything mounted in your namespace (including `/mnt/term/...` if
-you are a drawterm/cpu client into your own files), and on
-plan9port it means your real Unix user account.
+you are a drawterm/cpu client into your own files).
 
 ### Worst case
 
@@ -88,28 +86,15 @@ within those limits it can do real damage.
 
 ## Building
 
-### Plan 9 / 9front
-
 	mk
 	mk install
 
 This builds claude9fs and installs it to `$home/bin/$objtype`.
 The `claudetalk` rc script is installed to `/rc/bin`, which is
-the canonical location for system-wide rc scripts on Plan 9
-and 9front; `mk install` therefore needs write permission there
-(run it as the appropriate user, e.g. `glenda` on a default
-9front install, or adjust `RCBIN` in the mkfile).
-
-### plan9port (Mac / Linux)
-
-	mk -f mkfile.plan9port
-	mk -f mkfile.plan9port install
-
-This builds claude9fs against plan9port's libthread and lib9p.
-On systems without webfs, claude9fs falls back to invoking
-`/usr/bin/curl` for HTTP, so streaming is delivered in one burst
-at end of round rather than incrementally.  Everything else
-works the same.
+the canonical location for system-wide rc scripts on 9front;
+`mk install` therefore needs write permission there (run it as
+the appropriate user, e.g. `glenda` on a default 9front install,
+or adjust `RCBIN` in the mkfile).
 
 ## Setup
 
@@ -117,8 +102,7 @@ Set your Anthropic API key in the environment:
 
 	ANTHROPIC_API_KEY=sk-ant-...
 
-HTTP requests prefer webfs (`/mnt/web`) when available; on
-systems without webfs, curl is used.
+HTTP is handled via webfs (`/mnt/web`), which must be mounted.
 
 ## claude9fs - 9P Filesystem
 
@@ -153,7 +137,7 @@ and returns its number.
 
 ### Session Commands (write to ctl)
 
-	clear          clear conversation history
+	clear          clear conversation history and usage counters
 	hangup         destroy the session
 	save <path>    save conversation to a file
 	load <path>    load conversation from a file
@@ -175,7 +159,7 @@ The `patch_file` tool uses the in-tree fuzzy unified-diff applier
 The `stream` file emits text deltas incrementally as the model
 generates them.  A reader opened against an idle session blocks
 until the next round starts; once the round finishes, the reader
-hits EOF.  See `STREAMING.md` for details.
+hits EOF.
 
 To see the last round's text after the fact, read `prompt`
 instead.
@@ -213,11 +197,11 @@ Messages are entered and sent with `^D` on an empty line.
 	commands: /models /model [name] /clear /status /usage /help /quit
 	type message, end with ^D on empty line, ^C to quit
 
-	claude-sonnet-4-20250514/16384> hello
+	claude-opus-4-6/16384> hello
 	^D
 	Hello! How can I help you today?
 
-	claude-sonnet-4-20250514/16384> /usage
+	claude-opus-4-6/16384> /usage
 	input_tokens 12
 	output_tokens 10
 	total_tokens 22
@@ -232,7 +216,7 @@ escaped with a leading space.
 
 ## Source Files
 
-	claude.c       API client: conversation, HTTP (webfs/curl), tool execution
+	claude.c       API client: conversation, HTTP via webfs, tool execution
 	claude.h       shared data structures and function declarations
 	patch.c        in-tree fuzzy unified-diff applier (patch_file tool)
 	json.c         JSON parser and serializer
@@ -242,14 +226,9 @@ escaped with a leading space.
 
 ## Dependencies
 
-	C compiler and Plan 9 / plan9port libraries (libc, bio, thread, 9p)
-	webfs for streaming HTTP (or curl as fallback)
+	9front
+	webfs (for HTTP to the Anthropic API)
 	Anthropic API key
-
-## plan9port support? 
-It's almost sort of kind of there, but I'm not sure I care when I can just
-run a 9front box and expose claude9fs over the network and use v9fs or whatever
-to connect to it.
 
 ## License
 

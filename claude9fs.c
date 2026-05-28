@@ -8,22 +8,6 @@
 #include "json.h"
 #include "claude.h"
 
-/*
- * srvrelease/srvacquire are 9front-only helpers that let the 9P
- * service proc yield while we do slow I/O (HTTP to the API),
- * so other 9P requests on the same connection can be handled
- * meanwhile.  plan9port's lib9p has no equivalent; under
- * plan9port we instead set Srv.srvforker = threadsrvforker so
- * each request runs in its own proc and blocking is harmless,
- * and stub these out.
- *
- * plan9port's <u.h> defines PLAN9PORT; native 9front does not.
- */
-#ifdef PLAN9PORT
-#define srvrelease(s) USED(s)
-#define srvacquire(s) USED(s)
-#endif
-
 enum {
 	Qroot,
 	Qclone,
@@ -282,6 +266,9 @@ sessionload(Session *s, char *path)
 	s->conv->msgs = nil;
 	s->conv->tail = nil;
 
+	free(s->usage.stop_reason);
+	memset(&s->usage, 0, sizeof s->usage);
+
 	state = Shdr;
 	role = Muser;
 	msgbuf = nil;
@@ -481,7 +468,7 @@ convtext(Conv *c)
 {
 	Msg *m;
 	int sz, n;
-	char *buf, *role;
+	char *buf, *tmp, *role;
 
 	sz = 1024;
 	buf = malloc(sz);
@@ -492,9 +479,12 @@ convtext(Conv *c)
 		role = m->role == Muser ? "user" : "assistant";
 		while(n + (int)strlen(role) + (int)strlen(m->text) + 8 >= sz){
 			sz *= 2;
-			buf = realloc(buf, sz);
-			if(buf == nil)
+			tmp = realloc(buf, sz);
+			if(tmp == nil){
+				free(buf);
 				return estrdup9p("");
+			}
+			buf = tmp;
 		}
 		n += snprint(buf + n, sz - n, "[%s]\n%s\n\n", role, m->text);
 	}
@@ -1011,6 +1001,8 @@ handlectl(Session *s, char *cmd, int *hangup)
 		s->lastreply = nil;
 		free(s->lasterror);
 		s->lasterror = nil;
+		free(s->usage.stop_reason);
+		memset(&s->usage, 0, sizeof s->usage);
 		qlock(&s->streamlk);
 		s->streamlen = 0;
 		if(s->streambuf != nil)
@@ -1196,14 +1188,6 @@ initclsrv(void)
 	clsrv.read = fsread;
 	clsrv.write = fswrite;
 	clsrv.destroyfid = fsdestroyfid;
-#ifdef PLAN9PORT
-	/*
-	 * Under plan9port we have no srvrelease/srvacquire, so let
-	 * lib9p fork a proc per request; that way an API call on
-	 * one fid doesn't block 9P traffic on others.
-	 */
-	clsrv.srvforker = threadsrvforker;
-#endif
 }
 
 static void

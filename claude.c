@@ -525,187 +525,167 @@ writeall(int fd, char *buf, long len)
 	return 0;
 }
 
-static char*
-webfssend(Conv *c, char *body)
+/*
+ * Describes one HTTP request to webfs.  The boolean flags pick
+ * the few headers that differ between our three call sites:
+ *   post   - method is POST (vs GET); a postbody file is written
+ *   ctype  - send "Content-Type: application/json"
+ *   stream - send "Accept: text/event-stream"
+ */
+typedef struct Webreq Webreq;
+struct Webreq {
+	char *url;
+	char *apikey;
+	int post;
+	int ctype;
+	int stream;
+};
+
+/*
+ * Open a fresh webfs connection for the given request: clone a
+ * connection, work out its directory, then write the url,
+ * method, and headers to its ctl file.  On success returns the
+ * open clone fd (which must stay open for the lifetime of the
+ * request) and stores a malloc'd connection directory path in
+ * *webdirp (caller frees).  On failure returns -1 with werrstr
+ * set and leaves *webdirp untouched.
+ */
+static int
+webopen(Webreq *w, char **webdirp)
 {
 	int clonefd, fd, n;
-	char buf[256], *data;
-	char *clone, *ctl, *bodyf, *page;
+	char buf[256];
+	char *webdir, *ctl;
 
-	clone = "/mnt/web/clone";
-	clonefd = open(clone, ORDWR);
+	clonefd = open("/mnt/web/clone", ORDWR);
 	if(clonefd < 0){
-		werrstr("open %s: %r", clone);
-		return nil;
+		werrstr("open /mnt/web/clone: %r");
+		return -1;
 	}
 
 	n = read(clonefd, buf, sizeof buf - 1);
 	if(n <= 0){
 		close(clonefd);
 		werrstr("read clone: %r");
-		return nil;
+		return -1;
 	}
 	buf[n] = '\0';
 	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
 		buf[--n] = '\0';
 
-	free(c->webdir);
-	c->webdir = smprint("/mnt/web/%s", buf);
+	webdir = smprint("/mnt/web/%s", buf);
 
-	ctl = smprint("%s/ctl", c->webdir);
+	ctl = smprint("%s/ctl", webdir);
 	fd = open(ctl, OWRITE);
 	free(ctl);
 	if(fd < 0){
 		close(clonefd);
+		free(webdir);
 		werrstr("open ctl: %r");
-		return nil;
+		return -1;
 	}
 
-	if(fprint(fd, "url %s\n", apiurl) < 0
-	|| fprint(fd, "request POST\n") < 0
-	|| fprint(fd, "headers Content-Type: application/json\r\n") < 0
-	|| fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
+	if(fprint(fd, "url %s\n", w->url) < 0
+	|| fprint(fd, "request %s\n", w->post ? "POST" : "GET") < 0
+	|| (w->ctype && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
+	|| (w->stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
+	|| fprint(fd, "headers x-api-key: %s\r\n", w->apikey) < 0
 	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
 	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
 		close(fd);
 		close(clonefd);
+		free(webdir);
 		werrstr("write ctl: %r");
-		return nil;
+		return -1;
 	}
 	close(fd);
 
-	bodyf = smprint("%s/postbody", c->webdir);
+	*webdirp = webdir;
+	return clonefd;
+}
+
+/*
+ * Write the POST body to a connection's postbody file.
+ * Returns 0 on success, -1 with werrstr set on failure.
+ */
+static int
+webpost(char *webdir, char *body)
+{
+	int fd;
+	char *bodyf;
+
+	bodyf = smprint("%s/postbody", webdir);
 	fd = open(bodyf, OWRITE);
 	free(bodyf);
 	if(fd < 0){
-		close(clonefd);
 		werrstr("open postbody: %r");
-		return nil;
+		return -1;
 	}
 	if(writeall(fd, body, strlen(body)) < 0){
 		close(fd);
-		close(clonefd);
 		werrstr("write postbody: %r");
-		return nil;
+		return -1;
 	}
 	close(fd);
+	return 0;
+}
 
-	page = smprint("%s/body", c->webdir);
+/*
+ * Open a connection's body file for reading the response.
+ * Returns the open fd, or -1 with werrstr set.
+ */
+static int
+webbody(char *webdir)
+{
+	int fd;
+	char *page;
+
+	page = smprint("%s/body", webdir);
 	fd = open(page, OREAD);
 	free(page);
+	if(fd < 0)
+		werrstr("open body: %r");
+	return fd;
+}
+
+/*
+ * POST a request body to the messages API and return the whole
+ * response as a malloc'd string (caller frees), or nil with
+ * werrstr set.
+ */
+static char*
+webfssend(Conv *c, char *body)
+{
+	int clonefd, fd;
+	char *data;
+	Webreq w;
+
+	memset(&w, 0, sizeof w);
+	w.url = apiurl;
+	w.apikey = c->apikey;
+	w.post = 1;
+	w.ctype = 1;
+
+	free(c->webdir);
+	c->webdir = nil;
+	clonefd = webopen(&w, &c->webdir);
+	if(clonefd < 0)
+		return nil;
+
+	if(webpost(c->webdir, body) < 0){
+		close(clonefd);
+		return nil;
+	}
+
+	fd = webbody(c->webdir);
 	if(fd < 0){
 		close(clonefd);
-		werrstr("open body: %r");
 		return nil;
 	}
 
 	data = readfd(fd);
 	close(fd);
 	close(clonefd);
-	if(data == nil)
-		werrstr("empty response from API");
-	return data;
-}
-
-static char*
-curlconfig(char *apikey)
-{
-	char *path;
-	int fd;
-
-	path = smprint("/tmp/claude9.cfg.%d", getpid());
-	fd = create(path, OWRITE|OEXCL, 0600);
-	if(fd < 0){
-		free(path);
-		return nil;
-	}
-	fprint(fd, "header \"Content-Type: application/json\"\n");
-	fprint(fd, "header \"x-api-key: %s\"\n", apikey);
-	fprint(fd, "header \"anthropic-version: %s\"\n", apiversion);
-	fprint(fd, "header \"anthropic-beta: prompt-caching-2024-07-31\"\n");
-	close(fd);
-	return path;
-}
-
-static char*
-curlsend(Conv *c, char *body)
-{
-	int pfd[2], fd;
-	char *data, *cfg, *bodypath, *bodyarg;
-
-	cfg = curlconfig(c->apikey);
-	if(cfg == nil){
-		werrstr("curlconfig: %r");
-		return nil;
-	}
-
-	bodypath = smprint("/tmp/claude9.body.%d", getpid());
-	fd = create(bodypath, OWRITE|OEXCL, 0600);
-	if(fd < 0){
-		remove(cfg);
-		free(cfg);
-		free(bodypath);
-		werrstr("create body tmpfile: %r");
-		return nil;
-	}
-	if(writeall(fd, body, strlen(body)) < 0){
-		close(fd);
-		remove(bodypath);
-		free(bodypath);
-		remove(cfg);
-		free(cfg);
-		werrstr("write body tmpfile: %r");
-		return nil;
-	}
-	close(fd);
-
-	bodyarg = smprint("@%s", bodypath);
-
-	if(pipe(pfd) < 0){
-		remove(bodypath);
-		free(bodypath);
-		free(bodyarg);
-		remove(cfg);
-		free(cfg);
-		werrstr("pipe: %r");
-		return nil;
-	}
-
-	switch(fork()){
-	case -1:
-		close(pfd[0]);
-		close(pfd[1]);
-		remove(bodypath);
-		free(bodypath);
-		free(bodyarg);
-		remove(cfg);
-		free(cfg);
-		werrstr("fork: %r");
-		return nil;
-	case 0:
-		close(pfd[0]);
-		dup(pfd[1], 1);
-		close(pfd[1]);
-		execl("/usr/bin/curl", "curl", "-s",
-			"-X", "POST",
-			"-K", cfg,
-			"-d", bodyarg,
-			apiurl,
-			nil);
-		sysfatal("exec curl: %r");
-	}
-	close(pfd[1]);
-
-	data = readfd(pfd[0]);
-	close(pfd[0]);
-	waitpid();
-
-	remove(bodypath);
-	free(bodypath);
-	free(bodyarg);
-	remove(cfg);
-	free(cfg);
-
 	if(data == nil)
 		werrstr("empty response from API");
 	return data;
@@ -729,85 +709,35 @@ curlsend(Conv *c, char *body)
 static int
 webfssend_stream(Conv *c, char *body, int *clonefdp)
 {
-	int clonefd, fd, n;
-	char buf[256];
-	char *clone, *ctl, *bodyf, *page;
+	int clonefd, fd;
+	Webreq w;
 
-	clone = "/mnt/web/clone";
-	clonefd = open(clone, ORDWR);
-	if(clonefd < 0){
-		werrstr("open %s: %r", clone);
-		return -1;
-	}
-
-	n = read(clonefd, buf, sizeof buf - 1);
-	if(n <= 0){
-		close(clonefd);
-		werrstr("read clone: %r");
-		return -1;
-	}
-	buf[n] = '\0';
-	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
-		buf[--n] = '\0';
+	memset(&w, 0, sizeof w);
+	w.url = apiurl;
+	w.apikey = c->apikey;
+	w.post = 1;
+	w.ctype = 1;
+	w.stream = 1;
 
 	free(c->webdir);
-	c->webdir = smprint("/mnt/web/%s", buf);
+	c->webdir = nil;
+	clonefd = webopen(&w, &c->webdir);
+	if(clonefd < 0)
+		return -1;
 
-	ctl = smprint("%s/ctl", c->webdir);
-	fd = open(ctl, OWRITE);
-	free(ctl);
+	if(webpost(c->webdir, body) < 0){
+		close(clonefd);
+		return -1;
+	}
+
+	fd = webbody(c->webdir);
 	if(fd < 0){
 		close(clonefd);
-		werrstr("open ctl: %r");
-		return -1;
-	}
-	if(fprint(fd, "url %s\n", apiurl) < 0
-	|| fprint(fd, "request POST\n") < 0
-	|| fprint(fd, "headers Content-Type: application/json\r\n") < 0
-	|| fprint(fd, "headers Accept: text/event-stream\r\n") < 0
-	|| fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
-	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
-		close(fd);
-		close(clonefd);
-		werrstr("write ctl: %r");
-		return -1;
-	}
-	close(fd);
-
-	bodyf = smprint("%s/postbody", c->webdir);
-	fd = open(bodyf, OWRITE);
-	free(bodyf);
-	if(fd < 0){
-		close(clonefd);
-		werrstr("open postbody: %r");
-		return -1;
-	}
-	if(writeall(fd, body, strlen(body)) < 0){
-		close(fd);
-		close(clonefd);
-		werrstr("write postbody: %r");
-		return -1;
-	}
-	close(fd);
-
-	page = smprint("%s/body", c->webdir);
-	fd = open(page, OREAD);
-	free(page);
-	if(fd < 0){
-		close(clonefd);
-		werrstr("open body: %r");
 		return -1;
 	}
 
 	*clonefdp = clonefd;
 	return fd;
-}
-
-static int
-haswebfs(void)
-{
-	return access("/mnt/web/clone", AREAD) == 0;
 }
 
 static char*
@@ -933,10 +863,7 @@ sendonce(Conv *c, Usage *usage)
 		return nil;
 	}
 
-	if(haswebfs())
-		data = webfssend(c, body);
-	else
-		data = curlsend(c, body);
+	data = webfssend(c, body);
 	free(body);
 
 	if(data == nil){
@@ -1070,7 +997,6 @@ toollist(char *path)
  * Read a man page by forking man(1).
  * The query string is the path field, e.g. "open" or "2 open".
  * On 9front, man takes positional args: man [section] page.
- * We pipe man's stdout through col -b to strip backspace formatting.
  * Returns the formatted text. Caller frees.
  */
 static char*
@@ -1093,7 +1019,13 @@ toolman(char *query)
 	section = nil;
 	page = q;
 
-	/* if first token is a single digit, treat as section */
+	/*
+	 * If the first token is a single digit followed by
+	 * whitespace, treat it as a man section.  We terminate the
+	 * digit in place (q[1] = '\0') so that "section" points at
+	 * just the one-character string "N", and advance "page"
+	 * past the separator to the page name.
+	 */
 	if(q[0] >= '1' && q[0] <= '9' && (q[1] == ' ' || q[1] == '\t')){
 		section = q;
 		q[1] = '\0';
@@ -1913,22 +1845,6 @@ claudeconverse_stream(Conv *c, Usage *usage,
 	char *resultjson, *alltext, *tmp, marker[256];
 	int round, alllen, tlen;
 
-	/*
-	 * Streaming requires webfs (body file delivers bytes as
-	 * they arrive).  On systems without webfs (e.g. plan9port
-	 * with only curl), fall back to the non-streaming path --
-	 * the caller still gets a complete reply, just all at once
-	 * when the round finishes.  We invoke the callback with
-	 * the entire final text so readers of the stream file
-	 * see the reply too (just not incrementally).
-	 */
-	if(!haswebfs()){
-		alltext = claudeconverse(c, usage);
-		if(alltext != nil && alltext[0] != '\0' && cb != nil)
-			cb(alltext, aux);
-		return alltext;
-	}
-
 	alltext = strdup("");
 	alllen = 0;
 
@@ -1984,53 +1900,27 @@ claudeconverse_stream(Conv *c, Usage *usage,
 	return alltext;
 }
 
+/*
+ * GET a URL from the API and return the response as a malloc'd
+ * string (caller frees), or nil with werrstr set.
+ */
 static char*
 webfsget(char *apikey, char *url)
 {
-	int clonefd, fd, n;
-	char buf[256], *data;
-	char *clone, *ctl, *page, *webdir;
+	int clonefd, fd;
+	char *data, *webdir;
+	Webreq w;
 
-	clone = "/mnt/web/clone";
-	clonefd = open(clone, ORDWR);
+	memset(&w, 0, sizeof w);
+	w.url = url;
+	w.apikey = apikey;
+
+	webdir = nil;
+	clonefd = webopen(&w, &webdir);
 	if(clonefd < 0)
 		return nil;
 
-	n = read(clonefd, buf, sizeof buf - 1);
-	if(n <= 0){
-		close(clonefd);
-		return nil;
-	}
-	buf[n] = '\0';
-	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
-		buf[--n] = '\0';
-
-	webdir = smprint("/mnt/web/%s", buf);
-
-	ctl = smprint("%s/ctl", webdir);
-	fd = open(ctl, OWRITE);
-	free(ctl);
-	if(fd < 0){
-		close(clonefd);
-		free(webdir);
-		return nil;
-	}
-
-	if(fprint(fd, "url %s\n", url) < 0
-	|| fprint(fd, "request GET\n") < 0
-	|| fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
-	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
-		close(fd);
-		close(clonefd);
-		free(webdir);
-		return nil;
-	}
-	close(fd);
-
-	page = smprint("%s/body", webdir);
-	fd = open(page, OREAD);
-	free(page);
+	fd = webbody(webdir);
 	free(webdir);
 	if(fd < 0){
 		close(clonefd);
@@ -2040,50 +1930,6 @@ webfsget(char *apikey, char *url)
 	data = readfd(fd);
 	close(fd);
 	close(clonefd);
-	return data;
-}
-
-static char*
-curlget(char *apikey, char *url)
-{
-	int pfd[2];
-	char *data, *cfg;
-
-	cfg = curlconfig(apikey);
-	if(cfg == nil)
-		return nil;
-
-	if(pipe(pfd) < 0){
-		remove(cfg);
-		free(cfg);
-		return nil;
-	}
-
-	switch(fork()){
-	case -1:
-		close(pfd[0]);
-		close(pfd[1]);
-		remove(cfg);
-		free(cfg);
-		return nil;
-	case 0:
-		close(pfd[0]);
-		dup(pfd[1], 1);
-		close(pfd[1]);
-		execl("/usr/bin/curl", "curl", "-s",
-			"-K", cfg,
-			url,
-			nil);
-		sysfatal("exec curl: %r");
-	}
-	close(pfd[1]);
-
-	data = readfd(pfd[0]);
-	close(pfd[0]);
-	waitpid();
-
-	remove(cfg);
-	free(cfg);
 	return data;
 }
 
@@ -2098,10 +1944,7 @@ fetchmodels(char *apikey, ModelInfo **out)
 
 	*out = nil;
 
-	if(haswebfs())
-		data = webfsget(apikey, modelsurl);
-	else
-		data = curlget(apikey, modelsurl);
+	data = webfsget(apikey, modelsurl);
 
 	if(data == nil){
 		werrstr("failed to contact models API");

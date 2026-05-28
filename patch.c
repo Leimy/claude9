@@ -314,6 +314,11 @@ trymatch(char **flines, int nflines, int pos, char **ctx, int nctx)
  * Find the best position to apply a hunk.  Searches outward
  * from the hinted position.  Returns the 0-based file line
  * index, or -1 if no match.
+ *
+ * hint is a 1-based line number (as it appears in an @@ header,
+ * or the carried-over end of the previous hunk).  All paths
+ * convert it to a 0-based index the same way, so a pure
+ * insertion lands at the same line a context match would.
  */
 static int
 findhunk(char **flines, int nflines, Hunk *h, int hint)
@@ -324,22 +329,29 @@ findhunk(char **flines, int nflines, Hunk *h, int hint)
 	int pos;
 
 	hunkcontext(h, &ctx, &op, &nctx);
+
+	/* convert the 1-based hint to a 0-based file index */
+	pos = hint > 0 ? hint - 1 : 0;
+
 	if(nctx == 0){
-		/* pure insertion: use hint */
+		/*
+		 * Pure insertion: there are no context or remove lines
+		 * to match against, so just insert at the hinted line,
+		 * clamped to the end of the file.
+		 */
 		free(ctx);
 		free(op);
-		return hint < nflines ? hint : nflines;
+		return pos < nflines ? pos : nflines;
 	}
 
-	/* try hint first (convert 1-based to 0-based) */
-	pos = hint > 0 ? hint - 1 : 0;
+	/* try the hint first */
 	if(trymatch(flines, nflines, pos, ctx, nctx)){
 		free(ctx);
 		free(op);
 		return pos;
 	}
 
-	/* search outward from hint */
+	/* search outward from the hint */
 	for(i = 1; i <= Fuzzlines; i++){
 		if(pos - i >= 0 && trymatch(flines, nflines, pos - i, ctx, nctx)){
 			free(ctx);
@@ -363,13 +375,15 @@ findhunk(char **flines, int nflines, Hunk *h, int hint)
  * new file lines array.  The old array is freed.
  *
  * Returns the new lines array and updates *nflinesp.  Also
- * updates *posp to point past the applied region in the new
- * file so that subsequent hunks search from the right place.
+ * updates *posp to point just past the applied region in the
+ * new file so that subsequent hunks search from the right
+ * place.
  */
 static char**
 applyhunk(char **flines, int *nflinesp, Hunk *h, int pos, int *posp)
 {
 	int nflines, nold, nnew, newcount, i;
+	int fi, ni, di;
 	char **nfl;
 	int cap;
 
@@ -400,45 +414,44 @@ applyhunk(char **flines, int *nflinesp, Hunk *h, int pos, int *posp)
 		nfl[i] = strdup(flines[i]);
 
 	/* apply the hunk */
-	{
-		int fi, ni, di;
-		fi = pos;	/* file index (into old lines being consumed) */
-		ni = pos;	/* new file index (into nfl being built) */
-
-		for(di = 0; di < h->nlines; di++){
-			switch(h->lines[di].op){
-			case ' ':
-				/* context: copy from old file (preserving original) */
-				if(fi < nflines)
-					nfl[ni] = strdup(flines[fi]);
-				else
-					nfl[ni] = strdup(h->lines[di].text);
-				fi++;
-				ni++;
-				break;
-			case '-':
-				/* remove: skip old file line */
-				fi++;
-				break;
-			case '+':
-				/* add: insert new line */
+	fi = pos;	/* file index (into old lines being consumed) */
+	ni = pos;	/* new file index (into nfl being built) */
+	for(di = 0; di < h->nlines; di++){
+		switch(h->lines[di].op){
+		case ' ':
+			/* context: copy from old file (preserving original) */
+			if(fi < nflines)
+				nfl[ni] = strdup(flines[fi]);
+			else
 				nfl[ni] = strdup(h->lines[di].text);
-				ni++;
-				break;
-			}
-		}
-
-		/* copy remaining lines after the hunk */
-		while(fi < nflines){
-			nfl[ni] = strdup(flines[fi]);
 			fi++;
 			ni++;
+			break;
+		case '-':
+			/* remove: skip old file line */
+			fi++;
+			break;
+		case '+':
+			/* add: insert new line */
+			nfl[ni] = strdup(h->lines[di].text);
+			ni++;
+			break;
 		}
-
-		*posp = ni - (nflines - fi);  /* should just be ni since fi==nflines */
-		/* actually, posp should point just past the inserted region */
-		*posp = pos + nnew;
 	}
+
+	/* copy remaining lines after the hunk */
+	while(fi < nflines){
+		nfl[ni] = strdup(flines[fi]);
+		fi++;
+		ni++;
+	}
+
+	/*
+	 * Point just past the region we replaced.  This is the
+	 * end of the new (context + add) lines, i.e. pos + nnew;
+	 * at this point ni == newcount and fi == nflines.
+	 */
+	*posp = pos + nnew;
 
 	/* free old lines */
 	for(i = 0; i < nflines; i++)

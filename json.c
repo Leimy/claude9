@@ -587,92 +587,91 @@ jset(Json *obj, char *name, Json *val)
 }
 
 /* JSON serialization using Fmt */
-static int jsonprint(Fmt*);
 
-const char *hexdigits="0123456789abcdef";
+static char *hexdigits = "0123456789abcdef";
 
 static int
 fmtjstr(Fmt *f, char *s)
 {
-    int extra = 0;
-    char *p;
+	int extra, len, result;
+	char *p, *q, *buf;
 
-    for (p = s; *p; p++) {
-        switch (*p) {
-        case '"':
-        case '\\':
-        case '\b':
-        case '\f':
-        case '\n':
-        case '\r':
-        case '\t':
-            extra += 1;	/* \X is 2 bytes, original is 1, so 1 extra */
-            break;
-        default:
-            if (*p < 0x20) {
-                extra += 5;	/* \u00XX is 6 bytes, original is 1, so 5 extra */
-            }
-            break;
-        }
-    }
+	extra = 0;
+	for(p = s; *p; p++){
+		switch(*p){
+		case '"':
+		case '\\':
+		case '\b':
+		case '\f':
+		case '\n':
+		case '\r':
+		case '\t':
+			extra += 1;
+			break;
+		default:
+			if(*p < 0x20)
+				extra += 5;
+			break;
+		}
+	}
 
-    int len = p - s;
-    char *buf = malloc(len + extra + 3);	/* +3 for two quotes and NUL */
-    if (buf == nil)
-        sysfatal("malloc: %r");
+	len = p - s;
+	buf = malloc(len + extra + 3);
+	if(buf == nil)
+		sysfatal("malloc: %r");
 
-    char *q = buf;
-    *q++ = '"';
-    for (p = s; *p; p++) {
-        switch (*p) {
-        case '"':
-            *q++ = '\\';
-            *q++ = '"';
-            break;
-        case '\\':
-            *q++ = '\\';
-            *q++ = '\\';
-            break;
-        case '\b':
-            *q++ = '\\';
-            *q++ = 'b';
-            break;
-        case '\f':
-            *q++ = '\\';
-            *q++ = 'f';
-            break;
-        case '\n':
-            *q++ = '\\';
-            *q++ = 'n';
-            break;
-        case '\r':
-            *q++ = '\\';
-            *q++ = 'r';
-            break;
-        case '\t':
-            *q++ = '\\';
-            *q++ = 't';
-            break;
-        default:
-            if (*p < 0x20) {
-                *q++ = '\\';
-                *q++ = 'u';
-                *q++ = '0';
-                *q++ = '0';
-                *q++ = hexdigits[(*p >> 4) & 0xF];
-                *q++ = hexdigits[*p & 0xF];
-            } else {
-                *q++ = *p;
-            }
-            break;
-        }
-    }
-    *q++ = '"';
-    *q = '\0';
+	q = buf;
+	*q++ = '"';
+	for(p = s; *p; p++){
+		switch(*p){
+		case '"':
+			*q++ = '\\';
+			*q++ = '"';
+			break;
+		case '\\':
+			*q++ = '\\';
+			*q++ = '\\';
+			break;
+		case '\b':
+			*q++ = '\\';
+			*q++ = 'b';
+			break;
+		case '\f':
+			*q++ = '\\';
+			*q++ = 'f';
+			break;
+		case '\n':
+			*q++ = '\\';
+			*q++ = 'n';
+			break;
+		case '\r':
+			*q++ = '\\';
+			*q++ = 'r';
+			break;
+		case '\t':
+			*q++ = '\\';
+			*q++ = 't';
+			break;
+		default:
+			if(*p < 0x20){
+				*q++ = '\\';
+				*q++ = 'u';
+				*q++ = '0';
+				*q++ = '0';
+				*q++ = hexdigits[(*p >> 4) & 0xF];
+				*q++ = hexdigits[*p & 0xF];
+			} else {
+				*q++ = *p;
+			}
+			break;
+		}
+	}
+	*q++ = '"';
+	*q = '\0';
 
-    int result = fmtprint(f, "%s", buf);
-    free(buf);
-    return result;
+	result = fmtprint(f, "%s", buf);
+	free(buf);
+	return result;
 }
 
 static int
@@ -714,15 +713,6 @@ jsonfmt(Json *j, Fmt *f)
 		return fmtrune(f, '}');
 	}
 	return fmtprint(f, "null");
-}
-
-static int
-jsonprint(Fmt *f)
-{
-	Json *j;
-
-	j = va_arg(f->args, Json*);
-	return jsonfmt(j, f);
 }
 
 char*
