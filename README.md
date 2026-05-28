@@ -246,6 +246,11 @@ escaped with a leading space.
 	webfs for streaming HTTP (or curl as fallback)
 	Anthropic API key
 
+## plan9port support? 
+It's almost sort of kind of there, but I'm not sure I care when I can just
+run a 9front box and expose claude9fs over the network and use v9fs or whatever
+to connect to it.
+
 ## License
 
 MIT License.  See the LICENSE file for details.
