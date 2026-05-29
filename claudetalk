@@ -1,7 +1,22 @@
 #!/bin/rc
 # claudetalk - interactive Claude chat via claude9fs
+#
+# usage: claudetalk [-d] [-a session] [-l convfile]
+#   -a N      attach to existing session N (instead of cloning)
+#   -d        detach on exit: leave session alive for later -a
+#   -l file   load conversation from file on startup
 
 rfork e
+
+attach=()
+detach=0
+loadfile=()
+flagfmt='a:attach,d,l:loadfile'
+args=''
+if(! ifs=() eval `{aux/getflags $*}){
+	echo 'usage: claudetalk [-d] [-a session] [-l convfile]' >[1=2]
+	exit usage
+}
 
 mnt=/mnt/claude
 if(! test -f $mnt/clone){
@@ -22,37 +37,45 @@ if(! test -d $beads/by-id){
 if not
 	echo 'memory: '$beads >[1=2]
 
-n=`{cat $mnt/clone}
-if(~ $#n 0){
-	echo 'failed to allocate session' >[1=2]
-	exit 'clone failed'
+if(~ $#attach 0){
+	n=`{cat $mnt/clone}
+	if(~ $#n 0){
+		echo 'failed to allocate session' >[1=2]
+		exit 'clone failed'
+	}
+}
+if not {
+	n=$attach
+	if(! test -d $mnt/$n){
+		echo 'session '$n' does not exist' >[1=2]
+		exit 'no session'
+	}
 }
 sess=$mnt/$n
 
+fn teardown {
+	if(! ~ $detach 1)
+		echo hangup > $sess/ctl >[2]/dev/null
+}
+
 fn sigexit {
-	echo hangup > $sess/ctl >[2]/dev/null
-}
-
-# On Plan 9, the interrupt note (sent by the DEL key) maps to
-# sigint.  Without an explicit handler rc just keeps looping
-# because the inner subprocess absorbs the note.  Define
-# handlers that tear down the session and exit.
-fn sigint {
-	echo hangup > $sess/ctl >[2]/dev/null
-	exit interrupt
-}
-
-fn sighup {
-	echo hangup > $sess/ctl >[2]/dev/null
-	exit hangup
+	teardown
 }
 
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /models /model [name] /tokens [n] /clear /status /usage /help /quit' >[1=2]
-echo 'type message, end with ^D to send, DEL to quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /clear /detach /help /quit' >[1=2]
+echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
+if(~ $detach 1)
+	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
 echo '' >[1=2]
+
+# load conversation from file if requested
+if(! ~ $#loadfile 0){
+	echo 'load '$loadfile > $sess/ctl
+	echo 'loaded '$loadfile >[1=2]
+}
 
 fn docmd {
 	cmd=$1
@@ -60,14 +83,29 @@ fn docmd {
 		echo clear > $sess/ctl
 		echo 'cleared' >[1=2]
 	}
+	if not if(~ $cmd /detach){
+		detach=1
+		echo 'session '$n' will persist on exit (reattach with: claudetalk -a '$n')' >[1=2]
+	}
+	if not if(~ $cmd /sessions){
+		echo 'sessions:' >[1=2]
+		for(d in $mnt/[0-9]*){
+			sid=`{basename $d}
+			smod=`{cat $d/model}
+			smsgs=`{cat $d/ctl | grep '^messages' | sed 's/messages //'}
+			if(~ $sid $n)
+				echo '  '$sid' '$smod' ('$smsgs' msgs) *' >[1=2]
+			if not
+				echo '  '$sid' '$smod' ('$smsgs' msgs)' >[1=2]
+		}
+	}
 	if not if(~ $cmd /models){
 		echo 'fetching models...' >[1=2]
 		cat $mnt/models >[1=2]
 	}
 	if not if(~ $cmd /model){
-		if(~ $#* 1){
+		if(~ $#* 1)
 			echo 'model: '^`{cat $sess/model} >[1=2]
-		}
 		if not {
 			shift
 			echo -n $"* > $sess/model
@@ -75,9 +113,8 @@ fn docmd {
 		}
 	}
 	if not if(~ $cmd /tokens){
-		if(~ $#* 1){
+		if(~ $#* 1)
 			echo 'tokens: '^`{cat $sess/tokens} >[1=2]
-		}
 		if not {
 			shift
 			echo -n $"* > $sess/tokens
@@ -92,6 +129,7 @@ fn docmd {
 	}
 	if not if(~ $cmd /help){
 		echo 'commands:' >[1=2]
+		echo '  /sessions      list live sessions' >[1=2]
 		echo '  /models        list available models' >[1=2]
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
@@ -102,6 +140,7 @@ fn docmd {
 		echo '  /usage         show token usage' >[1=2]
 		echo '  /save <path>   save conversation' >[1=2]
 		echo '  /load <path>   load conversation' >[1=2]
+		echo '  /detach        keep session alive on exit' >[1=2]
 		echo '  /quit          exit' >[1=2]
 	}
 	if not if(~ $cmd /save){
@@ -136,19 +175,19 @@ msgfile=/tmp/claudetalk.$pid
 fn cleanup {
 	rm -f $msgfile
 }
+
+# On Plan 9, the interrupt note (sent by the DEL key) maps to
+# sigint.  Without an explicit handler rc just keeps looping
+# because the inner subprocess absorbs the note.  Define
+# handlers that tear down the session and exit.
 fn sigexit {
-	echo hangup > $sess/ctl >[2]/dev/null
+	teardown
 	cleanup
 }
 fn sigint {
-	echo hangup > $sess/ctl >[2]/dev/null
+	teardown
 	cleanup
 	exit interrupt
-}
-fn sighup {
-	echo hangup > $sess/ctl >[2]/dev/null
-	cleanup
-	exit hangup
 }
 
 while(){
@@ -194,4 +233,4 @@ while(){
 }
 
 cleanup
-echo hangup > $sess/ctl >[2]/dev/null
+teardown

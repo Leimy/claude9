@@ -166,7 +166,13 @@ instead.
 
 ## claudetalk - rc Shell Client
 
-	claudetalk
+	claudetalk [-d] [-a session] [-l convfile]
+
+Flags:
+
+	-a N      attach to existing session N (instead of cloning a new one)
+	-d        detach on exit: leave session alive for later reattachment
+	-l file   load a saved conversation file on startup
 
 claudetalk is an rc script that talks to a running claude9fs
 mounted on `/mnt/claude`.  It prints incremental text by reading
@@ -175,6 +181,7 @@ the session's `stream` file in the background while writing to
 
 ### Commands
 
+	/sessions      list live sessions (current session marked with *)
 	/models        list available models
 	/model         show current model
 	/model <name>  switch model
@@ -183,29 +190,90 @@ the session's `stream` file in the background while writing to
 	/clear         clear conversation
 	/status        show session info
 	/usage         show token usage
-	/save <path>   save conversation
-	/load <path>   load conversation
+	/save <path>   save conversation to file
+	/load <path>   load conversation from file
+	/detach        keep session alive on exit (can reattach later)
+	/help          show command list
 	/quit          exit
 
-Messages are entered and sent with `^D` on an empty line.
+Messages are entered as text and sent with `^D`.
 
-## Example Session
+### Resumable Sessions
 
-	% claude9fs -s claude
+Sessions live in claude9fs as numbered directories under the
+mount point.  Normally, claudetalk sends `hangup` when you quit,
+which destroys the session.  With detach mode, the session is
+left alive so you can reattach from another window or later.
+
+There are two ways to enter detach mode:
+
+- Start with `-d`: `claudetalk -d`
+- Toggle mid-session with the `/detach` command
+
+Once detached, the session persists until you explicitly hang it
+up (by reattaching without `-d` and quitting, or by writing
+`hangup` to the session's ctl file directly).
+
+#### Example: move a session between windows
+
+	# Window 1: start a session, decide to keep it
 	% claudetalk
 	claude9 session 0 - claude-opus-4-6
-	commands: /models /model [name] /clear /status /usage /help /quit
-	type message, end with ^D on empty line, ^C to quit
-
-	claude-opus-4-6/16384> hello
+	claude-opus-4-6/16384> What files are in /sys/src/cmd?
 	^D
-	Hello! How can I help you today?
+	...
+	/detach
+	session 0 will persist on exit (reattach with: claudetalk -a 0)
+	/quit
 
-	claude-opus-4-6/16384> /usage
-	input_tokens 12
-	output_tokens 10
-	total_tokens 22
-	stop_reason end_turn
+	# Window 2: pick up where we left off
+	% claudetalk -a 0
+	claude9 session 0 - claude-opus-4-6
+	claude-opus-4-6/16384> Now look at /sys/src/cmd/ls.c
+	^D
+	...
+
+#### Example: save and reload across restarts
+
+	% claudetalk
+	...
+	/save /usr/dave/convos/refactor-session
+	saved to /usr/dave/convos/refactor-session
+	/quit
+
+	# Later, or after restarting claude9fs:
+	% claudetalk -l /usr/dave/convos/refactor-session
+	loaded /usr/dave/convos/refactor-session
+	...
+
+#### Example: list and manage sessions
+
+	% claudetalk -d
+	claude9 session 1 - claude-opus-4-6
+	/sessions
+	sessions:
+	  0 claude-opus-4-6 (14 msgs)
+	  1 claude-opus-4-6 (0 msgs) *
+
+The `*` marks the session you are currently attached to.
+
+### Scripting with the Filesystem
+
+Because sessions are just directories in a 9P filesystem, you
+can also drive them from rc without claudetalk:
+
+	# Create a session
+	n=`{cat /mnt/claude/clone}
+
+	# Send a message and read the reply
+	echo 'hello' > /mnt/claude/$n/prompt
+	cat /mnt/claude/$n/prompt
+
+	# Check what sessions exist
+	ls /mnt/claude
+
+	# Destroy a session
+	echo hangup > /mnt/claude/$n/ctl
 
 ## File Format
 
