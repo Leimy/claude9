@@ -2,7 +2,7 @@
 # claudetalk - interactive Claude chat via claude9fs
 #
 # usage: claudetalk [-d] [-a session] [-l convfile]
-#   -a N      attach to existing session N (instead of cloning)
+#   -a name   attach to existing session (instead of cloning)
 #   -d        detach on exit: leave session alive for later -a
 #   -l file   load conversation from file on startup
 
@@ -89,8 +89,8 @@ fn docmd {
 	}
 	if not if(~ $cmd /sessions){
 		echo 'sessions:' >[1=2]
-		for(d in $mnt/[0-9]*){
-			sid=`{basename $d}
+		for(sid in `{ls $mnt | grep -v '^clone$' | grep -v '^models$'}){
+			d=$mnt/$sid
 			smod=`{cat $d/model}
 			smsgs=`{cat $d/ctl | grep '^messages' | sed 's/messages //'}
 			if(~ $sid $n)

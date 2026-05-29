@@ -31,6 +31,7 @@ enum {
 typedef struct Session Session;
 struct Session {
 	int id;
+	char *name;
 	Conv *conv;
 	char *lastreply;
 	char *lasterror;
@@ -63,27 +64,11 @@ static char *apikey;
 static char *defmodel = "claude-opus-4-6";
 static int defmaxtokens = 16384;
 static char *defsysprompt = nil;
+static char *namepath = "/mnt/names/name";
 
 static Session *sessions;
 static int nextsid;
 static QLock sessionlk;
-
-static Session*
-newsession(void)
-{
-	Session *s;
-
-	s = emallocz(sizeof *s, 1);
-	qlock(&sessionlk);
-	s->id = nextsid++;
-	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt);
-	s->streamrz.l = &s->streamlk;
-	s->streamdone = 1;
-	s->next = sessions;
-	sessions = s;
-	qunlock(&sessionlk);
-	return s;
-}
 
 static Session*
 findsession(int id)
@@ -98,6 +83,83 @@ findsession(int id)
 	return s;
 }
 
+static Session*
+findsessionname(char *name)
+{
+	Session *s;
+
+	qlock(&sessionlk);
+	for(s = sessions; s != nil; s = s->next)
+		if(strcmp(s->name, name) == 0)
+			break;
+	qunlock(&sessionlk);
+	return s;
+}
+
+/*
+ * Try to get a name from namefs.  Returns a malloc'd
+ * string or nil if the name server is unavailable.
+ */
+static char*
+genname(void)
+{
+	int fd, n;
+	char buf[64];
+
+	fd = open(namepath, OREAD);
+	if(fd < 0)
+		return nil;
+	n = read(fd, buf, sizeof buf - 1);
+	close(fd);
+	if(n <= 0)
+		return nil;
+	buf[n] = '\0';
+	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
+		buf[--n] = '\0';
+	if(n == 0)
+		return nil;
+	return estrdup(buf);
+}
+
+static Session*
+newsession(void)
+{
+	Session *s;
+	char *name;
+	char buf[32];
+
+	s = emallocz(sizeof *s, 1);
+	qlock(&sessionlk);
+	s->id = nextsid++;
+	/*
+	 * Try namefs for a goofy name; on collision or
+	 * failure, fall back to the integer id.
+	 */
+	name = genname();
+	if(name != nil){
+		Session *dup;
+		for(dup = sessions; dup != nil; dup = dup->next)
+			if(strcmp(dup->name, name) == 0)
+				break;
+		if(dup != nil){
+			free(name);
+			name = nil;
+		}
+	}
+	if(name == nil){
+		snprint(buf, sizeof buf, "%d", s->id);
+		name = estrdup(buf);
+	}
+	s->name = name;
+	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt);
+	s->streamrz.l = &s->streamlk;
+	s->streamdone = 1;
+	s->next = sessions;
+	sessions = s;
+	qunlock(&sessionlk);
+	return s;
+}
+
 static void
 freesession(Session *s)
 {
@@ -106,6 +168,7 @@ freesession(Session *s)
 	convfree(s->conv);
 	free(s->lastreply);
 	free(s->lasterror);
+	free(s->name);
 	free(s->usage.stop_reason);
 	free(s->streambuf);
 	free(s);
@@ -363,7 +426,6 @@ rootgen(int i, Dir *d, void *v)
 {
 	Session *s;
 	int n;
-	char buf[32];
 
 	USED(v);
 	if(i == 0){
@@ -394,12 +456,11 @@ rootgen(int i, Dir *d, void *v)
 	n = 0;
 	for(s = sessions; s != nil; s = s->next){
 		if(n == i){
-			snprint(buf, sizeof buf, "%d", s->id);
 			d->qid = (Qid){QPATH(s->id, Qsess), 0, QTDIR};
 			d->mode = DMDIR|0555;
 			d->atime = d->mtime = time(0);
 			d->length = 0;
-			d->name = estrdup9p(buf);
+			d->name = estrdup9p(s->name);
 			d->uid = estrdup9p("claude");
 			d->gid = estrdup9p("claude");
 			d->muid = estrdup9p("");
@@ -507,10 +568,12 @@ ctltext(Session *s)
 	char buf[512];
 
 	snprint(buf, sizeof buf,
+		"name %s\n"
 		"model %s\n"
 		"tokens %d\n"
 		"messages %d\n"
 		"bytes %ld\n",
+		s->name,
 		s->conv->model,
 		s->conv->maxtokens,
 		convcount(s->conv),
@@ -530,9 +593,8 @@ static char*
 fswalk1(Fid *fid, char *name, Qid *qid)
 {
 	uvlong path;
-	int type, sid, i;
+	int type, i;
 	Session *s;
-	char buf[32];
 
 	path = fid->qid.path;
 	type = QTYPE(path);
@@ -546,17 +608,14 @@ fswalk1(Fid *fid, char *name, Qid *qid)
 			*qid = (Qid){Qmodels, 0, QTFILE};
 			return nil;
 		}
-		sid = atoi(name);
-		snprint(buf, sizeof buf, "%d", sid);
-		if(strcmp(buf, name) != 0)
-			return "not found";
-		s = findsession(sid);
+		s = findsessionname(name);
 		if(s == nil)
 			return "not found";
-		*qid = (Qid){QPATH(sid, Qsess), 0, QTDIR};
+		*qid = (Qid){QPATH(s->id, Qsess), 0, QTDIR};
 		return nil;
 	}
 	if(type == Qsess){
+		int sid;
 		sid = QSID(path);
 		s = findsession(sid);
 		if(s == nil)
@@ -578,7 +637,6 @@ fsstat(Req *r)
 	uvlong path;
 	int type, sid;
 	Session *s;
-	char buf[32];
 
 	path = r->fid->qid.path;
 	type = QTYPE(path);
@@ -617,8 +675,7 @@ fsstat(Req *r)
 			respond(r, "session gone");
 			return;
 		}
-		snprint(buf, sizeof buf, "%d", sid);
-		r->d.name = estrdup9p(buf);
+		r->d.name = estrdup9p(s->name);
 		r->d.qid = r->fid->qid;
 		r->d.mode = DMDIR|0555;
 		respond(r, nil);
@@ -872,8 +929,7 @@ fsread(Req *r)
 		if(fa->clone == nil)
 			fa->clone = newsession();
 		s = fa->clone;
-		snprint(buf, sizeof buf, "%d", s->id);
-		readstr(r, buf);
+		readstr(r, s->name);
 		respond(r, nil);
 		return;
 	}
@@ -1162,7 +1218,7 @@ initclsrv(void)
 static void
 usage(void)
 {
-	fprint(2, "usage: %s [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
+	fprint(2, "usage: %s [-n namepath] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
 	threadexitsall("usage");
 }
 
@@ -1175,6 +1231,9 @@ threadmain(int argc, char **argv)
 	mtpt = "/mnt/claude";
 
 	ARGBEGIN{
+	case 'n':
+		namepath = EARGF(usage());
+		break;
 	case 's':
 		srvname = EARGF(usage());
 		break;
