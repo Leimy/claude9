@@ -33,12 +33,10 @@ fn sigexit {
 	echo hangup > $sess/ctl >[2]/dev/null
 }
 
-# Plan 9 rc maps the 'interrupt' note (delete key / ctrl-C) to
-# sigint, and 'hangup' to sighup.  Without explicit handlers rc
-# just keeps looping because the outer `{cat} subprocess absorbs
-# the note and exits, leaving rc to go round again and print a
-# fresh prompt.  Define handlers that tear down the session and
-# exit so del/^C actually quits the client.
+# On Plan 9, the interrupt note (sent by the DEL key) maps to
+# sigint.  Without an explicit handler rc just keeps looping
+# because the inner subprocess absorbs the note.  Define
+# handlers that tear down the session and exit.
 fn sigint {
 	echo hangup > $sess/ctl >[2]/dev/null
 	exit interrupt
@@ -53,7 +51,7 @@ curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
 echo 'commands: /models /model [name] /tokens [n] /clear /status /usage /help /quit' >[1=2]
-echo 'type message, end with ^D on empty line, ^C to quit' >[1=2]
+echo 'type message, end with ^D to send, DEL to quit' >[1=2]
 echo '' >[1=2]
 
 fn docmd {
@@ -129,22 +127,51 @@ fn docmd {
 	}
 }
 
+# Read user input preserving newlines and whitespace.
+# cat reads until EOF (^D); we capture into a temp file
+# so that blank lines and indentation survive intact.
+# Returns the content via $msg (tokenized) for command
+# detection, and writes the raw text to $msgfile.
+msgfile=/tmp/claudetalk.$pid
+fn cleanup {
+	rm -f $msgfile
+}
+fn sigexit {
+	echo hangup > $sess/ctl >[2]/dev/null
+	cleanup
+}
+fn sigint {
+	echo hangup > $sess/ctl >[2]/dev/null
+	cleanup
+	exit interrupt
+}
+fn sighup {
+	echo hangup > $sess/ctl >[2]/dev/null
+	cleanup
+	exit hangup
+}
+
 while(){
 	curmodel=`{cat $sess/model}
 	curtokens=`{cat $sess/tokens}
 	prompt=$curmodel/$curtokens'> '
 	echo -n $prompt >[1=2]
 
-	msg=`{cat}
-	if(~ $#msg 0)
+	cat > $msgfile
+	if(! test -s $msgfile)
 		break
 
-	first=$msg(1)
-	if(~ $first /quit /exit)
+	# read first line for command detection
+	first=`{sed 1q $msgfile}
+	if(~ $#first 0)
+		break
+	cmd=$first(1)
+
+	if(~ $cmd /quit /exit)
 		break
 
-	if(~ $first /*)
-		docmd $msg
+	if(~ $cmd /*)
+		docmd $first
 	if not {
 		# Start the streaming reader first so it is blocked in
 		# open() before we write the prompt.  The read on stream
@@ -152,7 +179,7 @@ while(){
 		# arrives, then EOFs when the round is complete.
 		cat $sess/stream &
 		cpid=$apid
-		if(echo -n $"msg > $sess/prompt){
+		if(cat $msgfile > $sess/prompt){
 			wait $cpid
 			echo '' >[1=2]
 			cat $sess/usage >[1=2]
@@ -166,4 +193,5 @@ while(){
 	}
 }
 
+cleanup
 echo hangup > $sess/ctl >[2]/dev/null
