@@ -9,6 +9,67 @@ static char *modelsurl = "https://api.anthropic.com/v1/models?limit=100";
 static char *apiversion = "2023-06-01";
 
 /*
+ * emalloc wrappers: succeed or sysfatal.
+ */
+void*
+emalloc(ulong n)
+{
+	void *p;
+
+	p = malloc(n);
+	if(p == nil)
+		sysfatal("malloc %lud: %r", n);
+	return p;
+}
+
+void*
+erealloc(void *v, ulong n)
+{
+	void *p;
+
+	p = realloc(v, n);
+	if(p == nil)
+		sysfatal("realloc %lud: %r", n);
+	return p;
+}
+
+void*
+emallocz(ulong n, int clr)
+{
+	void *p;
+
+	p = mallocz(n, clr);
+	if(p == nil)
+		sysfatal("mallocz %lud: %r", n);
+	return p;
+}
+
+char*
+estrdup(char *s)
+{
+	char *p;
+
+	p = strdup(s);
+	if(p == nil)
+		sysfatal("strdup: %r");
+	return p;
+}
+
+char*
+esmprint(char *fmt, ...)
+{
+	char *p;
+	va_list arg;
+
+	va_start(arg, fmt);
+	p = vsmprint(fmt, arg);
+	va_end(arg);
+	if(p == nil)
+		sysfatal("smprint: %r");
+	return p;
+}
+
+/*
  * Single source of truth for the tools we expose to Claude.
  *
  * Every tool takes a "path" parameter; tools that also need a
@@ -159,12 +220,12 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 	char *s;
 
 	s = jstr(input, "path");
-	tc->path = strdup(s ? s : "");
+	tc->path = estrdup(s ? s : "");
 	if(td->bodyparam != nil){
 		s = jstr(input, td->bodyparam);
-		tc->body = strdup(s ? s : "");
+		tc->body = estrdup(s ? s : "");
 	} else {
-		tc->body = strdup("");
+		tc->body = estrdup("");
 	}
 }
 
@@ -192,37 +253,26 @@ mkparents(char *path)
 
 /*
  * Read all data from fd into a malloc'd NUL-terminated string.
+ * Returns nil on error (deliberate -- callers propagate the failure).
  */
-char*
+static char*
 readfd(int fd)
 {
-	char *buf, *tmp;
+	char *buf;
 	vlong len;
 	long n;
 
-	buf = malloc(8192);
-	if(buf == nil)
-		return nil;
+	buf = emalloc(8192);
 	len = 0;
 	while((n = read(fd, buf + len, 8192)) > 0){
 		len += n;
-		tmp = realloc(buf, len + 8192);
-		if(tmp == nil){
-			free(buf);
-			return nil;
-		}
-		buf = tmp;
+		buf = erealloc(buf, len + 8192);
 	}
 	if(n < 0){
 		free(buf);
 		return nil;
 	}
-	tmp = realloc(buf, len + 1);
-	if(tmp == nil){
-		free(buf);
-		return nil;
-	}
-	buf = tmp;
+	buf = erealloc(buf, len + 1);
 	buf[len] = '\0';
 	return buf;
 }
@@ -238,16 +288,14 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt)
 {
 	Conv *c;
 
-	c = mallocz(sizeof *c, 1);
-	if(c == nil)
-		sysfatal("malloc: %r");
-	c->apikey = strdup(apikey);
-	c->model = strdup(model);
+	c = emallocz(sizeof *c, 1);
+	c->apikey = estrdup(apikey);
+	c->model = estrdup(model);
 	c->maxtokens = maxtokens;
 	if(sysprompt)
-		c->sysprompt = strdup(sysprompt);
+		c->sysprompt = estrdup(sysprompt);
 	else
-		c->sysprompt = strdup(
+		c->sysprompt = estrdup(
 			"You are a coding assistant running on Plan 9 (9front). "
 			"You have tools to create, patch, and delete files. "
 			"Use the tools when the user asks you to make changes. "
@@ -356,13 +404,9 @@ msgnew(int role, char *text)
 {
 	Msg *m;
 
-	m = mallocz(sizeof *m, 1);
-	if(m == nil)
-		sysfatal("malloc: %r");
+	m = emallocz(sizeof *m, 1);
 	m->role = role;
-	m->text = strdup(text);
-	if(m->text == nil)
-		sysfatal("strdup: %r");
+	m->text = estrdup(text);
 	return m;
 }
 
@@ -373,7 +417,7 @@ msgnewraw(int role, char *text, char *rawjson)
 
 	m = msgnew(role, text);
 	if(rawjson != nil)
-		m->rawjson = strdup(rawjson);
+		m->rawjson = estrdup(rawjson);
 	return m;
 }
 
@@ -571,9 +615,9 @@ webopen(Webreq *w, char **webdirp)
 	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
 		buf[--n] = '\0';
 
-	webdir = smprint("/mnt/web/%s", buf);
+	webdir = esmprint("/mnt/web/%s", buf);
 
-	ctl = smprint("%s/ctl", webdir);
+	ctl = esmprint("%s/ctl", webdir);
 	fd = open(ctl, OWRITE);
 	free(ctl);
 	if(fd < 0){
@@ -612,7 +656,7 @@ webpost(char *webdir, char *body)
 	int fd;
 	char *bodyf;
 
-	bodyf = smprint("%s/postbody", webdir);
+	bodyf = esmprint("%s/postbody", webdir);
 	fd = open(bodyf, OWRITE);
 	free(bodyf);
 	if(fd < 0){
@@ -638,7 +682,7 @@ webbody(char *webdir)
 	int fd;
 	char *page;
 
-	page = smprint("%s/body", webdir);
+	page = esmprint("%s/body", webdir);
 	fd = open(page, OREAD);
 	free(page);
 	if(fd < 0)
@@ -742,10 +786,10 @@ static char*
 extracttext(Json *content)
 {
 	Json *block;
-	char *type, *text, *buf, *tmp;
+	char *type, *text, *buf;
 	int i, len, tlen;
 
-	buf = strdup("");
+	buf = estrdup("");
 	len = 0;
 
 	for(i = 0; i < content->nitem; i++){
@@ -759,10 +803,7 @@ extracttext(Json *content)
 		if(text == nil)
 			continue;
 		tlen = strlen(text);
-		tmp = realloc(buf, len + tlen + 1);
-		if(tmp == nil)
-			sysfatal("realloc: %r");
-		buf = tmp;
+		buf = erealloc(buf, len + tlen + 1);
 		memmove(buf + len, text, tlen);
 		len += tlen;
 		buf[len] = '\0';
@@ -803,10 +844,8 @@ parsetools(Json *content)
 		if(input == nil)
 			continue;
 
-		tc = mallocz(sizeof *tc, 1);
-		if(tc == nil)
-			sysfatal("malloc: %r");
-		tc->id = strdup(id);
+		tc = emallocz(sizeof *tc, 1);
+		tc->id = estrdup(id);
 		tc->type = td->type;
 		parseinput(tc, td, input);
 
@@ -906,10 +945,7 @@ sendonce(Conv *c, Usage *usage)
 		return nil;
 	}
 
-	r = mallocz(sizeof *r, 1);
-	if(r == nil)
-		sysfatal("malloc: %r");
-
+	r = emallocz(sizeof *r, 1);
 	r->text = extracttext(content);
 	r->tools = parsetools(content);
 	r->rawjson = jsonstr(content);
@@ -922,7 +958,7 @@ sendonce(Conv *c, Usage *usage)
 			r->stopped = 1;
 		if(usage != nil){
 			free(usage->stop_reason);
-			usage->stop_reason = strdup(stopreason->str);
+			usage->stop_reason = estrdup(stopreason->str);
 		}
 	} else {
 		r->stopped = 1;
@@ -943,11 +979,11 @@ toolread(char *path)
 
 	fd = open(path, OREAD);
 	if(fd < 0)
-		return smprint("error: open %s: %r", path);
+		return esmprint("error: open %s: %r", path);
 	data = readfd(fd);
 	close(fd);
 	if(data == nil)
-		return smprint("error: read %s: %r", path);
+		return esmprint("error: read %s: %r", path);
 	return data;
 }
 
@@ -959,26 +995,21 @@ toollist(char *path)
 {
 	int fd, n, i;
 	Dir *d;
-	char *buf, *tmp;
+	char *buf;
 	int len, cap, nlen;
 
 	fd = open(path, OREAD);
 	if(fd < 0)
-		return smprint("error: open %s: %r", path);
+		return esmprint("error: open %s: %r", path);
 	cap = 4096;
-	buf = malloc(cap);
-	if(buf == nil)
-		sysfatal("malloc: %r");
+	buf = emalloc(cap);
 	len = 0;
 	while((n = dirread(fd, &d)) > 0){
 		for(i = 0; i < n; i++){
 			nlen = strlen(d[i].name);
 			while(len + nlen + 2 > cap){
 				cap *= 2;
-				tmp = realloc(buf, cap);
-				if(tmp == nil)
-					sysfatal("realloc: %r");
-				buf = tmp;
+				buf = erealloc(buf, cap);
 			}
 			memmove(buf + len, d[i].name, nlen);
 			len += nlen;
@@ -1007,7 +1038,7 @@ toolman(char *query)
 	char qbuf[256];
 
 	if(query == nil || query[0] == '\0')
-		return smprint("error: empty man page query");
+		return esmprint("error: empty man page query");
 
 	/* parse optional section number from query */
 	snprint(qbuf, sizeof qbuf, "%s", query);
@@ -1030,17 +1061,17 @@ toolman(char *query)
 		page = q + 2;
 		while(*page == ' ' || *page == '\t') page++;
 		if(*page == '\0')
-			return smprint("error: missing page name after section %s", section);
+			return esmprint("error: missing page name after section %s", section);
 	}
 
 	if(pipe(pfd) < 0)
-		return smprint("error: pipe: %r");
+		return esmprint("error: pipe: %r");
 
 	switch(fork()){
 	case -1:
 		close(pfd[0]);
 		close(pfd[1]);
-		return smprint("error: fork: %r");
+		return esmprint("error: fork: %r");
 	case 0:
 		close(pfd[0]);
 		dup(pfd[1], 1);
@@ -1063,7 +1094,7 @@ toolman(char *query)
 
 	if(data == nil || data[0] == '\0'){
 		free(data);
-		return smprint("error: no man page found for '%s'", query);
+		return esmprint("error: no man page found for '%s'", query);
 	}
 	return data;
 }
@@ -1090,17 +1121,16 @@ toolmemcheck(char *root)
 	int counts[128];
 	char line[1024];
 	int outlen, outcap;
-	char *tmp;
 
 	if(root == nil || root[0] == '\0')
-		mount = strdup("/n/beads");
+		mount = estrdup("/n/beads");
 	else
-		mount = strdup(root);
+		mount = estrdup(root);
 
-	byid = smprint("%s/by-id", mount);
+	byid = esmprint("%s/by-id", mount);
 	fd = open(byid, OREAD);
 	if(fd < 0){
-		out = smprint("memory not mounted at %s: %r\n"
+		out = esmprint("memory not mounted at %s: %r\n"
 			"hint: beadsfs -s beads -m %s <store>\n",
 			mount, mount);
 		free(mount);
@@ -1117,9 +1147,7 @@ toolmemcheck(char *root)
 		for(i = 0; i < n; i++){
 			if(nids >= idcap){
 				idcap = idcap ? idcap * 2 : 64;
-				ids = realloc(ids, idcap * sizeof *ids);
-				if(ids == nil)
-					sysfatal("realloc: %r");
+				ids = erealloc(ids, idcap * sizeof *ids);
 			}
 			ids[nids++] = strtoll(d[i].name, nil, 10);
 		}
@@ -1130,10 +1158,10 @@ toolmemcheck(char *root)
 
 	/* read each bead's type to build type histogram */
 	for(i = 0; i < nids; i++){
-		char *tpath, *tbuf;
+		char *tpath;
 		int tfd, m;
 		char tb[16];
-		tpath = smprint("%s/by-id/%lld/type", mount, ids[i]);
+		tpath = esmprint("%s/by-id/%lld/type", mount, ids[i]);
 		tfd = open(tpath, OREAD);
 		free(tpath);
 		if(tfd < 0)
@@ -1143,17 +1171,15 @@ toolmemcheck(char *root)
 		if(m <= 0)
 			continue;
 		tb[m] = '\0';
-		tbuf = tb;
-		while(*tbuf == ' ' || *tbuf == '\n') tbuf++;
-		if(*tbuf != '\0' && (uchar)*tbuf < 128)
-			counts[(uchar)*tbuf]++;
+		p = tb;
+		while(*p == ' ' || *p == '\n') p++;
+		if(*p != '\0' && (uchar)*p < 128)
+			counts[(uchar)*p]++;
 	}
 
 	/* build output */
 	outcap = 4096;
-	out = malloc(outcap);
-	if(out == nil)
-		sysfatal("malloc: %r");
+	out = emalloc(outcap);
 	outlen = 0;
 	outlen += snprint(out + outlen, outcap - outlen,
 		"memory mounted at %s\n", mount);
@@ -1190,7 +1216,7 @@ toolmemcheck(char *root)
 			char *ipath, *info;
 			int ifd, m;
 			char ibuf[1024];
-			ipath = smprint("%s/by-id/%lld/info", mount, ids[i]);
+			ipath = esmprint("%s/by-id/%lld/info", mount, ids[i]);
 			ifd = open(ipath, OREAD);
 			free(ipath);
 			if(ifd < 0)
@@ -1216,10 +1242,7 @@ toolmemcheck(char *root)
 			n = strlen(line);
 			while(outlen + n + 1 > outcap){
 				outcap *= 2;
-				tmp = realloc(out, outcap);
-				if(tmp == nil)
-					sysfatal("realloc: %r");
-				out = tmp;
+				out = erealloc(out, outcap);
 			}
 			memmove(out + outlen, line, n);
 			outlen += n;
@@ -1256,22 +1279,17 @@ toolmk(char *dir, char *args)
 		args = "";
 
 	if(pipe(pfd) < 0)
-		return smprint("error: pipe: %r");
+		return esmprint("error: pipe: %r");
 
 	/* duplicate args so we can chop it up in place */
-	buf = strdup(args);
-	if(buf == nil){
-		close(pfd[0]);
-		close(pfd[1]);
-		return smprint("error: strdup: %r");
-	}
+	buf = estrdup(args);
 
 	switch(fork()){
 	case -1:
 		close(pfd[0]);
 		close(pfd[1]);
 		free(buf);
-		return smprint("error: fork: %r");
+		return esmprint("error: fork: %r");
 	case 0:
 		close(pfd[0]);
 		dup(pfd[1], 1);
@@ -1313,12 +1331,12 @@ toolmk(char *dir, char *args)
 	waitpid();
 
 	if(data == nil)
-		return smprint("mk (in %s): no output, error reading: %r",
+		return esmprint("mk (in %s): no output, error reading: %r",
 			dir != nil && dir[0] ? dir : ".");
 
 	outlen = strlen(data);
 	if(outlen > Mkmaxout){
-		out = smprint("mk (in %s): output truncated to %d of %d bytes\n%.*s\n[... truncated ...]\n",
+		out = esmprint("mk (in %s): output truncated to %d of %d bytes\n%.*s\n[... truncated ...]\n",
 			dir != nil && dir[0] ? dir : ".",
 			Mkmaxout, outlen, Mkmaxout, data);
 		free(data);
@@ -1326,7 +1344,7 @@ toolmk(char *dir, char *args)
 	}
 	if(outlen == 0){
 		free(data);
-		return smprint("mk (in %s): ok (no output)",
+		return esmprint("mk (in %s): ok (no output)",
 			dir != nil && dir[0] ? dir : ".");
 	}
 	return data;
@@ -1345,13 +1363,13 @@ exectool(ToolCall *tc)
 		mkparents(tc->path);
 		fd = create(tc->path, OWRITE, 0666);
 		if(fd < 0)
-			return smprint("error: create %s: %r", tc->path);
+			return esmprint("error: create %s: %r", tc->path);
 		if(write(fd, tc->body, strlen(tc->body)) != (long)strlen(tc->body)){
 			close(fd);
-			return smprint("error: write %s: %r", tc->path);
+			return esmprint("error: write %s: %r", tc->path);
 		}
 		close(fd);
-		return smprint("created %s (%d bytes)",
+		return esmprint("created %s (%d bytes)",
 			tc->path, (int)strlen(tc->body));
 
 	case Apatch:
@@ -1365,8 +1383,8 @@ exectool(ToolCall *tc)
 
 	case Adelete:
 		if(remove(tc->path) < 0)
-			return smprint("error: remove %s: %r", tc->path);
-		return smprint("deleted %s", tc->path);
+			return esmprint("error: remove %s: %r", tc->path);
+		return esmprint("deleted %s", tc->path);
 
 	case Aread:
 		return toolread(tc->path);
@@ -1384,7 +1402,7 @@ exectool(ToolCall *tc)
 		return toolmk(tc->path, tc->body);
 	}
 
-	return smprint("error: unknown tool type %d", tc->type);
+	return esmprint("error: unknown tool type %d", tc->type);
 }
 
 /*
@@ -1421,10 +1439,10 @@ claudeconverse(Conv *c, Usage *usage)
 {
 	Reply *r;
 	ToolCall *tc;
-	char *resultjson, *alltext, *tmp;
+	char *resultjson, *alltext;
 	int round, alllen, tlen;
 
-	alltext = strdup("");
+	alltext = estrdup("");
 	alllen = 0;
 
 	for(round = 0; round < 20; round++){
@@ -1439,10 +1457,7 @@ claudeconverse(Conv *c, Usage *usage)
 		/* accumulate text */
 		if(r->text != nil && r->text[0] != '\0'){
 			tlen = strlen(r->text);
-			tmp = realloc(alltext, alllen + tlen + 2);
-			if(tmp == nil)
-				sysfatal("realloc: %r");
-			alltext = tmp;
+			alltext = erealloc(alltext, alllen + tlen + 2);
 			if(alllen > 0)
 				alltext[alllen++] = '\n';
 			memmove(alltext + alllen, r->text, tlen);
@@ -1529,8 +1544,7 @@ sblock_appendtext(Sblock *b, char *s, int n)
 	if(need > b->textcap){
 		while(need > b->textcap)
 			b->textcap = b->textcap ? b->textcap * 2 : 256;
-		b->text = realloc(b->text, b->textcap);
-		if(b->text == nil) sysfatal("realloc: %r");
+		b->text = erealloc(b->text, b->textcap);
 	}
 	memmove(b->text + b->textlen, s, n);
 	b->textlen += n;
@@ -1546,8 +1560,7 @@ sblock_appendjson(Sblock *b, char *s, int n)
 	if(need > b->tooljsoncap){
 		while(need > b->tooljsoncap)
 			b->tooljsoncap = b->tooljsoncap ? b->tooljsoncap * 2 : 256;
-		b->tooljson = realloc(b->tooljson, b->tooljsoncap);
-		if(b->tooljson == nil) sysfatal("realloc: %r");
+		b->tooljson = erealloc(b->tooljson, b->tooljsoncap);
 	}
 	memmove(b->tooljson + b->tooljsonlen, s, n);
 	b->tooljsonlen += n;
@@ -1564,16 +1577,15 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 	Reply *r;
 	Json *content, *block, *input;
 	ToolCall *head, *tail, *tc;
-	char *alltext, *tmp;
+	char *alltext;
 	Tooldef *td;
 	int i, alllen, tlen;
 
-	r = mallocz(sizeof *r, 1);
-	if(r == nil) sysfatal("malloc: %r");
+	r = emallocz(sizeof *r, 1);
 
 	/* build rawjson content array */
 	content = jarray();
-	alltext = strdup("");
+	alltext = estrdup("");
 	alllen = 0;
 	head = tail = nil;
 
@@ -1586,9 +1598,7 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			jappend(content, block);
 			if(blocks[i].text != nil){
 				tlen = blocks[i].textlen;
-				tmp = realloc(alltext, alllen + tlen + 1);
-				if(tmp == nil) sysfatal("realloc: %r");
-				alltext = tmp;
+				alltext = erealloc(alltext, alllen + tlen + 1);
 				memmove(alltext + alllen, blocks[i].text, tlen);
 				alllen += tlen;
 				alltext[alllen] = '\0';
@@ -1616,9 +1626,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		if(td == nil)
 			continue;
 
-		tc = mallocz(sizeof *tc, 1);
-		if(tc == nil) sysfatal("malloc: %r");
-		tc->id = strdup(blocks[i].toolid ? blocks[i].toolid : "");
+		tc = emallocz(sizeof *tc, 1);
+		tc->id = estrdup(blocks[i].toolid ? blocks[i].toolid : "");
 		tc->type = td->type;
 		parseinput(tc, td, input);
 		if(tail == nil) head = tc;
@@ -1699,7 +1708,7 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			sr = jstr(delta, "stop_reason");
 			if(sr != nil){
 				free(*stopreasonp);
-				*stopreasonp = strdup(sr);
+				*stopreasonp = estrdup(sr);
 			}
 		}
 		uobj = jget(ev, "usage");
@@ -1721,9 +1730,9 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			char *s;
 			blocks[idx].istool = 1;
 			s = jstr(cb0, "id");
-			blocks[idx].toolid = strdup(s ? s : "");
+			blocks[idx].toolid = estrdup(s ? s : "");
 			s = jstr(cb0, "name");
-			blocks[idx].toolname = strdup(s ? s : "");
+			blocks[idx].toolname = estrdup(s ? s : "");
 		}
 		jsonfree(ev);
 		return 0;
@@ -1825,7 +1834,7 @@ sendonce_stream(Conv *c, Usage *usage,
 
 	if(stopreason != nil && usage != nil){
 		free(usage->stop_reason);
-		usage->stop_reason = strdup(stopreason);
+		usage->stop_reason = estrdup(stopreason);
 	}
 
 	r = blocks2reply(blocks, nblocks, stopreason);
@@ -1840,10 +1849,10 @@ claudeconverse_stream(Conv *c, Usage *usage,
 {
 	Reply *r;
 	ToolCall *tc;
-	char *resultjson, *alltext, *tmp, marker[256];
+	char *resultjson, *alltext, marker[256];
 	int round, alllen, tlen;
 
-	alltext = strdup("");
+	alltext = estrdup("");
 	alllen = 0;
 
 	for(round = 0; round < 20; round++){
@@ -1856,9 +1865,7 @@ claudeconverse_stream(Conv *c, Usage *usage,
 
 		if(r->text != nil && r->text[0] != '\0'){
 			tlen = strlen(r->text);
-			tmp = realloc(alltext, alllen + tlen + 2);
-			if(tmp == nil) sysfatal("realloc: %r");
-			alltext = tmp;
+			alltext = erealloc(alltext, alllen + tlen + 2);
 			if(alllen > 0) alltext[alllen++] = '\n';
 			memmove(alltext + alllen, r->text, tlen);
 			alllen += tlen;
@@ -1982,9 +1989,7 @@ fetchmodels(char *apikey, ModelInfo **out)
 		return 0;
 	}
 
-	list = mallocz(n * sizeof(ModelInfo), 1);
-	if(list == nil)
-		sysfatal("malloc: %r");
+	list = emallocz(n * sizeof(ModelInfo), 1);
 
 	for(i = 0; i < n; i++){
 		item = jidx(darr, i);
@@ -1993,9 +1998,9 @@ fetchmodels(char *apikey, ModelInfo **out)
 		id = jstr(item, "id");
 		name = jstr(item, "display_name");
 		if(id != nil)
-			list[i].id = strdup(id);
+			list[i].id = estrdup(id);
 		if(name != nil)
-			list[i].display_name = strdup(name);
+			list[i].display_name = estrdup(name);
 		list[i].max_output_tokens = jint(item, "max_output_tokens");
 		if(list[i].max_output_tokens <= 0)
 			list[i].max_output_tokens = 4096;

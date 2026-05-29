@@ -84,14 +84,14 @@ ensurehdrs(char *path, char *diff)
 	char *old;
 
 	if(hashdr(diff))
-		return strdup(diff);
+		return estrdup(diff);
 
 	if(fileexists(path))
 		old = path;
 	else
 		old = "/dev/null";
 
-	return smprint("--- %s\n+++ %s\n%s", old, path, diff);
+	return esmprint("--- %s\n+++ %s\n%s", old, path, diff);
 }
 
 /*
@@ -113,29 +113,27 @@ applydiff(char *path, char *diff)
 	long n, len;
 
 	if(path == nil || path[0] == '\0')
-		return smprint("error: no file path specified");
+		return esmprint("error: no file path specified");
 	if(diff == nil || diff[0] == '\0')
-		return smprint("error: empty diff");
+		return esmprint("error: empty diff");
 
 	nhunks = counthunks(diff);
 	if(nhunks == 0)
-		return smprint("error: no hunks found in diff");
+		return esmprint("error: no hunks found in diff");
 
 	mkparents(path);
 
 	fulldiff = ensurehdrs(path, diff);
-	if(fulldiff == nil)
-		return smprint("error: out of memory");
 
 	if(pipe(pfd) < 0){
 		free(fulldiff);
-		return smprint("error: pipe: %r");
+		return esmprint("error: pipe: %r");
 	}
 	if(pipe(dfd) < 0){
 		close(pfd[0]);
 		close(pfd[1]);
 		free(fulldiff);
-		return smprint("error: pipe: %r");
+		return esmprint("error: pipe: %r");
 	}
 
 	switch(fork()){
@@ -145,7 +143,7 @@ applydiff(char *path, char *diff)
 		close(dfd[0]);
 		close(dfd[1]);
 		free(fulldiff);
-		return smprint("error: fork: %r");
+		return esmprint("error: fork: %r");
 	case 0:
 		close(pfd[0]);
 		close(dfd[1]);
@@ -170,29 +168,17 @@ applydiff(char *path, char *diff)
 		free(fulldiff);
 		/* still need to reap child */
 		waitpid();
-		return smprint("error: write to patch: %r");
+		return esmprint("error: write to patch: %r");
 	}
 	close(dfd[1]);
 	free(fulldiff);
 
 	/* read patch's output */
-	data = malloc(8192);
-	if(data == nil){
-		close(pfd[0]);
-		waitpid();
-		return smprint("error: malloc: %r");
-	}
+	data = emalloc(8192);
 	len = 0;
 	while((n = read(pfd[0], data + len, 8192)) > 0){
 		len += n;
-		tmp = realloc(data, len + 8192);
-		if(tmp == nil){
-			free(data);
-			close(pfd[0]);
-			waitpid();
-			return smprint("error: realloc: %r");
-		}
-		data = tmp;
+		data = erealloc(data, len + 8192);
 	}
 	close(pfd[0]);
 	data[len] = '\0';
@@ -204,7 +190,7 @@ applydiff(char *path, char *diff)
 		w = wait();
 		if(w != nil){
 			if(w->msg[0] != '\0')
-				tmp = strdup(w->msg);
+				tmp = estrdup(w->msg);
 			free(w);
 		}
 	}
@@ -215,10 +201,10 @@ applydiff(char *path, char *diff)
 		while(len > 0 && (data[len-1] == '\n' || data[len-1] == ' '))
 			data[--len] = '\0';
 		if(len > 0)
-			result = smprint("error: patch %s failed: %s\n%s",
+			result = esmprint("error: patch %s failed: %s\n%s",
 				path, tmp, data);
 		else
-			result = smprint("error: patch %s failed: %s",
+			result = esmprint("error: patch %s failed: %s",
 				path, tmp);
 		free(tmp);
 		free(data);
@@ -226,5 +212,5 @@ applydiff(char *path, char *diff)
 	}
 
 	free(data);
-	return smprint("patched %s (%d hunks)", path, nhunks);
+	return esmprint("patched %s (%d hunks)", path, nhunks);
 }

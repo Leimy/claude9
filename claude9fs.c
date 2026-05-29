@@ -73,9 +73,7 @@ newsession(void)
 {
 	Session *s;
 
-	s = mallocz(sizeof *s, 1);
-	if(s == nil)
-		sysfatal("malloc: %r");
+	s = emallocz(sizeof *s, 1);
 	qlock(&sessionlk);
 	s->id = nextsid++;
 	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt);
@@ -162,9 +160,7 @@ streamappend(Session *s, char *data, int n)
 	if(need > s->streamcap){
 		while(need > s->streamcap)
 			s->streamcap = s->streamcap ? s->streamcap * 2 : 4096;
-		s->streambuf = realloc(s->streambuf, s->streamcap);
-		if(s->streambuf == nil)
-			sysfatal("realloc: %r");
+		s->streambuf = erealloc(s->streambuf, s->streamcap);
 	}
 	memmove(s->streambuf + s->streamlen, data, n);
 	s->streamlen += n;
@@ -296,7 +292,7 @@ sessionload(Session *s, char *path)
 					msglen--;
 				msgbuf[msglen] = '\0';
 				free(s->conv->sysprompt);
-				s->conv->sysprompt = strdup(msgbuf);
+				s->conv->sysprompt = estrdup(msgbuf);
 			}
 			r = line + strlen(msgsep);
 			while(*r == ' ') r++;
@@ -312,7 +308,7 @@ sessionload(Session *s, char *path)
 				while(*v == ' ') v++;
 				if(*v != '\0'){
 					free(s->conv->model);
-					s->conv->model = strdup(v);
+					s->conv->model = estrdup(v);
 				}
 			} else if(strncmp(line, maxtokenshdr, strlen(maxtokenshdr)) == 0){
 				v = line + strlen(maxtokenshdr);
@@ -335,9 +331,7 @@ sessionload(Session *s, char *path)
 			if(need > msgcap){
 				while(need > msgcap)
 					msgcap = msgcap ? msgcap * 2 : 1024;
-				msgbuf = realloc(msgbuf, msgcap);
-				if(msgbuf == nil)
-					sysfatal("realloc: %r");
+				msgbuf = erealloc(msgbuf, msgcap);
 			}
 			if(msglen > 0)
 				msgbuf[msglen++] = '\n';
@@ -358,7 +352,7 @@ sessionload(Session *s, char *path)
 			msglen--;
 		msgbuf[msglen] = '\0';
 		free(s->conv->sysprompt);
-		s->conv->sysprompt = strdup(msgbuf);
+		s->conv->sysprompt = estrdup(msgbuf);
 	}
 	free(msgbuf);
 	free(data);
@@ -468,23 +462,16 @@ convtext(Conv *c)
 {
 	Msg *m;
 	int sz, n;
-	char *buf, *tmp, *role;
+	char *buf, *role;
 
 	sz = 1024;
-	buf = malloc(sz);
-	if(buf == nil)
-		return estrdup9p("");
+	buf = emalloc(sz);
 	n = 0;
 	for(m = c->msgs; m != nil; m = m->next){
 		role = m->role == Muser ? "user" : "assistant";
 		while(n + (int)strlen(role) + (int)strlen(m->text) + 8 >= sz){
 			sz *= 2;
-			tmp = realloc(buf, sz);
-			if(tmp == nil){
-				free(buf);
-				return estrdup9p("");
-			}
-			buf = tmp;
+			buf = erealloc(buf, sz);
 		}
 		n += snprint(buf + n, sz - n, "[%s]\n%s\n\n", role, m->text);
 	}
@@ -693,7 +680,7 @@ modelstext(Req *r)
 {
 	ModelInfo *list;
 	int n, i;
-	char *buf, *tmp;
+	char *buf;
 	int len, cap, slen;
 	char line[256];
 
@@ -704,9 +691,7 @@ modelstext(Req *r)
 		return;
 	}
 	cap = 4096;
-	buf = malloc(cap);
-	if(buf == nil)
-		sysfatal("malloc: %r");
+	buf = emalloc(cap);
 	len = 0;
 	for(i = 0; i < n; i++){
 		if(list[i].id == nil)
@@ -715,10 +700,7 @@ modelstext(Req *r)
 		slen = strlen(line);
 		while(len + slen + 1 > cap){
 			cap *= 2;
-			tmp = realloc(buf, cap);
-			if(tmp == nil)
-				sysfatal("realloc: %r");
-			buf = tmp;
+			buf = erealloc(buf, cap);
 		}
 		memmove(buf + len, line, slen);
 		len += slen;
@@ -795,12 +777,7 @@ streamread(Req *r, Session *s, Faux *fa)
 			avail = s->streamlen - fa->streamoff;
 			want = r->ifcall.count;
 			if(want > avail) want = avail;
-			data = malloc(want);
-			if(data == nil){
-				qunlock(&s->streamlk);
-				respond(r, "out of memory");
-				return;
-			}
+			data = emalloc(want);
 			memmove(data, s->streambuf + fa->streamoff, want);
 			off = fa->streamoff;
 			fa->streamoff += want;
@@ -845,9 +822,7 @@ fsopen(Req *r)
 
 	fa = r->fid->aux;
 	if(fa == nil){
-		fa = mallocz(sizeof *fa, 1);
-		if(fa == nil)
-			sysfatal("malloc: %r");
+		fa = emallocz(sizeof *fa, 1);
 		r->fid->aux = fa;
 	}
 
@@ -883,9 +858,7 @@ fsread(Req *r)
 
 	fa = r->fid->aux;
 	if(fa == nil){
-		fa = mallocz(sizeof *fa, 1);
-		if(fa == nil)
-			sysfatal("malloc: %r");
+		fa = emallocz(sizeof *fa, 1);
 		r->fid->aux = fa;
 	}
 
@@ -1049,11 +1022,7 @@ fswrite(Req *r)
 	}
 
 	count = r->ifcall.count;
-	data = malloc(count + 1);
-	if(data == nil){
-		respond(r, "out of memory");
-		return;
-	}
+	data = emalloc(count + 1);
 	memmove(data, r->ifcall.data, count);
 	data[count] = '\0';
 	while(count > 0 && (data[count-1] == '\n' || data[count-1] == '\r'))
@@ -1080,7 +1049,7 @@ fswrite(Req *r)
 
 		/*
 		 * Reset streaming buffer *before* we kick off the work
-		 * so any cat of$sess/stream started in parallel with
+		 * so any cat of $sess/stream started in parallel with
 		 * us will block on new data rather than see stale text
 		 * or an immediate EOF.
 		 */

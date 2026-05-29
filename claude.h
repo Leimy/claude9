@@ -108,6 +108,15 @@ char*	claudeconverse_stream(Conv *c, Usage *usage,
 void	replyfree(Reply *r);
 void	toolfree(ToolCall *t);
 char*	readfile(int fd);
+
+/* emalloc wrappers: succeed or sysfatal */
+void*	emalloc(ulong n);
+void*	erealloc(void *p, ulong n);
+void*	emallocz(ulong n, int clr);
+char*	estrdup(char *s);
+char*	esmprint(char *fmt, ...);
+#pragma varargck argpos esmprint 1
+
 void	mkparents(char *path);
 int	fetchmodels(char *apikey, ModelInfo **out);
 

@@ -1,6 +1,7 @@
 #include <u.h>
 #include <libc.h>
 #include "json.h"
+#include "claude.h"
 
 static Json*	parseval(char**);
 static int	parseu4(char*, Rune*);
@@ -20,9 +21,7 @@ mkjson(int type)
 {
 	Json *j;
 
-	j = mallocz(sizeof *j, 1);
-	if(j == nil)
-		sysfatal("malloc: %r");
+	j = emallocz(sizeof *j, 1);
 	j->type = type;
 	return j;
 }
@@ -75,9 +74,7 @@ parsestr(char **pp)
 	 * Safe upper bound: decoded output cannot exceed the remaining
 	 * bytes of input starting at p.
 	 */
-	s = malloc(strlen(p) + 1);
-	if(s == nil)
-		sysfatal("malloc: %r");
+	s = emalloc(strlen(p) + 1);
 
 	w = s;
 	for(q = p; *q != '\0' && *q != '"'; ){
@@ -222,9 +219,7 @@ parsenum(char **pp)
 		return nil;
 	}
 
-	buf = malloc(e - p + 1);
-	if(buf == nil)
-		sysfatal("malloc: %r");
+	buf = emalloc(e - p + 1);
 	memmove(buf, p, e - p);
 	buf[e - p] = '\0';
 
@@ -246,14 +241,9 @@ jgrow(Json *j)
 {
 	if(j->nitem >= j->aitem){
 		j->aitem = j->aitem ? j->aitem * 2 : 8;
-		j->items = realloc(j->items, j->aitem * sizeof(Json*));
-		if(j->items == nil)
-			sysfatal("realloc: %r");
-		if(j->type == Jobject){
-			j->names = realloc(j->names, j->aitem * sizeof(char*));
-			if(j->names == nil)
-				sysfatal("realloc: %r");
-		}
+		j->items = erealloc(j->items, j->aitem * sizeof(Json*));
+		if(j->type == Jobject)
+			j->names = erealloc(j->names, j->aitem * sizeof(char*));
 	}
 }
 
@@ -501,9 +491,7 @@ jstring(char *s)
 	Json *j;
 
 	j = mkjson(Jstring);
-	j->str = strdup(s);
-	if(j->str == nil)
-		sysfatal("strdup: %r");
+	j->str = estrdup(s);
 	return j;
 }
 
@@ -513,9 +501,7 @@ jstringn(char *s, int n)
 	Json *j;
 
 	j = mkjson(Jstring);
-	j->str = malloc(n + 1);
-	if(j->str == nil)
-		sysfatal("malloc: %r");
+	j->str = emalloc(n + 1);
 	memmove(j->str, s, n);
 	j->str[n] = '\0';
 	return j;
@@ -579,9 +565,7 @@ jset(Json *obj, char *name, Json *val)
 		}
 	}
 	jgrow(obj);
-	obj->names[obj->nitem] = strdup(name);
-	if(obj->names[obj->nitem] == nil)
-		sysfatal("strdup: %r");
+	obj->names[obj->nitem] = estrdup(name);
 	obj->items[obj->nitem] = val;
 	obj->nitem++;
 }
@@ -616,9 +600,7 @@ fmtjstr(Fmt *f, char *s)
 	}
 
 	len = p - s;
-	buf = malloc(len + extra + 3);
-	if(buf == nil)
-		sysfatal("malloc: %r");
+	buf = emalloc(len + extra + 3);
 
 	q = buf;
 	*q++ = '"';
