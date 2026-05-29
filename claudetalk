@@ -11,7 +11,7 @@ rfork e
 attach=()
 detach=0
 loadfile=()
-flagfmt='a:attach,d,l:loadfile'
+flagfmt='a:attach session,d,l:loadfile file'
 args=''
 if(! ifs=() eval `{aux/getflags $*}){
 	echo 'usage: claudetalk [-d] [-a session] [-l convfile]' >[1=2]
