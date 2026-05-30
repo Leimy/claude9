@@ -106,10 +106,11 @@ HTTP is handled via webfs (`/mnt/web`), which must be mounted.
 
 ## claude9fs - 9P Filesystem
 
-	claude9fs [-s srvname] [-m mtpt] [-M model] [-t maxtokens]
+	claude9fs [-K skillsdir] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]
 
 Flags:
 
+	-K skillsdir   load skill files from this directory into the system prompt
 	-s srvname     post to /srv with this name
 	-m mtpt        mount point (default: /mnt/claude)
 	-M model       default model (default: claude-opus-4-6)
@@ -194,6 +195,68 @@ new output tokens.
 
 Auto-continue is off by default.  Each continuation round
 counts against the same usage totals shown in the `usage` file.
+
+### Skills
+
+The `-K` flag points claude9fs at a directory of skill files.
+At startup, every regular file in that directory is read and
+its contents are appended to the system prompt under a
+`Skills` heading.  Each file becomes a subsection named after
+the file.  This lets you configure persistent instructions --
+coding conventions, project context, persona tweaks -- without
+editing C or passing a giant `-sysprompt` string.
+
+Skills are baked into the system prompt at startup, so they
+benefit from Anthropic's prompt caching: the entire skills
+block is a cache hit on every request after the first, adding
+no extra latency or cost.
+
+#### Example: set up a skills directory
+
+	mkdir $home/lib/claude-skills
+
+	cat > $home/lib/claude-skills/plan9 <<'EOF'
+	When writing Plan 9 C, follow the style of the existing
+	codebase: tabs for indentation, no braces on single-statement
+	blocks, K&R function definitions.
+	EOF
+
+	cat > $home/lib/claude-skills/project <<'EOF'
+	The main project lives in /usr/dave/work/myproject.
+	Always run mk after editing source to check for errors.
+	EOF
+
+Then start claude9fs with:
+
+	claude9fs -K $home/lib/claude-skills
+
+The model will see these instructions as part of its system
+prompt in every session.  To change skills, edit the files and
+restart claude9fs.
+
+#### What the model sees
+
+The skills directory above produces a system prompt suffix
+like:
+
+	Skills
+	------
+	The following skill files were loaded at startup from /usr/dave/lib/claude-skills.
+	Follow their instructions.
+
+	### plan9
+	When writing Plan 9 C, follow the style of the existing
+	codebase: tabs for indentation, no braces on single-statement
+	blocks, K&R function definitions.
+
+	### project
+	The main project lives in /usr/dave/work/myproject.
+	Always run mk after editing source to check for errors.
+
+Skills are appended after the default system prompt (or after
+a custom one if you write to the session's `system` file
+before loading skills).  Subdirectories are ignored; only
+regular files are read.
 
 ## claudetalk - rc Shell Client
 

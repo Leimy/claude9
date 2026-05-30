@@ -66,11 +66,101 @@ static char *apikey;
 static char *defmodel = "claude-opus-4-6";
 static int defmaxtokens = 16384;
 static char *defsysprompt = nil;
+static char *skillsdir = nil;
+static char *defskills = nil;
 static char *namepath = "/mnt/names/name";
 
 static Session *sessions;
 static int nextsid;
 static QLock sessionlk;
+
+/*
+ * Read all files from a skills directory and return a malloc'd
+ * string containing a "Skills" section suitable for appending
+ * to the system prompt.  Each file becomes a subsection with
+ * its name as heading.  Returns nil if the directory can't be
+ * opened or contains no readable files.
+ */
+static char*
+readskills(char *dir)
+{
+	int dfd, fd, n, i;
+	int gotany;
+	Dir *d;
+	char *path, *data, *buf;
+	int len, cap, dlen, nlen, hlen;
+	char header[512];
+
+	if(dir == nil || dir[0] == '\0')
+		return nil;
+
+	dfd = open(dir, OREAD);
+	if(dfd < 0)
+		return nil;
+
+	cap = 4096;
+	buf = emalloc(cap);
+	len = 0;
+
+	/* section header */
+	hlen = snprint(header, sizeof header,
+		"\n\nSkills\n"
+		"------\n"
+		"The following skill files were loaded at startup from %s.\n"
+		"Follow their instructions.\n\n", dir);
+
+	while(len + hlen + 1 > cap){
+		cap *= 2;
+		buf = erealloc(buf, cap);
+	}
+	memmove(buf + len, header, hlen);
+	len += hlen;
+	buf[len] = '\0';
+
+	gotany = 0;
+	while((n = dirread(dfd, &d)) > 0){
+		for(i = 0; i < n; i++){
+			if(d[i].qid.type & QTDIR)
+				continue;
+			path = esmprint("%s/%s", dir, d[i].name);
+			fd = open(path, OREAD);
+			free(path);
+			if(fd < 0)
+				continue;
+			data = readfile(fd);
+			close(fd);
+			if(data == nil || data[0] == '\0'){
+				free(data);
+				continue;
+			}
+			dlen = strlen(data);
+			nlen = strlen(d[i].name);
+
+			/* "### filename\n" + data + "\n\n" */
+			while(len + nlen + dlen + 8 > cap){
+				cap *= 2;
+				buf = erealloc(buf, cap);
+			}
+			len += snprint(buf + len, cap - len, "### %s\n", d[i].name);
+			memmove(buf + len, data, dlen);
+			len += dlen;
+			if(dlen > 0 && data[dlen-1] != '\n')
+				buf[len++] = '\n';
+			buf[len++] = '\n';
+			buf[len] = '\0';
+			free(data);
+			gotany = 1;
+		}
+		free(d);
+	}
+	close(dfd);
+
+	if(!gotany){
+		free(buf);
+		return nil;
+	}
+	return buf;
+}
 
 static Session*
 findsession(int id)
@@ -153,7 +243,7 @@ newsession(void)
 		name = estrdup(buf);
 	}
 	s->name = name;
-	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt);
+	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt, defskills);
 	s->streamrz.l = &s->streamlk;
 	s->streamdone = 1;
 	s->next = sessions;
@@ -1278,7 +1368,7 @@ initclsrv(void)
 static void
 usage(void)
 {
-	fprint(2, "usage: %s [-n namepath] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
+	fprint(2, "usage: %s [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
 	threadexitsall("usage");
 }
 
@@ -1293,6 +1383,9 @@ threadmain(int argc, char **argv)
 	ARGBEGIN{
 	case 'n':
 		namepath = EARGF(usage());
+		break;
+	case 'K':
+		skillsdir = EARGF(usage());
 		break;
 	case 's':
 		srvname = EARGF(usage());
@@ -1317,6 +1410,12 @@ threadmain(int argc, char **argv)
 	if(apikey == nil || apikey[0] == '\0'){
 		fprint(2, "set $ANTHROPIC_API_KEY\n");
 		threadexitsall("no api key");
+	}
+
+	if(skillsdir != nil){
+		defskills = readskills(skillsdir);
+		if(defskills != nil)
+			fprint(2, "loaded skills from %s\n", skillsdir);
 	}
 
 	initclsrv();

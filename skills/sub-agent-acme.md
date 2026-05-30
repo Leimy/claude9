@@ -2,26 +2,67 @@
 
 ## What this does
 
-Spawn a sub-agent as a second session on the same claude9fs,
-send it a task, and deposit the result in an acme window --
-all using ordinary file reads and writes from the outer agent's
-tool loop.
+Spawn a sub-agent as a second claude9fs session, send it a
+task, and deposit the result in an acme window -- all using
+ordinary file reads and writes from the outer agent's tool
+loop.
 
-No second claude9fs process is needed.  claude9fs supports
-multiple concurrent sessions; each is an independent directory
-under the mount point.  The outer agent (your current session)
-and the sub-agent are just two sessions on the same server.
+## Critical: you need a SECOND claude9fs process
 
-## Prerequisites
+A single claude9fs process cannot serve sub-agents to itself.
+The reason is a 9P deadlock: when the outer agent (which is
+being served by claude9fs) issues a `read_file` on `clone`,
+that read becomes a 9P Tread on the same server.  But the
+server thread is blocked waiting for the outer agent's tool
+call to complete.  Neither side can make progress.
 
-Start acme *before* claude9fs so that `/mnt/acme` is in the
-namespace when claude9fs inherits it:
+**Symptoms:** reading `/mnt/claude/clone` returns "i/o on
+hungup channel" or hangs indefinitely.
 
-    % acme
-    % claude9fs          # inherits /mnt/acme from acme's namespace
+**Solution:** the user must start a second claude9fs process
+and mount it at a separate path (e.g. `/mnt/claudesub`):
 
-The agent now has both `/mnt/claude` (its own claude9fs) and
-`/mnt/acme` available as files it can read and write.
+    % claude9fs -s claudesub -m /mnt/claudesub
+
+## Critical: startup order matters (namespace inheritance)
+
+The outer claude9fs (the one serving the agent's session)
+executes the agent's tool calls -- `read_file`, `create_file`,
+etc. -- inside **its own process namespace**.  Plan 9
+namespaces are per-process and inherited at fork time.  This
+means:
+
+- If you start the sub-agent claude9fs **after** the outer
+  claude9fs, the outer process never sees `/mnt/claudesub`.
+  It was not in the namespace when the outer process started,
+  and mounting it later in your shell only affects your
+  shell's namespace, not the already-running claude9fs.
+
+- `claudetalk` (the rc script) runs in your shell and CAN
+  see both mounts.  But claudetalk is just a thin wrapper --
+  the actual tool execution happens inside the outer
+  claude9fs process, which has its own isolated namespace.
+
+**The sub-agent server MUST be started BEFORE the outer
+agent server**, so the outer server inherits the mount:
+
+    % acme                                     # acme first
+    % claude9fs -s claudesub -m /mnt/claudesub # sub-agent server
+    % claude9fs -s claude                      # outer server (inherits /mnt/claudesub)
+    % claudetalk                               # start the chat
+
+If you get the order wrong, the agent will see `/mnt/claudesub`
+as empty or nonexistent even though your shell can see it fine.
+
+**Debugging clue:** if `list_directory /mnt/claudesub` returns
+empty (no `clone` file) but the mount exists, the outer
+claude9fs was started before the sub-agent server.  Restart
+in the correct order.
+
+The outer agent now has (in its namespace):
+- `/mnt/claude` -- its own session (do NOT clone from here)
+- `/mnt/claudesub` -- the sub-agent server (clone from here)
+- `/mnt/acme` -- acme's filesystem
 
 ## Step by step
 
@@ -44,42 +85,40 @@ delete strays with `create_file /mnt/acme/<id>/ctl "delete\n"`.
 
 ### 2. Create a sub-agent session
 
-Read `clone` on the *same* claude9fs mount to allocate a new
-session.  This returns a session name:
+Read `clone` on the **sub-agent** claude9fs mount:
 
-    read_file /mnt/claude/clone   -->  "dizzy-monkey"
+    read_file /mnt/claudesub/clone   -->  "dizzy-monkey"
 
-This session is independent of the outer agent's session.
-They share the server process and API key but have separate
-conversation histories, models, and system prompts.
+This allocates a new independent session on the second server.
+Do NOT read `/mnt/claude/clone` -- that will deadlock.
 
 ### 3. Configure the session
 
 Set the model to something cheap for simple tasks:
 
-    create_file /mnt/claude/dizzy-monkey/model "claude-haiku-4-5-20251001"
+    create_file /mnt/claudesub/dizzy-monkey/model "claude-haiku-4-5-20251001"
 
 Optionally set a system prompt to keep the sub-agent focused:
 
-    create_file /mnt/claude/dizzy-monkey/system "You are a poet. Respond only with the poem."
+    create_file /mnt/claudesub/dizzy-monkey/system "You are a concise summarizer."
 
 ### 4. Send a prompt and read the reply
 
 Write the user message to `prompt`.  The write blocks until
 the model finishes (including any tool-use loops):
 
-    create_file /mnt/claude/dizzy-monkey/prompt "Write a poem about X."
+    create_file /mnt/claudesub/dizzy-monkey/prompt "Summarize X."
 
 Read `prompt` back to get the last assistant reply:
 
-    read_file /mnt/claude/dizzy-monkey/prompt   -->  (the poem)
+    read_file /mnt/claudesub/dizzy-monkey/prompt   -->  (the summary)
 
 ### 5. Deposit the result in the acme window
 
 Write the text to `/mnt/acme/<id>/body`.  Writes to `body`
 are always appended (file offset is ignored):
 
-    create_file /mnt/acme/14/body "<the poem text>"
+    create_file /mnt/acme/14/body "<the result text>"
 
 The text appears immediately in the acme window.
 
@@ -87,31 +126,73 @@ The text appears immediately in the acme window.
 
 Hang up the sub-agent session:
 
-    create_file /mnt/claude/dizzy-monkey/ctl "hangup"
+    create_file /mnt/claudesub/dizzy-monkey/ctl "hangup"
 
-## Verified workflow (2025-07-11)
+## Why the deadlock happens (details)
 
-This exact sequence was tested successfully:
+claude9fs is a 9P file server built on lib9p.  When the outer
+agent calls `read_file /mnt/claude/clone`, the tool
+implementation opens and reads a file.  That file lives on the
+same 9P server.  The lib9p event loop dispatches the Tread to
+`fsread`, which calls `newsession()` and responds.  But the
+problem is that the 9P connection the outer agent uses is the
+SAME pipe that serves the agent's own conversation.  The
+`srvrelease`/`srvacquire` mechanism in lib9p allows concurrent
+requests on different fids, but when the agent's tool execution
+is itself a 9P client of its own server, the server may not be
+able to process the new request until the current one completes
+-- classic self-deadlock over a synchronous channel.
 
-1. acme was started first
-2. claude9fs was started (inheriting acme's namespace)
-3. The outer agent created an acme window named `/tmp/llm-poem`
-4. The outer agent read `/mnt/claude/clone` to get session `dizzy-monkey`
-5. Set the session model to `claude-haiku-4-5-20251001`
-6. Set a system prompt ("You are a poet...")
-7. Wrote a prompt asking for a poem about writing code with LLMs
-8. Read back the poem from `prompt`
-9. Wrote the poem text to `/mnt/acme/14/body`
-10. Hung up the sub-agent session
+A second process on a separate pipe eliminates this entirely.
 
-The whole thing used one claude9fs process with two sessions.
+## Why namespace order matters (details)
+
+On Plan 9, each process has its own namespace -- a private
+mapping of paths to file trees.  Namespaces are inherited
+from parent to child at fork/rfork time.  They are NOT
+shared retroactively.
+
+When you type `claude9fs -s claudesub -m /mnt/claudesub` in
+your shell, only your shell's namespace (and future children)
+gets the mount.  An already-running claude9fs process is
+unaffected -- its namespace was fixed when it started.
+
+claudetalk (the rc script) runs in your shell's namespace,
+so it can see everything.  But the tool calls that the agent
+makes (read_file, create_file, etc.) are executed by the
+outer claude9fs process, not by claudetalk.  So it is the
+outer claude9fs's namespace that matters, not the shell's.
+
+This is the same Plan 9 namespace isolation that makes
+`mount -b '#|/data' /dev` work -- and the same reason that
+`ns` output from one process doesn't describe what another
+process sees.
+
+## Testing log
+
+- **2025-07-11:** First successful sub-agent test using a
+  single process.  Likely worked because the clone was
+  reached through a separate 9P connection (e.g. via /srv).
+
+- **2025-07-14 (session gloomy-hammer):** Reading
+  `/mnt/claude/clone` from the agent's tool loop produced
+  "i/o on hungup channel", confirming the self-deadlock.
+  Started second claude9fs with `-s claudesub -m /mnt/claudesub`
+  but the outer claude9fs was already running -- it could
+  not see the mount.  `list_directory /mnt/claudesub`
+  returned empty.
+
+- **2025-07-14 (session jazzy-weasel):** Same result --
+  `/mnt/claudesub` visible as a mount point (inherited from
+  shell) but file tree empty because the outer claude9fs
+  started before the sub-agent server.  Root cause confirmed:
+  namespace inheritance requires correct startup order.
 
 ## Notes
 
-- **One server, many agents:** You do not need a second
-  claude9fs.  Each `clone` creates an independent session.
-  You could spawn several sub-agents in parallel (e.g. one
-  for research, one for code review) on the same mount.
+- **Two servers, many sub-agents:** The sub-agent server at
+  `/mnt/claudesub` can host many sessions via `clone`.  You
+  only need one extra process, not one per sub-agent.
 
 - **Model per session:** Each session has its own `model` file.
   The outer agent can run on Opus while sub-agents run on Haiku

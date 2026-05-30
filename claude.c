@@ -284,7 +284,7 @@ readfile(int fd)
 }
 
 Conv*
-convnew(char *apikey, char *model, int maxtokens, char *sysprompt)
+convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 {
 	Conv *c;
 
@@ -292,10 +292,14 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt)
 	c->apikey = estrdup(apikey);
 	c->model = estrdup(model);
 	c->maxtokens = maxtokens;
-	if(sysprompt)
+	if(sysprompt && skills)
+		c->sysprompt = esmprint("%s%s", sysprompt, skills);
+	else if(sysprompt)
 		c->sysprompt = estrdup(sysprompt);
-	else
-		c->sysprompt = estrdup(
+	else {
+		char *base;
+
+		base =
 			"You are a coding assistant running on Plan 9 (9front). "
 			"You have tools to create, patch, and delete files. "
 			"Use the tools when the user asks you to make changes. "
@@ -360,7 +364,13 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt)
 			"doesn't fit, split it across linked beads using "
 			"child ('c') edges.\n"
 			"  - If /n/beads is not mounted, proceed without it "
-			"and do not mention it to the user.");
+			"and do not mention it to the user.";
+
+		if(skills != nil)
+			c->sysprompt = esmprint("%s%s", base, skills);
+		else
+			c->sysprompt = estrdup(base);
+	}
 	return c;
 }
 

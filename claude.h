@@ -78,7 +78,7 @@ struct ModelInfo {
 };
 
 /* claude.c */
-Conv*	convnew(char *apikey, char *model, int maxtokens, char *sysprompt);
+Conv*	convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills);
 void	convfree(Conv *c);
 int	convcount(Conv *c);
 long	convsize(Conv *c);
