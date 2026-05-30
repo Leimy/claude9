@@ -45,6 +45,8 @@ struct Session {
 	int streamcap;
 	int streamdone;
 	int streamgen;
+	/* auto-continue on max_tokens */
+	int autocont;	/* max auto-continue rounds; 0 = disabled */
 	Session *next;
 };
 
@@ -572,12 +574,14 @@ ctltext(Session *s)
 		"model %s\n"
 		"tokens %d\n"
 		"messages %d\n"
-		"bytes %ld\n",
+		"bytes %ld\n"
+		"autocontinue %d\n",
 		s->name,
 		s->conv->model,
 		s->conv->maxtokens,
 		convcount(s->conv),
-		convsize(s->conv));
+		convsize(s->conv),
+		s->autocont);
 	return estrdup9p(buf);
 }
 
@@ -1054,6 +1058,19 @@ handlectl(Session *s, char *cmd, int *hangup)
 		while(*path == ' ') path++;
 		if(*path != '\0')
 			sessionload(s, path);
+	} else if(strncmp(cmd, "autocontinue", 12) == 0){
+		char *v;
+		int n;
+		v = cmd + 12;
+		while(*v == ' ') v++;
+		if(*v == '\0')
+			n = 3;	/* default: up to 3 rounds */
+		else
+			n = atoi(v);
+		if(n < 0) n = 0;
+		s->autocont = n;
+	} else if(strcmp(cmd, "noautocontinue") == 0){
+		s->autocont = 0;
 	}
 }
 
@@ -1065,6 +1082,7 @@ fswrite(Req *r)
 	int hangup, n;
 	Session *s;
 	char *data, *reply;
+	char *contreply;
 	long count;
 
 	path = r->fid->qid.path;
@@ -1115,6 +1133,48 @@ fswrite(Req *r)
 			streamcb, s);
 
 		streamfinish(s);
+
+		/*
+		 * Auto-continue: if Claude hit max_tokens and
+		 * autocontinue is enabled, send "Continue." messages
+		 * to keep going.  We keep appending to the stream
+		 * buffer so the reader sees seamless text.  Stop
+		 * early if stop_reason becomes end_turn or if the
+		 * API call fails.
+		 */
+		if(reply != nil && s->autocont > 0){
+			int contround;
+			for(contround = 0; contround < s->autocont; contround++){
+				if(s->usage.stop_reason == nil
+				|| strcmp(s->usage.stop_reason, "max_tokens") != 0)
+					break;
+
+				qlock(&s->lk);
+				convappend(s->conv, msgnew(Muser, "Continue."));
+				free(s->usage.stop_reason);
+				s->usage.stop_reason = nil;
+				qunlock(&s->lk);
+
+				/* reopen the stream so readers keep blocking */
+				qlock(&s->streamlk);
+				s->streamdone = 0;
+				qunlock(&s->streamlk);
+
+				contreply = claudeconverse_stream(s->conv,
+					&s->usage, streamcb, s);
+
+				streamfinish(s);
+
+				if(contreply != nil){
+					reply = erealloc(reply,
+						strlen(reply) + strlen(contreply) + 2);
+					strcat(reply, "\n");
+					strcat(reply, contreply);
+					free(contreply);
+				} else
+					break;
+			}
+		}
 
 		qlock(&s->lk);
 		if(reply == nil){

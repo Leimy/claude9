@@ -65,7 +65,7 @@ fn sigexit {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /clear /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /autocontinue [n] /clear /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -140,6 +140,8 @@ fn docmd {
 		echo '  /usage         show token usage' >[1=2]
 		echo '  /save <path>   save conversation' >[1=2]
 		echo '  /load <path>   load conversation' >[1=2]
+		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
+		echo '  /noautocontinue   disable auto-continue' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
 		echo '  /quit          exit' >[1=2]
 	}
@@ -160,6 +162,19 @@ fn docmd {
 		}
 		if not
 			echo 'usage: /load <path>' >[1=2]
+	}
+	if not if(~ $cmd /autocontinue /ac){
+		shift
+		if(~ $#* 0)
+			echo 'autocontinue' > $sess/ctl
+		if not
+			echo 'autocontinue '$1 > $sess/ctl
+		ac=`{cat $sess/ctl | grep '^autocontinue' | sed 's/autocontinue //'}
+		echo 'autocontinue: '$ac >[1=2]
+	}
+	if not if(~ $cmd /noautocontinue /noac){
+		echo 'noautocontinue' > $sess/ctl
+		echo 'autocontinue: 0' >[1=2]
 	}
 	if not {
 		echo 'unknown command: '$cmd >[1=2]

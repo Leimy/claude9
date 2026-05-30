@@ -141,6 +141,8 @@ and returns its number.
 	hangup         destroy the session
 	save <path>    save conversation to a file
 	load <path>    load conversation from a file
+	autocontinue [n]  enable auto-continue (default n=3)
+	noautocontinue    disable auto-continue
 
 ### Tool Use
 
@@ -163,6 +165,35 @@ hits EOF.
 
 To see the last round's text after the fact, read `prompt`
 instead.
+
+### Auto-Continue
+
+When Claude's response hits the `max_tokens` limit, the API
+returns `stop_reason: max_tokens` and the output is truncated
+mid-sentence.  Normally you would need to manually send a
+follow-up message to get the rest.
+
+The `autocontinue` ctl command automates this.  When enabled,
+claude9fs checks the stop reason after each response; if it is
+`max_tokens`, the fs automatically appends a `"Continue."` user
+message and sends another request, keeping the stream open so
+the reader sees seamless text.  This repeats up to *n* times or
+until the model stops on its own (e.g. `end_turn`).
+
+	echo autocontinue > /mnt/claude/$n/ctl     # enable, default 3 rounds
+	echo autocontinue 5 > /mnt/claude/$n/ctl   # enable, up to 5 rounds
+	echo noautocontinue > /mnt/claude/$n/ctl   # disable
+
+The current setting is shown in `ctl` output as
+`autocontinue N` (0 means disabled).
+
+Because continuations fire within seconds of each truncation,
+the Anthropic prompt cache stays warm -- the entire conversation
+prefix is a cache hit on each follow-up, so you only pay for
+new output tokens.
+
+Auto-continue is off by default.  Each continuation round
+counts against the same usage totals shown in the `usage` file.
 
 ## claudetalk - rc Shell Client
 
@@ -192,6 +223,8 @@ the session's `stream` file in the background while writing to
 	/usage         show token usage
 	/save <path>   save conversation to file
 	/load <path>   load conversation from file
+	/autocontinue [n]  enable auto-continue on max_tokens (default 3)
+	/noautocontinue    disable auto-continue
 	/detach        keep session alive on exit (can reattach later)
 	/help          show command list
 	/quit          exit
