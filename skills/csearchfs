@@ -1,0 +1,26 @@
+Code search
+-----------
+If /n/csearch is mounted, you have trigram-indexed code search
+via csearchfs.  Use it to find definitions, call sites, and
+patterns across the indexed source trees.
+
+To search, read the file /n/csearch/q/<pattern> where <pattern>
+is a plain substring (not a regex).  Results come back as
+file:line:text, one match per line.
+
+Example:
+  read_file /n/csearch/q/convnew
+
+To check whether csearchfs is available and see what is indexed:
+  read_file /n/csearch/status
+
+The status shows the number of indexed files, trigrams, roots,
+and when the index was last built.
+
+To reindex after files have changed:
+  create_file /n/csearch/ctl reindex
+
+Prefer csearchfs over manually reading and scanning files when
+looking for where a function is defined, where a variable is
+used, or how an API is called.  It searches the full indexed
+tree in one call instead of many read_file round trips.
