@@ -2,7 +2,7 @@
 
 enum {
 	Acreate,
-	Aedit,
+	Areplace,
 	Aread,
 	Alist,
 	Adelete,
@@ -19,11 +19,12 @@ enum {
 typedef struct ToolCall ToolCall;
 struct ToolCall {
 	char *id;		/* tool_use_id */
-	int type;		/* Acreate, Aedit, Adelete, Aread, Alist, Amanpage, Amk */
+	char *name;		/* tool name for display */
+	int type;		/* Acreate, Areplace, Adelete, Aread, Alist, Amanpage, Amk */
 	char *path;		/* file path */
-	char *body;		/* contents / replacement / targets */
-	int start;		/* Aedit: first line (1-based, inclusive) */
-	int end;		/* Aedit: last line (1-based, inclusive) */
+	char *body;		/* contents / targets (Acreate, Amk) */
+	char *oldstr;		/* Areplace: text to find */
+	char *newstr;		/* Areplace: replacement text */
 	char *result;		/* result text after execution */
 	ToolCall *next;
 };

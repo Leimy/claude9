@@ -24,7 +24,8 @@ following tools without asking you for confirmation each time:
 
 - `create_file` - create or overwrite a file at any path the
   process can write to.
-- `edit_file` - replace a range of lines in an existing file.
+- `replace_string` - find and replace an exact string in an
+  existing file (must match exactly once).
 - `read_file` - read any file the process can read.
 - `list_directory` - list any directory the process can read.
 - `delete_file` - remove a file at any path the process can
@@ -146,16 +147,22 @@ and returns its number.
 ### Tool Use
 
 When you write to `prompt`, claude9fs runs the full tool loop:
-Claude has access to file tools (`create_file`, `edit_file`,
+Claude has access to file tools (`create_file`, `replace_string`,
 `read_file`, `list_directory`, `delete_file`) and a few utility
 tools (`read_man_page`, `mk`) which are executed automatically
 as part of the round, with results sent back to Claude until it
 produces a final response.
 
-The `edit_file` tool replaces a range of lines (by 1-based line
-number) with new text.  It can also insert lines without removing
-any, or delete lines without inserting.  This is simpler and more
-reliable than the unified-diff approach used in earlier versions.
+The `replace_string` tool does content-addressed editing: it
+takes an `old_str` to find and a `new_str` to replace it with.
+The old string must match exactly once in the file -- if it
+matches zero times the tool returns an error (the text isn't
+there or has changed), and if it matches more than once the
+tool returns an error (the caller needs to include more
+surrounding context to make the match unique).  This is the
+same approach used by Claude Code's str_replace_editor and is
+much safer than line-number-based editing, which silently
+corrupts files when line numbers are stale or wrong.
 
 ### Streaming
 

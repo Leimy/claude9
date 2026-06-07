@@ -84,12 +84,10 @@ static QLock sessionlk;
 static char*
 readskills(char *dir)
 {
-	int dfd, fd, n, i;
-	int gotany;
+	int dfd, fd, n, i, gotany, dlen;
 	Dir *d;
-	char *path, *data, *buf;
-	int len, cap, dlen, nlen, hlen;
-	char header[512];
+	char *path, *data;
+	Fmt f;
 
 	if(dir == nil || dir[0] == '\0')
 		return nil;
@@ -98,24 +96,12 @@ readskills(char *dir)
 	if(dfd < 0)
 		return nil;
 
-	cap = 4096;
-	buf = emalloc(cap);
-	len = 0;
-
-	/* section header */
-	hlen = snprint(header, sizeof header,
+	fmtstrinit(&f);
+	fmtprint(&f,
 		"\n\nSkills\n"
 		"------\n"
 		"The following skill files were loaded at startup from %s.\n"
 		"Follow their instructions.\n\n", dir);
-
-	while(len + hlen + 1 > cap){
-		cap *= 2;
-		buf = erealloc(buf, cap);
-	}
-	memmove(buf + len, header, hlen);
-	len += hlen;
-	buf[len] = '\0';
 
 	gotany = 0;
 	while((n = dirread(dfd, &d)) > 0){
@@ -134,20 +120,10 @@ readskills(char *dir)
 				continue;
 			}
 			dlen = strlen(data);
-			nlen = strlen(d[i].name);
-
-			/* "### filename\n" + data + "\n\n" */
-			while(len + nlen + dlen + 8 > cap){
-				cap *= 2;
-				buf = erealloc(buf, cap);
-			}
-			len += snprint(buf + len, cap - len, "### %s\n", d[i].name);
-			memmove(buf + len, data, dlen);
-			len += dlen;
+			fmtprint(&f, "### %s\n%s", d[i].name, data);
 			if(dlen > 0 && data[dlen-1] != '\n')
-				buf[len++] = '\n';
-			buf[len++] = '\n';
-			buf[len] = '\0';
+				fmtprint(&f, "\n");
+			fmtprint(&f, "\n");
 			free(data);
 			gotany = 1;
 		}
@@ -156,10 +132,10 @@ readskills(char *dir)
 	close(dfd);
 
 	if(!gotany){
-		free(buf);
+		free(fmtstrflush(&f));
 		return nil;
 	}
-	return buf;
+	return fmtstrflush(&f);
 }
 
 static Session*
@@ -445,31 +421,19 @@ static char*
 convtext(Conv *c)
 {
 	Msg *m;
-	int sz, n;
-	char *buf, *role;
+	Fmt f;
 
-	sz = 1024;
-	buf = emalloc(sz);
-	n = 0;
-	for(m = c->msgs; m != nil; m = m->next){
-		role = m->role == Muser ? "user" : "assistant";
-		while(n + (int)strlen(role) + (int)strlen(m->text) + 8 >= sz){
-			sz *= 2;
-			buf = erealloc(buf, sz);
-		}
-		n += snprint(buf + n, sz - n, "[%s]\n%s\n\n", role, m->text);
-	}
-	if(n == 0)
-		buf[0] = '\0';
-	return buf;
+	fmtstrinit(&f);
+	for(m = c->msgs; m != nil; m = m->next)
+		fmtprint(&f, "[%s]\n%s\n\n",
+			m->role == Muser ? "user" : "assistant", m->text);
+	return fmtstrflush(&f);
 }
 
 static char*
 usagetext(Session *s)
 {
-	char buf[512];
-
-	snprint(buf, sizeof buf,
+	return esmprint(
 		"input_tokens %d\n"
 		"output_tokens %d\n"
 		"total_tokens %d\n"
@@ -482,15 +446,12 @@ usagetext(Session *s)
 		s->usage.cache_creation_input_tokens,
 		s->usage.cache_read_input_tokens,
 		s->usage.stop_reason ? s->usage.stop_reason : "none");
-	return estrdup9p(buf);
 }
 
 static char*
 ctltext(Session *s)
 {
-	char buf[512];
-
-	snprint(buf, sizeof buf,
+	return esmprint(
 		"name %s\n"
 		"model %s\n"
 		"tokens %d\n"
@@ -503,7 +464,6 @@ ctltext(Session *s)
 		convcount(s->conv),
 		convsize(s->conv),
 		s->autocont);
-	return estrdup9p(buf);
 }
 
 static void
@@ -631,8 +591,7 @@ modelstext(Req *r)
 	ModelInfo *list;
 	int n, i;
 	char *buf;
-	int len, cap, slen;
-	char line[256];
+	Fmt f;
 
 	n = fetchmodels(apikey, &list);
 	if(n < 0){
@@ -640,22 +599,12 @@ modelstext(Req *r)
 		respond(r, nil);
 		return;
 	}
-	cap = 4096;
-	buf = emalloc(cap);
-	len = 0;
+	fmtstrinit(&f);
 	for(i = 0; i < n; i++){
-		if(list[i].id == nil)
-			continue;
-		snprint(line, sizeof line, "%s\n", list[i].id);
-		slen = strlen(line);
-		while(len + slen + 1 > cap){
-			cap *= 2;
-			buf = erealloc(buf, cap);
-		}
-		memmove(buf + len, line, slen);
-		len += slen;
+		if(list[i].id != nil)
+			fmtprint(&f, "%s\n", list[i].id);
 	}
-	buf[len] = '\0';
+	buf = fmtstrflush(&f);
 	for(i = 0; i < n; i++){
 		free(list[i].id);
 		free(list[i].display_name);
@@ -679,7 +628,7 @@ modelstext(Req *r)
 static void
 streamread(Req *r, Session *s, Faux *fa)
 {
-	long avail, want, off;
+	long avail, want;
 	char *data;
 
 	qlock(&s->streamlk);
@@ -711,13 +660,11 @@ streamread(Req *r, Session *s, Faux *fa)
 			if(want > avail) want = avail;
 			data = emalloc(want);
 			memmove(data, s->streambuf + fa->streamoff, want);
-			off = fa->streamoff;
 			fa->streamoff += want;
 			qunlock(&s->streamlk);
 			memmove(r->ofcall.data, data, want);
 			r->ofcall.count = want;
 			free(data);
-			USED(off);
 			respond(r, nil);
 			return;
 		}

@@ -72,12 +72,11 @@ esmprint(char *fmt, ...)
 /*
  * Single source of truth for the tools we expose to Claude.
  *
- * Every tool takes a "path" parameter; tools that also need a
- * second string parameter declare it in the bodyparam / bodydesc
- * fields.  edit_file is special: it has integer start/end params
- * and a replacement string, handled via custom code in mktools()
- * and parseinput().  findtool() / findtooltype() let the rest of
- * the code walk between API names and the Acreate/Aedit/... enum.
+ * Most tools take a "path" parameter plus an optional body
+ * string (bodyparam/bodydesc).  replace_string is special:
+ * it has old_str and new_str parameters, handled via custom
+ * code in mktools() and parseinput().  findtool() maps API
+ * names to the Acreate/Areplace/... enum.
  */
 typedef struct Tooldef Tooldef;
 struct Tooldef {
@@ -97,21 +96,20 @@ static Tooldef tools[] = {
 		"contents", "Complete file contents" },
 
 	/*
-	 * edit_file has a custom schema (integer start/end params)
-	 * built by mktools(); the Tooldef entry only carries the
-	 * name, type, and description.  bodyparam is nil because
-	 * parseinput() handles it specially.
+	 * replace_string has a custom schema (old_str, new_str)
+	 * built by mktools(); bodyparam is nil because parseinput()
+	 * handles it specially.
 	 */
-	{ Aedit, "edit_file",
-		"Replace a range of lines in an existing file with new text.  "
-		"Lines are 1-based and inclusive: start=5, end=10 replaces "
-		"lines 5 through 10 (6 lines) with the replacement text.  "
-		"To insert text before line N without removing anything, "
-		"use start=N, end=N-1 (i.e. end < start).  "
-		"To delete lines without inserting, set replacement to "
-		"the empty string.  "
+	{ Areplace, "replace_string",
+		"Replace the first exact match of old_str with new_str "
+		"in a file.  The old_str must match exactly one location "
+		"in the file.  If it matches zero times, an error is "
+		"returned (check for typos or stale text).  If it matches "
+		"more than once, an error is returned (include more "
+		"surrounding context in old_str to make it unique).  "
+		"To delete text, set new_str to the empty string.  "
 		"The file must already exist.  "
-		"Returns a summary of the edit on success.",
+		"Returns a summary of the replacement on success.",
 		"File path to edit",
 		nil, nil },
 
@@ -170,21 +168,10 @@ findtool(char *name)
 	return nil;
 }
 
-static Tooldef*
-findtooltype(int type)
-{
-	int i;
-
-	for(i = 0; i < nelem(tools); i++)
-		if(tools[i].type == type)
-			return &tools[i];
-	return nil;
-}
-
 /*
  * Pull parameters out of a tool_use block's "input" object.
  * For most tools: path + optional body string.
- * For edit_file: path + start + end + replacement.
+ * For replace_string: path + old_str + new_str.
  */
 static void
 parseinput(ToolCall *tc, Tooldef *td, Json *input)
@@ -193,11 +180,11 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 
 	s = jstr(input, "path");
 	tc->path = estrdup(s ? s : "");
-	if(td->type == Aedit){
-		tc->start = jint(input, "start");
-		tc->end = jint(input, "end");
-		s = jstr(input, "replacement");
-		tc->body = estrdup(s ? s : "");
+	if(td->type == Areplace){
+		s = jstr(input, "old_str");
+		tc->oldstr = estrdup(s ? s : "");
+		s = jstr(input, "new_str");
+		tc->newstr = estrdup(s ? s : "");
 	} else if(td->bodyparam != nil){
 		s = jstr(input, td->bodyparam);
 		tc->body = estrdup(s ? s : "");
@@ -225,8 +212,8 @@ mkparents(char *path)
 	}
 }
 
-static char*
-readfd(int fd)
+char*
+readfile(int fd)
 {
 	char *buf;
 	vlong len;
@@ -245,12 +232,6 @@ readfd(int fd)
 	buf = erealloc(buf, len + 1);
 	buf[len] = '\0';
 	return buf;
-}
-
-char*
-readfile(int fd)
-{
-	return readfd(fd);
 }
 
 static char *defaultsysprompt =
@@ -405,28 +386,22 @@ mktools(void)
 		req = jarray();
 		jappend(req, jstring("path"));
 
-		/* edit_file has a custom schema with integer params */
-		if(td->type == Aedit){
+		/* replace_string has a custom schema */
+		if(td->type == Areplace){
 			p = jobject();
-			jset(p, "type", jstring("integer"));
+			jset(p, "type", jstring("string"));
 			jset(p, "description", jstring(
-				"First line to replace (1-based, inclusive)"));
-			jset(props, "start", p);
-			jappend(req, jstring("start"));
-
-			p = jobject();
-			jset(p, "type", jstring("integer"));
-			jset(p, "description", jstring(
-				"Last line to replace (1-based, inclusive). "
-				"Use end < start to insert without removing."));
-			jset(props, "end", p);
-			jappend(req, jstring("end"));
+				"The exact text to search for in the file. "
+				"Must match exactly once."));
+			jset(props, "old_str", p);
+			jappend(req, jstring("old_str"));
 
 			p = jobject();
 			jset(p, "type", jstring("string"));
-			jset(p, "description", jstring("Replacement text"));
-			jset(props, "replacement", p);
-			jappend(req, jstring("replacement"));
+			jset(p, "description", jstring(
+				"The replacement text. Use empty string to delete."));
+			jset(props, "new_str", p);
+			jappend(req, jstring("new_str"));
 		}
 
 		if(td->bodyparam != nil){
@@ -451,6 +426,23 @@ mktools(void)
 		jappend(arr, t);
 	}
 	return arr;
+}
+
+/*
+ * Wrap a plain text string in a JSON content array:
+ *   [{"type":"text","text":"..."}]
+ */
+static Json*
+mktextcontent(char *text)
+{
+	Json *content, *block;
+
+	content = jarray();
+	block = jobject();
+	jset(block, "type", jstring("text"));
+	jset(block, "text", jstring(text));
+	jappend(content, block);
+	return content;
 }
 
 static Json*
@@ -481,22 +473,11 @@ buildreq(Conv *c)
 	for(m = c->msgs; m != nil; m = m->next){
 		msg = jobject();
 		jset(msg, "role", jstring(m->role == Muser ? "user" : "assistant"));
-		if(m->rawjson != nil){
+		content = nil;
+		if(m->rawjson != nil)
 			content = jsonparse(m->rawjson);
-			if(content == nil){
-				content = jarray();
-				block = jobject();
-				jset(block, "type", jstring("text"));
-				jset(block, "text", jstring(m->text));
-				jappend(content, block);
-			}
-		} else {
-			content = jarray();
-			block = jobject();
-			jset(block, "type", jstring("text"));
-			jset(block, "text", jstring(m->text));
-			jappend(content, block);
-		}
+		if(content == nil)
+			content = mktextcontent(m->text);
 		jset(msg, "content", content);
 		jappend(msgs, msg);
 	}
@@ -642,35 +623,6 @@ websend(Conv *c, char *body, int stream, int *clonefdp)
 	return fd;
 }
 
-static char*
-extracttext(Json *content)
-{
-	Json *block;
-	char *type, *text, *buf;
-	int i, len, tlen;
-
-	buf = estrdup("");
-	len = 0;
-
-	for(i = 0; i < content->nitem; i++){
-		block = jidx(content, i);
-		if(block == nil)
-			continue;
-		type = jstr(block, "type");
-		if(type == nil || strcmp(type, "text") != 0)
-			continue;
-		text = jstr(block, "text");
-		if(text == nil)
-			continue;
-		tlen = strlen(text);
-		buf = erealloc(buf, len + tlen + 1);
-		memmove(buf + len, text, tlen);
-		len += tlen;
-		buf[len] = '\0';
-	}
-	return buf;
-}
-
 static ToolCall*
 parsetools(Json *content)
 {
@@ -706,6 +658,7 @@ parsetools(Json *content)
 
 		tc = emallocz(sizeof *tc, 1);
 		tc->id = estrdup(id);
+		tc->name = estrdup(name);
 		tc->type = td->type;
 		parseinput(tc, td, input);
 
@@ -726,8 +679,11 @@ toolfree(ToolCall *t)
 	while(t != nil){
 		next = t->next;
 		free(t->id);
+		free(t->name);
 		free(t->path);
 		free(t->body);
+		free(t->oldstr);
+		free(t->newstr);
 		free(t->result);
 		free(t);
 		t = next;
@@ -754,7 +710,7 @@ toolread(char *path)
 	fd = open(path, OREAD);
 	if(fd < 0)
 		return esmprint("error: open %s: %r", path);
-	data = readfd(fd);
+	data = readfile(fd);
 	close(fd);
 	if(data == nil)
 		return esmprint("error: read %s: %r", path);
@@ -766,31 +722,19 @@ toollist(char *path)
 {
 	int fd, n, i;
 	Dir *d;
-	char *buf;
-	int len, cap, nlen;
+	Fmt f;
 
 	fd = open(path, OREAD);
 	if(fd < 0)
 		return esmprint("error: open %s: %r", path);
-	cap = 4096;
-	buf = emalloc(cap);
-	len = 0;
+	fmtstrinit(&f);
 	while((n = dirread(fd, &d)) > 0){
-		for(i = 0; i < n; i++){
-			nlen = strlen(d[i].name);
-			while(len + nlen + 2 > cap){
-				cap *= 2;
-				buf = erealloc(buf, cap);
-			}
-			memmove(buf + len, d[i].name, nlen);
-			len += nlen;
-			buf[len++] = '\n';
-		}
+		for(i = 0; i < n; i++)
+			fmtprint(&f, "%s\n", d[i].name);
 		free(d);
 	}
 	close(fd);
-	buf[len] = '\0';
-	return buf;
+	return fmtstrflush(&f);
 }
 
 static char*
@@ -845,7 +789,7 @@ toolman(char *query)
 	}
 	close(pfd[1]);
 
-	data = readfd(pfd[0]);
+	data = readfile(pfd[0]);
 	close(pfd[0]);
 	waitpid();
 
@@ -918,7 +862,7 @@ toolmk(char *dir, char *args)
 	close(pfd[1]);
 	free(buf);
 
-	data = readfd(pfd[0]);
+	data = readfile(pfd[0]);
 	close(pfd[0]);
 	waitpid();
 
@@ -943,122 +887,88 @@ toolmk(char *dir, char *args)
 }
 
 /*
- * edit_file: replace lines start..end (1-based, inclusive)
- * with replacement text.  If end < start, insert before
- * line start without removing anything.  Returns a status
+ * replace_string: find old_str in the file, verify it occurs
+ * exactly once, replace it with new_str.  Returns a status
  * string (caller frees).
+ *
+ * This is the content-addressed edit model used by Claude Code's
+ * str_replace_editor.  It is safe against stale state: if the
+ * file has changed and the old text is no longer present, the
+ * operation fails loudly instead of silently corrupting.
  */
 static char*
-tooledit(char *path, int start, int end, char *replacement)
+toolreplace(char *path, char *oldstr, char *newstr)
 {
-	int fd, i, nfile, nrepl, delta;
-	char *data, *p, *sol;
-	char **lines;
-	int lcap;
-	Fmt out;
-	char *result;
+	int fd, count;
+	long filelen, oldlen, newlen;
+	char *data, *p, *match, *result;
 
 	if(path == nil || path[0] == '\0')
 		return esmprint("error: no file path");
+	if(oldstr == nil || oldstr[0] == '\0')
+		return esmprint("error: old_str is empty");
 
 	fd = open(path, OREAD);
 	if(fd < 0)
 		return esmprint("error: open %s: %r", path);
-	data = readfd(fd);
+	data = readfile(fd);
 	close(fd);
 	if(data == nil)
 		return esmprint("error: read %s: %r", path);
 
-	/* split file into lines */
-	lcap = 256;
-	lines = emalloc(lcap * sizeof lines[0]);
-	nfile = 0;
-	for(p = data; *p != '\0'; ){
-		sol = p;
-		while(*p != '\0' && *p != '\n')
-			p++;
-		if(*p == '\n')
-			p++;
-		if(nfile >= lcap){
-			lcap *= 2;
-			lines = erealloc(lines, lcap * sizeof lines[0]);
-		}
-		lines[nfile] = emalloc(p - sol + 1);
-		memmove(lines[nfile], sol, p - sol);
-		lines[nfile][p - sol] = '\0';
-		nfile++;
+	filelen = strlen(data);
+	oldlen = strlen(oldstr);
+	newlen = (newstr != nil) ? strlen(newstr) : 0;
+
+	/* count occurrences of old_str */
+	count = 0;
+	match = nil;
+	for(p = data; (p = strstr(p, oldstr)) != nil; p += oldlen){
+		if(count == 0)
+			match = p;
+		count++;
 	}
+
+	if(count == 0){
+		free(data);
+		return esmprint("error: old_str not found in %s", path);
+	}
+	if(count > 1){
+		free(data);
+		return esmprint("error: old_str matches %d times in %s; "
+			"include more context to make it unique", count, path);
+	}
+
+	/* build replacement: prefix + new_str + suffix */
+	result = emalloc(filelen - oldlen + newlen + 1);
+	memmove(result, data, match - data);
+	if(newlen > 0)
+		memmove(result + (match - data), newstr, newlen);
+	memmove(result + (match - data) + newlen,
+		match + oldlen,
+		filelen - (match - data) - oldlen);
+	result[filelen - oldlen + newlen] = '\0';
+
 	free(data);
-
-	/* validate range */
-	if(start < 1)
-		start = 1;
-	if(end > nfile)
-		end = nfile;
-
-	/* count replacement lines */
-	nrepl = 0;
-	if(replacement != nil && replacement[0] != '\0'){
-		for(p = replacement; *p != '\0'; ){
-			while(*p != '\0' && *p != '\n')
-				p++;
-			if(*p == '\n')
-				p++;
-			nrepl++;
-		}
-	}
-
-	/* number of lines removed */
-	delta = (end >= start) ? (end - start + 1) : 0;
-
-	/* build new file */
-	fmtstrinit(&out);
-
-	/* lines before the edit region: 1..start-1 */
-	for(i = 0; i < start - 1 && i < nfile; i++)
-		fmtprint(&out, "%s", lines[i]);
-
-	/* replacement text */
-	if(replacement != nil && replacement[0] != '\0'){
-		fmtprint(&out, "%s", replacement);
-		/* ensure replacement ends with newline */
-		i = strlen(replacement);
-		if(i > 0 && replacement[i-1] != '\n')
-			fmtprint(&out, "\n");
-	}
-
-	/* lines after the edit region: end+1..nfile */
-	for(i = end; i < nfile; i++)
-		fmtprint(&out, "%s", lines[i]);
-
-	result = fmtstrflush(&out);
 
 	/* write back */
 	fd = create(path, OWRITE, 0666);
 	if(fd < 0){
-		for(i = 0; i < nfile; i++) free(lines[i]);
-		free(lines);
 		free(result);
 		return esmprint("error: create %s: %r", path);
 	}
 	if(writeall(fd, result, strlen(result)) < 0){
 		close(fd);
-		for(i = 0; i < nfile; i++) free(lines[i]);
-		free(lines);
 		free(result);
 		return esmprint("error: write %s: %r", path);
 	}
 	close(fd);
 	free(result);
 
-	for(i = 0; i < nfile; i++) free(lines[i]);
-	free(lines);
-
-	if(end < start)
-		return esmprint("inserted %d lines before line %d in %s (%d lines now)",
-			nrepl, start, path, nfile + nrepl);
-	return esmprint("replaced lines %d-%d (%d lines) with %d lines in %s (%d lines now)",
-		start, end, delta, nrepl, path, nfile - delta + nrepl);
+	if(newlen == 0)
+		return esmprint("deleted %ld bytes in %s", oldlen, path);
+	return esmprint("replaced %ld bytes with %ld bytes in %s",
+		oldlen, newlen, path);
 }
 
 /*
@@ -1083,8 +993,8 @@ exectool(ToolCall *tc)
 		return esmprint("created %s (%d bytes)",
 			tc->path, (int)strlen(tc->body));
 
-	case Aedit:
-		return tooledit(tc->path, tc->start, tc->end, tc->body);
+	case Areplace:
+		return toolreplace(tc->path, tc->oldstr, tc->newstr);
 
 	case Adelete:
 		if(remove(tc->path) < 0)
@@ -1151,36 +1061,23 @@ struct Sblock {
 	int tooljsoncap;
 };
 
+/*
+ * Append n bytes of s to a growable buffer.
+ */
 static void
-sblock_appendtext(Sblock *b, char *s, int n)
+sbappend(char **buf, int *len, int *cap, char *s, int n)
 {
 	int need;
 
-	need = b->textlen + n + 1;
-	if(need > b->textcap){
-		while(need > b->textcap)
-			b->textcap = b->textcap ? b->textcap * 2 : 256;
-		b->text = erealloc(b->text, b->textcap);
+	need = *len + n + 1;
+	if(need > *cap){
+		while(need > *cap)
+			*cap = *cap ? *cap * 2 : 256;
+		*buf = erealloc(*buf, *cap);
 	}
-	memmove(b->text + b->textlen, s, n);
-	b->textlen += n;
-	b->text[b->textlen] = '\0';
-}
-
-static void
-sblock_appendjson(Sblock *b, char *s, int n)
-{
-	int need;
-
-	need = b->tooljsonlen + n + 1;
-	if(need > b->tooljsoncap){
-		while(need > b->tooljsoncap)
-			b->tooljsoncap = b->tooljsoncap ? b->tooljsoncap * 2 : 256;
-		b->tooljson = erealloc(b->tooljson, b->tooljsoncap);
-	}
-	memmove(b->tooljson + b->tooljsonlen, s, n);
-	b->tooljsonlen += n;
-	b->tooljson[b->tooljsonlen] = '\0';
+	memmove(*buf + *len, s, n);
+	*len += n;
+	(*buf)[*len] = '\0';
 }
 
 static Reply*
@@ -1189,15 +1086,14 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 	Reply *r;
 	Json *content, *block, *input;
 	ToolCall *head, *tail, *tc;
-	char *alltext;
 	Tooldef *td;
-	int i, alllen, tlen;
+	Fmt f;
+	int i;
 
 	r = emallocz(sizeof *r, 1);
 
 	content = jarray();
-	alltext = estrdup("");
-	alllen = 0;
+	fmtstrinit(&f);
 	head = tail = nil;
 
 	for(i = 0; i < nblocks; i++){
@@ -1207,13 +1103,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			jset(block, "text",
 				jstring(blocks[i].text ? blocks[i].text : ""));
 			jappend(content, block);
-			if(blocks[i].text != nil){
-				tlen = blocks[i].textlen;
-				alltext = erealloc(alltext, alllen + tlen + 1);
-				memmove(alltext + alllen, blocks[i].text, tlen);
-				alllen += tlen;
-				alltext[alllen] = '\0';
-			}
+			if(blocks[i].text != nil)
+				fmtprint(&f, "%s", blocks[i].text);
 			continue;
 		}
 
@@ -1238,6 +1129,7 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 
 		tc = emallocz(sizeof *tc, 1);
 		tc->id = estrdup(blocks[i].toolid ? blocks[i].toolid : "");
+		tc->name = estrdup(blocks[i].toolname ? blocks[i].toolname : "");
 		tc->type = td->type;
 		parseinput(tc, td, input);
 		if(tail == nil) head = tc;
@@ -1245,7 +1137,7 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		tail = tc;
 	}
 
-	r->text = alltext;
+	r->text = fmtstrflush(&f);
 	r->tools = head;
 	r->rawjson = jsonstr(content);
 	jsonfree(content);
@@ -1353,14 +1245,20 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			char *t;
 			t = jstr(delta, "text");
 			if(t != nil){
-				sblock_appendtext(&blocks[idx], t, strlen(t));
+				sbappend(&blocks[idx].text,
+					&blocks[idx].textlen,
+					&blocks[idx].textcap,
+					t, strlen(t));
 				if(cb != nil) cb(t, aux);
 			}
 		} else if(strcmp(dtype, "input_json_delta") == 0){
 			char *pj;
 			pj = jstr(delta, "partial_json");
 			if(pj != nil)
-				sblock_appendjson(&blocks[idx], pj, strlen(pj));
+				sbappend(&blocks[idx].tooljson,
+					&blocks[idx].tooljsonlen,
+					&blocks[idx].tooljsoncap,
+					pj, strlen(pj));
 		}
 		jsonfree(ev);
 		return 0;
@@ -1485,13 +1383,9 @@ claudeconverse(Conv *c, Usage *usage,
 
 		for(tc = r->tools; tc != nil; tc = tc->next){
 			if(cb != nil){
-				Tooldef *td;
-				char *tname;
-				td = findtooltype(tc->type);
-				tname = td != nil ? td->name : "tool";
 				snprint(marker, sizeof marker,
 					"\n[running %s %s]\n",
-					tname, tc->path);
+					tc->name, tc->path);
 				cb(marker, aux);
 			}
 			tc->result = exectool(tc);
@@ -1511,7 +1405,7 @@ static char*
 webfsget(char *apikey, char *url)
 {
 	int clonefd, fd;
-	char *data, *webdir;
+	char *data, *webdir, *page;
 	Webreq w;
 
 	memset(&w, 0, sizeof w);
@@ -1523,19 +1417,16 @@ webfsget(char *apikey, char *url)
 	if(clonefd < 0)
 		return nil;
 
-	{
-		char *page;
-		page = esmprint("%s/body", webdir);
-		fd = open(page, OREAD);
-		free(page);
-	}
+	page = esmprint("%s/body", webdir);
+	fd = open(page, OREAD);
+	free(page);
 	free(webdir);
 	if(fd < 0){
 		close(clonefd);
 		return nil;
 	}
 
-	data = readfd(fd);
+	data = readfile(fd);
 	close(fd);
 	close(clonefd);
 	return data;
