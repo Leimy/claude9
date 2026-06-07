@@ -1,27 +1,128 @@
 #!/bin/rc
 # claudetalk - interactive Claude chat via claude9fs
 #
-# usage: claudetalk [-d] [-a session] [-l convfile]
-#   -a name   attach to existing session (instead of cloning)
-#   -d        detach on exit: leave session alive for later -a
-#   -l file   load conversation from file on startup
+# Bootstraps the full environment: starts a sub-agent claude9fs
+# (for sub-agent support), then the main claude9fs on top, so
+# the main server's namespace includes the sub-agent mount.
+# On exit (unless -d), both servers are torn down.
+#
+# usage: claudetalk [-d] [-a session] [-l convfile] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
+#   -a name       attach to existing session (skip server startup)
+#   -d            detach on exit: leave session and servers alive
+#   -l file       load conversation from file on startup
+#   -M model      default model for claude9fs
+#   -t maxtokens  default max tokens for claude9fs
+#   -K skillsdir  skills directory for claude9fs
+#   -n namepath   name server path for claude9fs
 
 rfork e
 
 attach=()
 detach=0
 loadfile=()
-flagfmt='a:attach session,d,l:loadfile file'
+model=()
+maxtokens=()
+skills=()
+namepath=()
+flagfmt='a:attach session,d,l:loadfile file,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
 args=''
 if(! ifs=() eval `{aux/getflags $*}){
-	echo 'usage: claudetalk [-d] [-a session] [-l convfile]' >[1=2]
+	echo 'usage: claudetalk [-d] [-a session] [-l convfile] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
 	exit usage
 }
 
 mnt=/mnt/claude
-if(! test -f $mnt/clone){
-	echo 'claude9fs not mounted on '$mnt >[1=2]
-	exit 'no fs'
+submnt=/mnt/claudesub
+srvname=claude
+subsrvname=claudesub
+
+# Track whether we started the servers so we know to clean up.
+started_sub=0
+started_main=0
+
+# Build the common flags to pass through to claude9fs.
+fsflags=()
+# Default skills directory is $home/lib/claude9/skills unless
+# overridden with -K.
+if(~ $#skills 0)
+	skills=$home/lib/claude9/skills
+if(! ~ $#model 0)
+	fsflags=($fsflags -M $model)
+if(! ~ $#maxtokens 0)
+	fsflags=($fsflags -t $maxtokens)
+if(! ~ $#skills 0)
+	if(test -d $skills)
+		fsflags=($fsflags -K $skills)
+if(! ~ $#namepath 0)
+	fsflags=($fsflags -n $namepath)
+
+fn startsub {
+	if(test -f /srv/$subsrvname){
+		# Sub-agent server already posted; just mount it.
+		if(! test -f $submnt/clone)
+			mount -c /srv/$subsrvname $submnt
+		echo 'sub-agent: '$submnt' (already running)' >[1=2]
+	}
+	if not {
+		claude9fs -s $subsrvname -m $submnt $fsflags
+		started_sub=1
+		echo 'sub-agent: '$submnt >[1=2]
+	}
+}
+
+fn startmain {
+	if(test -f /srv/$srvname){
+		# Main server already posted; just mount it.
+		if(! test -f $mnt/clone)
+			mount -c /srv/$srvname $mnt
+		echo 'claude9fs: '$mnt' (already running)' >[1=2]
+	}
+	if not {
+		claude9fs -s $srvname -m $mnt $fsflags
+		started_main=1
+		echo 'claude9fs: '$mnt >[1=2]
+	}
+}
+
+fn stopservers {
+	# Only tear down servers we started.
+	if(~ $started_main 1){
+		unmount $mnt >[2]/dev/null
+		rm -f /srv/$srvname >[2]/dev/null
+	}
+	if(~ $started_sub 1){
+		unmount $submnt >[2]/dev/null
+		rm -f /srv/$subsrvname >[2]/dev/null
+	}
+}
+
+# If attaching, assume servers are already running.
+# Otherwise, bootstrap: sub-agent first, then main.
+if(~ $#attach 0){
+	startsub
+	startmain
+	if(! test -f $mnt/clone){
+		echo 'claude9fs failed to start on '$mnt >[1=2]
+		stopservers
+		exit 'no fs'
+	}
+}
+if not {
+	# Attach mode: servers must already exist.
+	# If srv files exist but aren't mounted in our namespace
+	# (e.g. reattaching from a different window), mount them.
+	if(test -f /srv/$subsrvname){
+		if(! test -f $submnt/clone)
+			mount -c /srv/$subsrvname $submnt
+	}
+	if(test -f /srv/$srvname){
+		if(! test -f $mnt/clone)
+			mount -c /srv/$srvname $mnt
+	}
+	if(! test -f $mnt/clone){
+		echo 'claude9fs not mounted on '$mnt >[1=2]
+		exit 'no fs'
+	}
 }
 
 # Memory store check: beads gives Claude persistent, structured
@@ -41,6 +142,7 @@ if(~ $#attach 0){
 	n=`{cat $mnt/clone}
 	if(~ $#n 0){
 		echo 'failed to allocate session' >[1=2]
+		stopservers
 		exit 'clone failed'
 	}
 }
@@ -54,8 +156,10 @@ if not {
 sess=$mnt/$n
 
 fn teardown {
-	if(! ~ $detach 1)
+	if(! ~ $detach 1){
 		echo hangup > $sess/ctl >[2]/dev/null
+		stopservers
+	}
 }
 
 fn sigexit {
