@@ -285,7 +285,7 @@ delsession(int id)
 }
 
 /*
- * Streaming helpers.  Text deltas from claudeconverse_stream
+ * Streaming helpers.  Text deltas from claudeconverse
  * are appended to s->streambuf; blocked readers on Qstream are
  * woken via s->streamrz.  All state guarded by s->streamlk.
  */
@@ -334,7 +334,7 @@ streamfinish(Session *s)
 }
 
 /*
- * Callback invoked by claudeconverse_stream with each incremental
+ * Callback invoked by claudeconverse with each incremental
  * text chunk (either SSE text_delta text or an internal
  * "[running ...]" marker between tool rounds).
  */
@@ -346,172 +346,24 @@ streamcb(char *chunk, void *aux)
 	streamappend(s, chunk, strlen(chunk));
 }
 
-static char *msgsep = "---msg";
-static char *modelhdr = "---model";
-static char *maxtokenshdr = "---maxtokens";
-static char *sysprompthdr = "---sysprompt";
-
-static void
-sessionsave(Session *s, char *path)
-{
-	Msg *m;
-	int fd;
-	char *sol, *eol;
-
-	mkparents(path);
-	fd = create(path, OWRITE, 0666);
-	if(fd < 0)
-		return;
-
-	fprint(fd, "%s %s\n", modelhdr, s->conv->model);
-	fprint(fd, "%s %d\n", maxtokenshdr, s->conv->maxtokens);
-	if(s->conv->sysprompt != nil){
-		fprint(fd, "%s\n", sysprompthdr);
-		fprint(fd, "%s\n", s->conv->sysprompt);
-	}
-
-	for(m = s->conv->msgs; m != nil; m = m->next){
-		fprint(fd, "%s %s\n", msgsep,
-			m->role == Muser ? "user" : "assistant");
-		for(sol = m->text; *sol != '\0'; sol = eol){
-			eol = strchr(sol, '\n');
-			if(eol != nil)
-				eol++;
-			else
-				eol = sol + strlen(sol);
-			if(strncmp(sol, "---", 3) == 0)
-				fprint(fd, " %.*s", (int)(eol - sol), sol);
-			else
-				write(fd, sol, eol - sol);
-		}
-		if(m->text[0] != '\0' && m->text[strlen(m->text)-1] != '\n')
-			fprint(fd, "\n");
-	}
-	close(fd);
-}
-
-static void
-sessionload(Session *s, char *path)
-{
-	int fd;
-	char *data, *p, *line, *eol, *v, *r;
-	Msg *m, *next;
-	int msglen, msgcap, llen, need, role;
-	char *msgbuf;
-	enum { Shdr, Ssysprompt, Smsg } state;
-
-	fd = open(path, OREAD);
-	if(fd < 0)
-		return;
-	data = readfile(fd);
-	close(fd);
-	if(data == nil)
-		return;
-
-	for(m = s->conv->msgs; m != nil; m = next){
-		next = m->next;
-		free(m->text);
-		free(m->rawjson);
-		free(m);
-	}
-	s->conv->msgs = nil;
-	s->conv->tail = nil;
-
-	free(s->usage.stop_reason);
-	memset(&s->usage, 0, sizeof s->usage);
-
-	state = Shdr;
-	role = Muser;
-	msgbuf = nil;
-	msglen = 0;
-	msgcap = 0;
-
-	for(p = data; *p != '\0'; ){
-		line = p;
-		eol = strchr(p, '\n');
-		if(eol != nil){
-			*eol = '\0';
-			p = eol + 1;
-		} else
-			p += strlen(p);
-
-		if(strncmp(line, msgsep, strlen(msgsep)) == 0){
-			if(state == Smsg && msgbuf != nil){
-				while(msglen > 0 && msgbuf[msglen-1] == '\n')
-					msglen--;
-				msgbuf[msglen] = '\0';
-				convappend(s->conv, msgnew(role, msgbuf));
-			}
-			if(state == Ssysprompt && msgbuf != nil){
-				while(msglen > 0 && msgbuf[msglen-1] == '\n')
-					msglen--;
-				msgbuf[msglen] = '\0';
-				free(s->conv->sysprompt);
-				s->conv->sysprompt = estrdup(msgbuf);
-			}
-			r = line + strlen(msgsep);
-			while(*r == ' ') r++;
-			role = (strcmp(r, "assistant") == 0) ? Massistant : Muser;
-			state = Smsg;
-			msglen = 0;
-			continue;
-		}
-
-		if(state == Shdr){
-			if(strncmp(line, modelhdr, strlen(modelhdr)) == 0){
-				v = line + strlen(modelhdr);
-				while(*v == ' ') v++;
-				if(*v != '\0'){
-					free(s->conv->model);
-					s->conv->model = estrdup(v);
-				}
-			} else if(strncmp(line, maxtokenshdr, strlen(maxtokenshdr)) == 0){
-				v = line + strlen(maxtokenshdr);
-				while(*v == ' ') v++;
-				if(*v != '\0')
-					s->conv->maxtokens = atoi(v);
-			} else if(strncmp(line, sysprompthdr, strlen(sysprompthdr)) == 0){
-				state = Ssysprompt;
-				msglen = 0;
-				continue;
-			}
-			continue;
-		}
-
-		if(state == Ssysprompt || state == Smsg){
-			if(line[0] == ' ' && strncmp(line+1, "---", 3) == 0)
-				line++;
-			llen = strlen(line);
-			need = msglen + llen + 2;
-			if(need > msgcap){
-				while(need > msgcap)
-					msgcap = msgcap ? msgcap * 2 : 1024;
-				msgbuf = erealloc(msgbuf, msgcap);
-			}
-			if(msglen > 0)
-				msgbuf[msglen++] = '\n';
-			memmove(msgbuf + msglen, line, llen);
-			msglen += llen;
-			msgbuf[msglen] = '\0';
-		}
-	}
-
-	if(state == Smsg && msgbuf != nil && msglen > 0){
-		while(msglen > 0 && msgbuf[msglen-1] == '\n')
-			msglen--;
-		msgbuf[msglen] = '\0';
-		convappend(s->conv, msgnew(role, msgbuf));
-	}
-	if(state == Ssysprompt && msgbuf != nil && msglen > 0){
-		while(msglen > 0 && msgbuf[msglen-1] == '\n')
-			msglen--;
-		msgbuf[msglen] = '\0';
-		free(s->conv->sysprompt);
-		s->conv->sysprompt = estrdup(msgbuf);
-	}
-	free(msgbuf);
-	free(data);
-}
+/*
+ * Session file table: maps file names to qid types and modes.
+ */
+static struct {
+	char *name;
+	int type;
+	int mode;
+} sessfiles[] = {
+	{ "ctl",	Qctl,		0666 },
+	{ "prompt",	Qprompt,	0666 },
+	{ "conv",	Qconv,		0666 },
+	{ "model",	Qmodel,		0666 },
+	{ "tokens",	Qtokens,	0666 },
+	{ "system",	Qsystem,	0666 },
+	{ "usage",	Qusage,		0444 },
+	{ "error",	Qerror,		0444 },
+	{ "stream",	Qstream,	0444 },
+};
 
 static int
 rootgen(int i, Dir *d, void *v)
@@ -565,18 +417,11 @@ rootgen(int i, Dir *d, void *v)
 	return -1;
 }
 
-static char *sessfiles[] = {
-	"ctl", "prompt", "conv", "model", "tokens", "system", "usage", "error", "stream",
-};
-static int sesstypes[] = {
-	Qctl, Qprompt, Qconv, Qmodel, Qtokens, Qsystem, Qusage, Qerror, Qstream,
-};
-
 static int
 sessgen(int i, Dir *d, void *aux)
 {
 	Session *s;
-	int sid, mode;
+	int sid;
 
 	sid = (int)(uintptr)aux;
 	s = findsession(sid);
@@ -585,25 +430,11 @@ sessgen(int i, Dir *d, void *aux)
 	if(i < 0 || i >= nelem(sessfiles))
 		return -1;
 
-	switch(sesstypes[i]){
-	case Qctl:
-	case Qprompt:
-	case Qmodel:
-	case Qtokens:
-	case Qsystem:
-	case Qconv:
-		mode = 0666;
-		break;
-	default:
-		mode = 0444;
-		break;
-	}
-
-	d->qid = (Qid){QPATH(sid, sesstypes[i]), 0, QTFILE};
-	d->mode = mode;
+	d->qid = (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE};
+	d->mode = sessfiles[i].mode;
 	d->atime = d->mtime = time(0);
 	d->length = 0;
-	d->name = estrdup9p(sessfiles[i]);
+	d->name = estrdup9p(sessfiles[i].name);
 	d->uid = estrdup9p("claude");
 	d->gid = estrdup9p("claude");
 	d->muid = estrdup9p("");
@@ -715,8 +546,8 @@ fswalk1(Fid *fid, char *name, Qid *qid)
 		if(s == nil)
 			return "session gone";
 		for(i = 0; i < nelem(sessfiles); i++){
-			if(strcmp(name, sessfiles[i]) == 0){
-				*qid = (Qid){QPATH(sid, sesstypes[i]), 0, QTFILE};
+			if(strcmp(name, sessfiles[i].name) == 0){
+				*qid = (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE};
 				return nil;
 			}
 		}
@@ -729,7 +560,7 @@ static void
 fsstat(Req *r)
 {
 	uvlong path;
-	int type, sid;
+	int type, sid, i;
 	Session *s;
 
 	path = r->fid->qid.path;
@@ -776,54 +607,22 @@ fsstat(Req *r)
 		return;
 	}
 
+	/* session file -- look up in table */
 	s = findsession(sid);
 	if(s == nil){
 		respond(r, "session gone");
 		return;
 	}
 	r->d.qid = r->fid->qid;
-	switch(type){
-	case Qctl:
-		r->d.name = estrdup9p("ctl");
-		r->d.mode = 0666;
-		break;
-	case Qprompt:
-		r->d.name = estrdup9p("prompt");
-		r->d.mode = 0666;
-		break;
-	case Qconv:
-		r->d.name = estrdup9p("conv");
-		r->d.mode = 0666;
-		break;
-	case Qmodel:
-		r->d.name = estrdup9p("model");
-		r->d.mode = 0666;
-		break;
-	case Qtokens:
-		r->d.name = estrdup9p("tokens");
-		r->d.mode = 0666;
-		break;
-	case Qsystem:
-		r->d.name = estrdup9p("system");
-		r->d.mode = 0666;
-		break;
-	case Qusage:
-		r->d.name = estrdup9p("usage");
-		r->d.mode = 0444;
-		break;
-	case Qerror:
-		r->d.name = estrdup9p("error");
-		r->d.mode = 0444;
-		break;
-	case Qstream:
-		r->d.name = estrdup9p("stream");
-		r->d.mode = 0444;
-		break;
-	default:
-		respond(r, "unknown file");
-		return;
+	for(i = 0; i < nelem(sessfiles); i++){
+		if(sessfiles[i].type == type){
+			r->d.name = estrdup9p(sessfiles[i].name);
+			r->d.mode = sessfiles[i].mode;
+			respond(r, nil);
+			return;
+		}
 	}
-	respond(r, nil);
+	respond(r, "unknown file");
 }
 
 static void
@@ -875,10 +674,7 @@ modelstext(Req *r)
  * A newly-opened fid whose session was idle at open time (as
  * captured by fsopen into fa->streamopendone) blocks until the
  * next round starts.  To see the last round's text after the
- * fact, read the prompt file instead.  This matches the design
- * in STREAMING.md and is what claudetalk relies on: it opens the
- * stream file and backgrounds the reader before writing to
- * prompt, expecting the reader to receive the new round's text.
+ * fact, read the prompt file instead.
  */
 static void
 streamread(Req *r, Session *s, Faux *fa)
@@ -890,25 +686,10 @@ streamread(Req *r, Session *s, Faux *fa)
 	/*
 	 * On first read, decide which generation this fid belongs
 	 * to.  If the session was idle at open time, wait for the
-	 * next round to start -- regardless of whether there is
-	 * still buffered text from the previous round.  That
-	 * buffered text belongs to the PREVIOUS reader, not us;
-	 * replaying it would make claudetalk print the last reply
-	 * again when the user sends a new message.
-	 *
-	 * If the session was already mid-round at open time, pin
-	 * to that live generation so we stream its output.
+	 * next round to start.
 	 */
 	if(!fa->streamgenset){
 		if(fa->streamopendone){
-			/*
-			 * Opened against an idle session: wait for
-			 * a new round (streamgen must advance AND
-			 * streamdone must have flipped to 0).  The
-			 * streamreset() call in fswrite does both
-			 * atomically under streamlk, so one wakeup
-			 * is enough.
-			 */
 			while(s->streamgen == fa->streamopengen
 			   && s->streamdone)
 				rsleep(&s->streamrz);
@@ -941,10 +722,6 @@ streamread(Req *r, Session *s, Faux *fa)
 			return;
 		}
 		if(s->streamdone){
-			/*
-			 * Our generation is done and we've read all its
-			 * bytes.  EOF.
-			 */
 			qunlock(&s->streamlk);
 			r->ofcall.count = 0;
 			respond(r, nil);
@@ -954,15 +731,6 @@ streamread(Req *r, Session *s, Faux *fa)
 	}
 }
 
-/*
- * On open, allocate Faux and snapshot session state so that
- * streamread can tell whether this fid opened against an idle
- * session (in which case it should wait for the next round) or
- * mid-round (in which case it should stream the current round).
- * This eliminates the race window between "cat stream &" and
- * "echo > prompt" in claudetalk: whichever 9p op lands first
- * here will see a consistent snapshot under streamlk.
- */
 static void
 fsopen(Req *r)
 {
@@ -1136,18 +904,6 @@ handlectl(Session *s, char *cmd, int *hangup)
 		qunlock(&s->streamlk);
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangup = 1;
-	} else if(strncmp(cmd, "save ", 5) == 0){
-		char *path;
-		path = cmd + 5;
-		while(*path == ' ') path++;
-		if(*path != '\0')
-			sessionsave(s, path);
-	} else if(strncmp(cmd, "load ", 5) == 0){
-		char *path;
-		path = cmd + 5;
-		while(*path == ' ') path++;
-		if(*path != '\0')
-			sessionload(s, path);
 	} else if(strncmp(cmd, "autocontinue", 12) == 0){
 		char *v;
 		int n;
@@ -1211,15 +967,9 @@ fswrite(Req *r)
 		free(data);
 		qunlock(&s->lk);
 
-		/*
-		 * Reset streaming buffer *before* we kick off the work
-		 * so any cat of $sess/stream started in parallel with
-		 * us will block on new data rather than see stale text
-		 * or an immediate EOF.
-		 */
 		streamreset(s);
 
-		reply = claudeconverse_stream(s->conv, &s->usage,
+		reply = claudeconverse(s->conv, &s->usage,
 			streamcb, s);
 
 		streamfinish(s);
@@ -1227,10 +977,7 @@ fswrite(Req *r)
 		/*
 		 * Auto-continue: if Claude hit max_tokens and
 		 * autocontinue is enabled, send "Continue." messages
-		 * to keep going.  We keep appending to the stream
-		 * buffer so the reader sees seamless text.  Stop
-		 * early if stop_reason becomes end_turn or if the
-		 * API call fails.
+		 * to keep going.
 		 */
 		if(reply != nil && s->autocont > 0){
 			int contround;
@@ -1245,12 +992,11 @@ fswrite(Req *r)
 				s->usage.stop_reason = nil;
 				qunlock(&s->lk);
 
-				/* reopen the stream so readers keep blocking */
 				qlock(&s->streamlk);
 				s->streamdone = 0;
 				qunlock(&s->streamlk);
 
-				contreply = claudeconverse_stream(s->conv,
+				contreply = claudeconverse(s->conv,
 					&s->usage, streamcb, s);
 
 				streamfinish(s);
@@ -1279,7 +1025,6 @@ fswrite(Req *r)
 			return;
 		}
 
-		/* claudeconverse already appends all messages to conv */
 		free(s->lastreply);
 		s->lastreply = estrdup9p(reply);
 		free(reply);

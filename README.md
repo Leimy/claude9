@@ -17,14 +17,14 @@ of the system in the usual Plan 9 way.
 
 ## Safety and risks - read this first
 
-**claude9fs gives the model the ability to read, write, patch,
+**claude9fs gives the model the ability to read, write, edit,
 and delete files on your machine.**  When you write to `prompt`,
 claude9fs runs a tool loop in which Claude can call any of the
 following tools without asking you for confirmation each time:
 
 - `create_file` - create or overwrite a file at any path the
   process can write to.
-- `patch_file` - apply a fuzzy unified diff to an existing file.
+- `edit_file` - replace a range of lines in an existing file.
 - `read_file` - read any file the process can read.
 - `list_directory` - list any directory the process can read.
 - `delete_file` - remove a file at any path the process can
@@ -117,13 +117,13 @@ Flags:
 	-t maxtokens   default max tokens (default: 16384)
 
 claude9fs serves a 9P filesystem where each Claude conversation
-is a numbered directory.  Reading clone allocates a new session
+is a numbered directory.  Reading `clone` allocates a new session
 and returns its number.
 
 ### Filesystem Layout
 
 	/mnt/claude/
-		clone         read to create a new session (returns session ID)
+		clone         read to create a new session (returns session number)
 		models        read to list available models from the API
 		<n>/          session directory
 			ctl       read for session info; write commands
@@ -138,24 +138,24 @@ and returns its number.
 
 ### Session Commands (write to ctl)
 
-	clear          clear conversation history and usage counters
-	hangup         destroy the session
-	save <path>    save conversation to a file
-	load <path>    load conversation from a file
-	autocontinue [n]  enable auto-continue (default n=3)
-	noautocontinue    disable auto-continue
+	clear              clear conversation history and usage counters
+	hangup             destroy the session
+	autocontinue [n]   enable auto-continue (default n=3)
+	noautocontinue     disable auto-continue
 
 ### Tool Use
 
 When you write to `prompt`, claude9fs runs the full tool loop:
-Claude has access to file tools (`create_file`, `patch_file`,
-`read_file`, `list_directory`, `delete_file`) which are executed
-automatically as part of the round, with results sent back to
-Claude until it produces a final response.
+Claude has access to file tools (`create_file`, `edit_file`,
+`read_file`, `list_directory`, `delete_file`) and a few utility
+tools (`read_man_page`, `mk`) which are executed automatically
+as part of the round, with results sent back to Claude until it
+produces a final response.
 
-The `patch_file` tool uses the in-tree fuzzy unified-diff applier
-(see `patch.c`), which tolerates off-by-one line numbers, missing
-`---`/`+++` headers, and minor whitespace drift.
+The `edit_file` tool replaces a range of lines (by 1-based line
+number) with new text.  It can also insert lines without removing
+any, or delete lines without inserting.  This is simpler and more
+reliable than the unified-diff approach used in earlier versions.
 
 ### Streaming
 
@@ -260,18 +260,21 @@ regular files are read.
 
 ## claudetalk - rc Shell Client
 
-	claudetalk [-d] [-a session] [-l convfile]
+	claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir]
 
 Flags:
 
-	-a N      attach to existing session N (instead of cloning a new one)
+	-a n      attach to existing session n (instead of cloning a new one)
 	-d        detach on exit: leave session alive for later reattachment
-	-l file   load a saved conversation file on startup
+	-M model  default model (passed through to claude9fs)
+	-t n      default max tokens (passed through to claude9fs)
+	-K dir    skills directory (passed through to claude9fs)
 
-claudetalk is an rc script that talks to a running claude9fs
-mounted on `/mnt/claude`.  It prints incremental text by reading
-the session's `stream` file in the background while writing to
-`prompt`.
+claudetalk is an rc script that bootstraps the claude9fs
+environment (including a sub-agent server for sub-agent
+support) and provides an interactive chat interface.  It
+prints incremental text by reading the session's `stream`
+file in the background while writing to `prompt`.
 
 ### Commands
 
@@ -284,15 +287,14 @@ the session's `stream` file in the background while writing to
 	/clear         clear conversation
 	/status        show session info
 	/usage         show token usage
-	/save <path>   save conversation to file
-	/load <path>   load conversation from file
 	/autocontinue [n]  enable auto-continue on max_tokens (default 3)
 	/noautocontinue    disable auto-continue
 	/detach        keep session alive on exit (can reattach later)
 	/help          show command list
 	/quit          exit
 
-Messages are entered as text and sent with `^D`.
+Messages are entered as text and sent with `^D`.  Press DEL
+to interrupt.
 
 ### Resumable Sessions
 
@@ -329,19 +331,6 @@ up (by reattaching without `-d` and quitting, or by writing
 	^D
 	...
 
-#### Example: save and reload across restarts
-
-	% claudetalk
-	...
-	/save /usr/dave/convos/refactor-session
-	saved to /usr/dave/convos/refactor-session
-	/quit
-
-	# Later, or after restarting claude9fs:
-	% claudetalk -l /usr/dave/convos/refactor-session
-	loaded /usr/dave/convos/refactor-session
-	...
-
 #### Example: list and manage sessions
 
 	% claudetalk -d
@@ -371,22 +360,14 @@ can also drive them from rc without claudetalk:
 	# Destroy a session
 	echo hangup > /mnt/claude/$n/ctl
 
-## File Format
-
-Saved conversations use a simple line-oriented text format with
-headers for metadata (model, maxtokens, sysprompt) and message
-separators.  Lines in message bodies that start with `---` are
-escaped with a leading space.
-
 ## Source Files
 
 	claude.c       API client: conversation, HTTP via webfs, tool execution
 	claude.h       shared data structures and function declarations
-	patch.c        in-tree fuzzy unified-diff applier (patch_file tool)
 	json.c         JSON parser and serializer
 	json.h         JSON type definitions
-	claude9fs.c    9P filesystem server (claude9fs)
-	claudetalk     rc script client for claude9fs
+	claude9fs.c    9P filesystem server
+	claudetalk     rc script client
 
 ## Dependencies
 

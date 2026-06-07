@@ -73,12 +73,11 @@ esmprint(char *fmt, ...)
  * Single source of truth for the tools we expose to Claude.
  *
  * Every tool takes a "path" parameter; tools that also need a
- * second parameter (file contents, unified diff) declare it in
- * the bodyparam / bodydesc fields.  mktools() turns this table
- * into the Anthropic tools schema, parseinput() extracts the
- * path/body fields out of a tool_use block's input JSON, and
- * findtool() / findtooltype() let the rest of the code walk
- * between API names and the Acreate/Apatch/... enum.
+ * second string parameter declare it in the bodyparam / bodydesc
+ * fields.  edit_file is special: it has integer start/end params
+ * and a replacement string, handled via custom code in mktools()
+ * and parseinput().  findtool() / findtooltype() let the rest of
+ * the code walk between API names and the Acreate/Aedit/... enum.
  */
 typedef struct Tooldef Tooldef;
 struct Tooldef {
@@ -97,25 +96,24 @@ static Tooldef tools[] = {
 		"File path to create",
 		"contents", "Complete file contents" },
 
-	{ Apatch, "patch_file",
-		"Apply a unified diff to an existing file.\n"
-		"\n"
-		"Accepts standard unified diff syntax with one or more "
-		"hunks. Each hunk starts with a '@@' header and contains "
-		"lines prefixed ' ' (context), '-' (remove), or '+' (add).\n"
-		"\n"
-		"The diff is applied by patch(1), which anchors each "
-		"hunk by its context lines, so:\n"
-		"  - '--- a/path' / '+++ b/path' headers are optional "
-		"(the target file is given by the path parameter);\n"
-		"  - line numbers in '@@ -a,b +c,d @@' are used as hints "
-		"but do not have to be exact.\n"
-		"\n"
-		"Include at least one unchanged context line before and "
-		"after each edit so the hunk can be located unambiguously. "
-		"Hunks are applied in order.",
-		"File path to patch",
-		"diff", "Unified diff to apply" },
+	/*
+	 * edit_file has a custom schema (integer start/end params)
+	 * built by mktools(); the Tooldef entry only carries the
+	 * name, type, and description.  bodyparam is nil because
+	 * parseinput() handles it specially.
+	 */
+	{ Aedit, "edit_file",
+		"Replace a range of lines in an existing file with new text.  "
+		"Lines are 1-based and inclusive: start=5, end=10 replaces "
+		"lines 5 through 10 (6 lines) with the replacement text.  "
+		"To insert text before line N without removing anything, "
+		"use start=N, end=N-1 (i.e. end < start).  "
+		"To delete lines without inserting, set replacement to "
+		"the empty string.  "
+		"The file must already exist.  "
+		"Returns a summary of the edit on success.",
+		"File path to edit",
+		nil, nil },
 
 	{ Adelete, "delete_file",
 		"Delete a file.",
@@ -144,23 +142,6 @@ static Tooldef tools[] = {
 		"(e.g. \"open\", \"2 open\", \"rio\")",
 		nil, nil },
 
-	{ Amemcheck, "memory_check",
-		"Report on the persistent memory store (beadsfs).  "
-		"Returns whether memory is mounted, the total bead count, "
-		"the type distribution, and a preview of the most recent "
-		"beads.  Memory is a graph of small notes ('beads') with "
-		"typed directed edges that survives across sessions.  "
-		"Beads live at the given mount point (default /n/beads); "
-		"interact with them using the file tools: "
-		"read_file /n/beads/by-id/N/info to inspect a bead, "
-		"list_directory /n/beads/by-id to enumerate, "
-		"create_file /n/beads/new to add a bead, "
-		"create_file /n/beads/link 'FROM EDGETYPE TO' to link two beads, "
-		"create_file /n/beads/by-id/N/ctl 'type X' to retype, "
-		"delete_file /n/beads/by-id/N to remove a bead and its edges.",
-		"Memory mount point (use /n/beads unless told otherwise)",
-		nil, nil },
-
 	{ Amk, "mk",
 		"Run mk(1) in a working directory and return the combined "
 		"stdout+stderr output.  Use this to check your own work: "
@@ -170,16 +151,12 @@ static Tooldef tools[] = {
 		"empty string means the current directory).  The "
 		"'targets' parameter is a space-separated list of mk "
 		"targets and/or arguments (e.g. \"\", \"clean\", "
-		"\"clean all\", \"beadsfs\"); empty means the default "
+		"\"clean all\"); empty means the default "
 		"target.  Output is truncated if it grows very large.",
 		"Directory to run mk in (empty for current directory)",
 		"targets", "Space-separated mk targets/args, or empty for the default target" },
 };
 
-/*
- * Look up a tool by its API name.  Returns nil if name is not
- * one of ours.
- */
 static Tooldef*
 findtool(char *name)
 {
@@ -193,10 +170,6 @@ findtool(char *name)
 	return nil;
 }
 
-/*
- * Look up a tool by its internal Acreate/Apatch/... type.
- * Returns nil if no match.
- */
 static Tooldef*
 findtooltype(int type)
 {
@@ -209,10 +182,9 @@ findtooltype(int type)
 }
 
 /*
- * Pull "path" and (if applicable) the body parameter out of a
- * tool_use block's "input" object, copying both into the given
- * ToolCall.  Always sets path and body to non-nil malloc'd
- * strings, possibly empty.
+ * Pull parameters out of a tool_use block's "input" object.
+ * For most tools: path + optional body string.
+ * For edit_file: path + start + end + replacement.
  */
 static void
 parseinput(ToolCall *tc, Tooldef *td, Json *input)
@@ -221,7 +193,12 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 
 	s = jstr(input, "path");
 	tc->path = estrdup(s ? s : "");
-	if(td->bodyparam != nil){
+	if(td->type == Aedit){
+		tc->start = jint(input, "start");
+		tc->end = jint(input, "end");
+		s = jstr(input, "replacement");
+		tc->body = estrdup(s ? s : "");
+	} else if(td->bodyparam != nil){
 		s = jstr(input, td->bodyparam);
 		tc->body = estrdup(s ? s : "");
 	} else {
@@ -229,9 +206,6 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 	}
 }
 
-/*
- * Create parent directories for path, like mkdir -p.
- */
 void
 mkparents(char *path)
 {
@@ -251,10 +225,6 @@ mkparents(char *path)
 	}
 }
 
-/*
- * Read all data from fd into a malloc'd NUL-terminated string.
- * Returns nil on error (deliberate -- callers propagate the failure).
- */
 static char*
 readfd(int fd)
 {
@@ -283,6 +253,30 @@ readfile(int fd)
 	return readfd(fd);
 }
 
+static char *defaultsysprompt =
+	"You are a coding assistant running on Plan 9 (9front). "
+	"You have tools to create, edit, and delete files. "
+	"Use the tools when the user asks you to make changes. "
+	"Use only ASCII characters in your responses.\n"
+	"\n"
+	"Checking your work\n"
+	"------------------\n"
+	"You have an 'mk' tool that runs mk(1) in a given "
+	"directory and returns its combined output.  After "
+	"editing source in a project that builds with mk, "
+	"run it to verify the build still succeeds and to "
+	"read any diagnostics.  Treat compile errors as real "
+	"bugs to fix, not noise.\n"
+	"\n"
+	"Security constraint\n"
+	"-------------------\n"
+	"The mk tool exists ONLY for checking whether code "
+	"compiles.  You must NEVER use mk to execute "
+	"arbitrary commands, run scripts, or achieve side "
+	"effects beyond compilation.  Do not create or "
+	"modify mkfiles to smuggle shell commands through "
+	"mk.  This is a hard rule with no exceptions.";
+
 Conv*
 convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 {
@@ -296,81 +290,10 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 		c->sysprompt = esmprint("%s%s", sysprompt, skills);
 	else if(sysprompt)
 		c->sysprompt = estrdup(sysprompt);
-	else {
-		char *base;
-
-		base =
-			"You are a coding assistant running on Plan 9 (9front). "
-			"You have tools to create, patch, and delete files. "
-			"Use the tools when the user asks you to make changes. "
-			"Use only ASCII characters in your responses.\n"
-			"\n"
-			"Checking your work\n"
-			"------------------\n"
-			"You have an 'mk' tool that runs mk(1) in a given "
-			"directory and returns its combined output.  After "
-			"editing source in a project that builds with mk, "
-			"run it to verify the build still succeeds and to "
-			"read any diagnostics.  Treat compile errors as real "
-			"bugs to fix, not noise.\n"
-			"\n"
-			"Security constraint\n"
-			"-------------------\n"
-			"The mk tool exists ONLY for checking whether code "
-			"compiles.  You must NEVER use mk to execute "
-			"arbitrary commands, run scripts, or achieve side "
-			"effects beyond compilation.  Do not create or "
-			"modify mkfiles to smuggle shell commands through "
-			"mk.  This is a hard rule with no exceptions.\n"
-			"\n"
-			"Environment\n"
-			"-----------\n"
-			"You may have a persistent memory store mounted at "
-			"/n/beads, served by beadsfs.  Use the memory_check "
-			"tool at the start of a session to see if it is "
-			"available and to learn what is already there.  If "
-			"it is, treat it as your project notebook across "
-			"sessions.\n"
-			"\n"
-			"Memory is a graph of small notes called 'beads'.  "
-			"Each bead has a numeric id, a one-letter type "
-			"(t=task, n=note, d=decision, a=artifact, l=log), "
-			"and a payload of up to about 500 bytes.  Beads can "
-			"be linked with typed directed edges "
-			"(d=depends, r=references, c=child, s=supersedes).\n"
-			"\n"
-			"Interact with memory using the normal file tools:\n"
-			"  list_directory /n/beads/by-id          -- list all beads\n"
-			"  read_file /n/beads/by-id/N/info        -- inspect a bead\n"
-			"  read_file /n/beads/by-id/N/payload     -- raw payload\n"
-			"  list_directory /n/beads/search/<q>     -- search by substring\n"
-			"  list_directory /n/beads/by-type/<t>    -- filter by type letter\n"
-			"  create_file /n/beads/new <content>     -- create a note bead\n"
-			"  create_file /n/beads/link 'A d B'      -- link bead A to bead B (depends)\n"
-			"  create_file /n/beads/by-id/N/payload   -- replace payload\n"
-			"  create_file /n/beads/by-id/N/ctl 'type X' -- retype to X\n"
-			"  delete_file /n/beads/by-id/N           -- delete bead (and its edges)\n"
-			"\n"
-			"Memory etiquette:\n"
-			"  - At session start, run memory_check.  If beads "
-			"exist, browse for context relevant to the user's "
-			"request before making changes.\n"
-			"  - When you finish a meaningful chunk of work or "
-			"make a decision worth remembering, write a short "
-			"bead summarising it and link it to whatever "
-			"motivated the work.\n"
-			"  - Aim for one idea per bead; a bead should be a "
-			"sentence or two, not an essay.  If a thought "
-			"doesn't fit, split it across linked beads using "
-			"child ('c') edges.\n"
-			"  - If /n/beads is not mounted, proceed without it "
-			"and do not mention it to the user.";
-
-		if(skills != nil)
-			c->sysprompt = esmprint("%s%s", base, skills);
-		else
-			c->sysprompt = estrdup(base);
-	}
+	else if(skills)
+		c->sysprompt = esmprint("%s%s", defaultsysprompt, skills);
+	else
+		c->sysprompt = estrdup(defaultsysprompt);
 	return c;
 }
 
@@ -482,6 +405,30 @@ mktools(void)
 		req = jarray();
 		jappend(req, jstring("path"));
 
+		/* edit_file has a custom schema with integer params */
+		if(td->type == Aedit){
+			p = jobject();
+			jset(p, "type", jstring("integer"));
+			jset(p, "description", jstring(
+				"First line to replace (1-based, inclusive)"));
+			jset(props, "start", p);
+			jappend(req, jstring("start"));
+
+			p = jobject();
+			jset(p, "type", jstring("integer"));
+			jset(p, "description", jstring(
+				"Last line to replace (1-based, inclusive). "
+				"Use end < start to insert without removing."));
+			jset(props, "end", p);
+			jappend(req, jstring("end"));
+
+			p = jobject();
+			jset(p, "type", jstring("string"));
+			jset(p, "description", jstring("Replacement text"));
+			jset(props, "replacement", p);
+			jappend(req, jstring("replacement"));
+		}
+
 		if(td->bodyparam != nil){
 			p = jobject();
 			jset(p, "type", jstring("string"));
@@ -554,10 +501,6 @@ buildreq(Conv *c)
 		jappend(msgs, msg);
 	}
 
-	/*
-	 * Mark the last message's content with cache_control so the
-	 * entire conversation prefix is cached on subsequent requests.
-	 */
 	if(msgs->nitem > 0){
 		msg = jidx(msgs, msgs->nitem - 1);
 		content = jget(msg, "content");
@@ -586,13 +529,6 @@ writeall(int fd, char *buf, long len)
 	return 0;
 }
 
-/*
- * Describes one HTTP request to webfs.  The boolean flags pick
- * the few headers that differ between our three call sites:
- *   post   - method is POST (vs GET); a postbody file is written
- *   ctype  - send "Content-Type: application/json"
- *   stream - send "Accept: text/event-stream"
- */
 typedef struct Webreq Webreq;
 struct Webreq {
 	char *url;
@@ -602,15 +538,6 @@ struct Webreq {
 	int stream;
 };
 
-/*
- * Open a fresh webfs connection for the given request: clone a
- * connection, work out its directory, then write the url,
- * method, and headers to its ctl file.  On success returns the
- * open clone fd (which must stay open for the lifetime of the
- * request) and stores a malloc'd connection directory path in
- * *webdirp (caller frees).  On failure returns -1 with werrstr
- * set and leaves *webdirp untouched.
- */
 static int
 webopen(Webreq *w, char **webdirp)
 {
@@ -665,135 +592,49 @@ webopen(Webreq *w, char **webdirp)
 	return clonefd;
 }
 
-/*
- * Write the POST body to a connection's postbody file.
- * Returns 0 on success, -1 with werrstr set on failure.
- */
 static int
-webpost(char *webdir, char *body)
+websend(Conv *c, char *body, int stream, int *clonefdp)
 {
-	int fd;
-	char *bodyf;
+	int clonefd, fd;
+	char *webdir, *bodyf, *page;
+	Webreq w;
+
+	memset(&w, 0, sizeof w);
+	w.url = apiurl;
+	w.apikey = c->apikey;
+	w.post = 1;
+	w.ctype = 1;
+	w.stream = stream;
+
+	free(c->webdir);
+	c->webdir = nil;
+	clonefd = webopen(&w, &c->webdir);
+	if(clonefd < 0)
+		return -1;
+	webdir = c->webdir;
 
 	bodyf = esmprint("%s/postbody", webdir);
 	fd = open(bodyf, OWRITE);
 	free(bodyf);
 	if(fd < 0){
+		close(clonefd);
 		werrstr("open postbody: %r");
 		return -1;
 	}
 	if(writeall(fd, body, strlen(body)) < 0){
 		close(fd);
+		close(clonefd);
 		werrstr("write postbody: %r");
 		return -1;
 	}
 	close(fd);
-	return 0;
-}
-
-/*
- * Open a connection's body file for reading the response.
- * Returns the open fd, or -1 with werrstr set.
- */
-static int
-webbody(char *webdir)
-{
-	int fd;
-	char *page;
 
 	page = esmprint("%s/body", webdir);
 	fd = open(page, OREAD);
 	free(page);
-	if(fd < 0)
+	if(fd < 0){
+		close(clonefd);
 		werrstr("open body: %r");
-	return fd;
-}
-
-/*
- * POST a request body to the messages API and return the whole
- * response as a malloc'd string (caller frees), or nil with
- * werrstr set.
- */
-static char*
-webfssend(Conv *c, char *body)
-{
-	int clonefd, fd;
-	char *data;
-	Webreq w;
-
-	memset(&w, 0, sizeof w);
-	w.url = apiurl;
-	w.apikey = c->apikey;
-	w.post = 1;
-	w.ctype = 1;
-
-	free(c->webdir);
-	c->webdir = nil;
-	clonefd = webopen(&w, &c->webdir);
-	if(clonefd < 0)
-		return nil;
-
-	if(webpost(c->webdir, body) < 0){
-		close(clonefd);
-		return nil;
-	}
-
-	fd = webbody(c->webdir);
-	if(fd < 0){
-		close(clonefd);
-		return nil;
-	}
-
-	data = readfd(fd);
-	close(fd);
-	close(clonefd);
-	if(data == nil)
-		werrstr("empty response from API");
-	return data;
-}
-
-/*
- * Streaming variant of webfssend.  Performs the same clone /
- * ctl / postbody dance as webfssend but leaves the body file
- * open for incremental reads and returns the open fd.
- * Webfs's body file hands out response bytes as they arrive
- * from the HTTP socket, so reading it line by line gives us
- * Server-Sent Events in real time.
- *
- * On success, returns the read fd of the body file and stores
- * the clone fd in *clonefdp -- the caller must close both
- * (body fd first, then clone fd) when done to release the
- * webfs connection.
- *
- * On failure returns -1 with werrstr set.
- */
-static int
-webfssend_stream(Conv *c, char *body, int *clonefdp)
-{
-	int clonefd, fd;
-	Webreq w;
-
-	memset(&w, 0, sizeof w);
-	w.url = apiurl;
-	w.apikey = c->apikey;
-	w.post = 1;
-	w.ctype = 1;
-	w.stream = 1;
-
-	free(c->webdir);
-	c->webdir = nil;
-	clonefd = webopen(&w, &c->webdir);
-	if(clonefd < 0)
-		return -1;
-
-	if(webpost(c->webdir, body) < 0){
-		close(clonefd);
-		return -1;
-	}
-
-	fd = webbody(c->webdir);
-	if(fd < 0){
-		close(clonefd);
 		return -1;
 	}
 
@@ -904,92 +745,6 @@ replyfree(Reply *r)
 	free(r);
 }
 
-static Reply*
-sendonce(Conv *c, Usage *usage)
-{
-	Json *req, *resp, *content, *stopreason, *uobj;
-	char *body, *data, *errtype, *errmsg;
-	Reply *r;
-
-	req = buildreq(c);
-	body = jsonstr(req);
-	jsonfree(req);
-	if(body == nil){
-		werrstr("failed to serialize request");
-		return nil;
-	}
-
-	data = webfssend(c, body);
-	free(body);
-
-	if(data == nil){
-		werrstr("no response: %r");
-		return nil;
-	}
-
-	resp = jsonparse(data);
-	if(resp == nil){
-		werrstr("json parse failed: %.100s", data);
-		free(data);
-		return nil;
-	}
-	free(data);
-
-	errtype = jstr(resp, "type");
-	if(errtype != nil && strcmp(errtype, "error") == 0){
-		Json *errobj;
-		errobj = jget(resp, "error");
-		errmsg = jstr(errobj, "message");
-		if(errmsg == nil)
-			errmsg = "unknown API error";
-		werrstr("API error: %s", errmsg);
-		jsonfree(resp);
-		return nil;
-	}
-
-	if(usage != nil){
-		uobj = jget(resp, "usage");
-		if(uobj != nil){
-			usage->input_tokens += jint(uobj, "input_tokens");
-			usage->output_tokens += jint(uobj, "output_tokens");
-			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
-			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
-		}
-	}
-
-	content = jget(resp, "content");
-	if(content == nil || content->type != Jarray){
-		jsonfree(resp);
-		werrstr("no content in response");
-		return nil;
-	}
-
-	r = emallocz(sizeof *r, 1);
-	r->text = extracttext(content);
-	r->tools = parsetools(content);
-	r->rawjson = jsonstr(content);
-
-	stopreason = jget(resp, "stop_reason");
-	if(stopreason != nil && stopreason->type == Jstring){
-		if(strcmp(stopreason->str, "tool_use") == 0)
-			r->stopped = 0;
-		else
-			r->stopped = 1;
-		if(usage != nil){
-			free(usage->stop_reason);
-			usage->stop_reason = estrdup(stopreason->str);
-		}
-	} else {
-		r->stopped = 1;
-	}
-
-	jsonfree(resp);
-	return r;
-}
-
-/*
- * Read a file, return contents. Caller frees.
- */
 static char*
 toolread(char *path)
 {
@@ -1006,9 +761,6 @@ toolread(char *path)
 	return data;
 }
 
-/*
- * List a directory, return one name per line. Caller frees.
- */
 static char*
 toollist(char *path)
 {
@@ -1041,12 +793,6 @@ toollist(char *path)
 	return buf;
 }
 
-/*
- * Read a man page by forking man(1).
- * The query string is the path field, e.g. "open" or "2 open".
- * On 9front, man takes positional args: man [section] page.
- * Returns the formatted text. Caller frees.
- */
 static char*
 toolman(char *query)
 {
@@ -1059,7 +805,6 @@ toolman(char *query)
 	if(query == nil || query[0] == '\0')
 		return esmprint("error: empty man page query");
 
-	/* parse optional section number from query */
 	snprint(qbuf, sizeof qbuf, "%s", query);
 	q = qbuf;
 	while(*q == ' ') q++;
@@ -1067,13 +812,6 @@ toolman(char *query)
 	section = nil;
 	page = q;
 
-	/*
-	 * If the first token is a single digit followed by
-	 * whitespace, treat it as a man section.  We terminate the
-	 * digit in place (q[1] = '\0') so that "section" points at
-	 * just the one-character string "N", and advance "page"
-	 * past the separator to the page name.
-	 */
 	if(q[0] >= '1' && q[0] <= '9' && (q[1] == ' ' || q[1] == '\t')){
 		section = q;
 		q[1] = '\0';
@@ -1118,172 +856,8 @@ toolman(char *query)
 	return data;
 }
 
-/*
- * memory_check: report on a beadsfs mount.
- * path is the mount root (e.g. /n/beads); empty -> /n/beads.
- * Returns a human-readable summary:
- *   - mount status
- *   - bead count
- *   - type distribution (one line per type letter)
- *   - last few beads with id, type, payload preview
- * Always returns a malloc'd string.  Errors are reported in
- * the returned text so Claude sees them as tool output.
- */
-static char*
-toolmemcheck(char *root)
-{
-	char *mount, *byid, *p, *out;
-	int fd, n, i, total, npreview, previewmax;
-	Dir *d;
-	vlong *ids;
-	int nids, idcap;
-	int counts[128];
-	char line[1024];
-	int outlen, outcap;
-
-	if(root == nil || root[0] == '\0')
-		mount = estrdup("/n/beads");
-	else
-		mount = estrdup(root);
-
-	byid = esmprint("%s/by-id", mount);
-	fd = open(byid, OREAD);
-	if(fd < 0){
-		out = esmprint("memory not mounted at %s: %r\n"
-			"hint: beadsfs -s beads -m %s <store>\n",
-			mount, mount);
-		free(mount);
-		free(byid);
-		return out;
-	}
-
-	/* enumerate ids */
-	ids = nil;
-	nids = 0;
-	idcap = 0;
-	memset(counts, 0, sizeof counts);
-	while((n = dirread(fd, &d)) > 0){
-		for(i = 0; i < n; i++){
-			if(nids >= idcap){
-				idcap = idcap ? idcap * 2 : 64;
-				ids = erealloc(ids, idcap * sizeof *ids);
-			}
-			ids[nids++] = strtoll(d[i].name, nil, 10);
-		}
-		free(d);
-	}
-	close(fd);
-	total = nids;
-
-	/* read each bead's type to build type histogram */
-	for(i = 0; i < nids; i++){
-		char *tpath;
-		int tfd, m;
-		char tb[16];
-		tpath = esmprint("%s/by-id/%lld/type", mount, ids[i]);
-		tfd = open(tpath, OREAD);
-		free(tpath);
-		if(tfd < 0)
-			continue;
-		m = read(tfd, tb, sizeof tb - 1);
-		close(tfd);
-		if(m <= 0)
-			continue;
-		tb[m] = '\0';
-		p = tb;
-		while(*p == ' ' || *p == '\n') p++;
-		if(*p != '\0' && (uchar)*p < 128)
-			counts[(uchar)*p]++;
-	}
-
-	/* build output */
-	outcap = 4096;
-	out = emalloc(outcap);
-	outlen = 0;
-	outlen += snprint(out + outlen, outcap - outlen,
-		"memory mounted at %s\n", mount);
-	outlen += snprint(out + outlen, outcap - outlen,
-		"beads: %d\n", total);
-	if(total > 0){
-		outlen += snprint(out + outlen, outcap - outlen, "types:\n");
-		for(i = 0; i < 128; i++){
-			if(counts[i] == 0)
-				continue;
-			outlen += snprint(out + outlen, outcap - outlen,
-				"  %c %d\n", i, counts[i]);
-		}
-	}
-
-	/* sort ids ascending (dirread order isn't guaranteed) */
-	for(i = 1; i < nids; i++){
-		vlong v = ids[i];
-		int j = i - 1;
-		while(j >= 0 && ids[j] > v){
-			ids[j+1] = ids[j];
-			j--;
-		}
-		ids[j+1] = v;
-	}
-
-	/* preview last 5 by id */
-	previewmax = 5;
-	npreview = total < previewmax ? total : previewmax;
-	if(npreview > 0){
-		outlen += snprint(out + outlen, outcap - outlen,
-			"recent:\n");
-		for(i = nids - npreview; i < nids; i++){
-			char *ipath, *info;
-			int ifd, m;
-			char ibuf[1024];
-			ipath = esmprint("%s/by-id/%lld/info", mount, ids[i]);
-			ifd = open(ipath, OREAD);
-			free(ipath);
-			if(ifd < 0)
-				continue;
-			m = read(ifd, ibuf, sizeof ibuf - 1);
-			close(ifd);
-			if(m <= 0)
-				continue;
-			ibuf[m] = '\0';
-			/* trim to first 160 chars and strip trailing newline */
-			if(m > 160){
-				ibuf[160] = '\0';
-				m = 160;
-			}
-			while(m > 0 && (ibuf[m-1] == '\n' || ibuf[m-1] == ' '))
-				ibuf[--m] = '\0';
-			/* collapse newlines inside info for compactness */
-			info = ibuf;
-			for(p = info; *p != '\0'; p++)
-				if(*p == '\n') *p = ' ';
-			/* grow out as needed */
-			snprint(line, sizeof line, "  %s\n", info);
-			n = strlen(line);
-			while(outlen + n + 1 > outcap){
-				outcap *= 2;
-				out = erealloc(out, outcap);
-			}
-			memmove(out + outlen, line, n);
-			outlen += n;
-			out[outlen] = '\0';
-		}
-	}
-
-	free(ids);
-	free(byid);
-	free(mount);
-	return out;
-}
-
-/*
- * toolmk: run mk(1) in the given directory and return its
- * combined stdout+stderr.  dir == nil or "" means cwd.  args
- * is a single string of space-separated mk arguments/targets;
- * we split on runs of whitespace.  Output is capped so a
- * runaway build can't blow the conversation budget.
- */
 enum {
-	Mkmaxout = 64*1024,	/* truncate beyond this many bytes */
+	Mkmaxout = 64*1024,
 	Mkmaxargs = 64,
 };
 
@@ -1300,7 +874,6 @@ toolmk(char *dir, char *args)
 	if(pipe(pfd) < 0)
 		return esmprint("error: pipe: %r");
 
-	/* duplicate args so we can chop it up in place */
 	buf = estrdup(args);
 
 	switch(fork()){
@@ -1370,6 +943,125 @@ toolmk(char *dir, char *args)
 }
 
 /*
+ * edit_file: replace lines start..end (1-based, inclusive)
+ * with replacement text.  If end < start, insert before
+ * line start without removing anything.  Returns a status
+ * string (caller frees).
+ */
+static char*
+tooledit(char *path, int start, int end, char *replacement)
+{
+	int fd, i, nfile, nrepl, delta;
+	char *data, *p, *sol;
+	char **lines;
+	int lcap;
+	Fmt out;
+	char *result;
+
+	if(path == nil || path[0] == '\0')
+		return esmprint("error: no file path");
+
+	fd = open(path, OREAD);
+	if(fd < 0)
+		return esmprint("error: open %s: %r", path);
+	data = readfd(fd);
+	close(fd);
+	if(data == nil)
+		return esmprint("error: read %s: %r", path);
+
+	/* split file into lines */
+	lcap = 256;
+	lines = emalloc(lcap * sizeof lines[0]);
+	nfile = 0;
+	for(p = data; *p != '\0'; ){
+		sol = p;
+		while(*p != '\0' && *p != '\n')
+			p++;
+		if(*p == '\n')
+			p++;
+		if(nfile >= lcap){
+			lcap *= 2;
+			lines = erealloc(lines, lcap * sizeof lines[0]);
+		}
+		lines[nfile] = emalloc(p - sol + 1);
+		memmove(lines[nfile], sol, p - sol);
+		lines[nfile][p - sol] = '\0';
+		nfile++;
+	}
+	free(data);
+
+	/* validate range */
+	if(start < 1)
+		start = 1;
+	if(end > nfile)
+		end = nfile;
+
+	/* count replacement lines */
+	nrepl = 0;
+	if(replacement != nil && replacement[0] != '\0'){
+		for(p = replacement; *p != '\0'; ){
+			while(*p != '\0' && *p != '\n')
+				p++;
+			if(*p == '\n')
+				p++;
+			nrepl++;
+		}
+	}
+
+	/* number of lines removed */
+	delta = (end >= start) ? (end - start + 1) : 0;
+
+	/* build new file */
+	fmtstrinit(&out);
+
+	/* lines before the edit region: 1..start-1 */
+	for(i = 0; i < start - 1 && i < nfile; i++)
+		fmtprint(&out, "%s", lines[i]);
+
+	/* replacement text */
+	if(replacement != nil && replacement[0] != '\0'){
+		fmtprint(&out, "%s", replacement);
+		/* ensure replacement ends with newline */
+		i = strlen(replacement);
+		if(i > 0 && replacement[i-1] != '\n')
+			fmtprint(&out, "\n");
+	}
+
+	/* lines after the edit region: end+1..nfile */
+	for(i = end; i < nfile; i++)
+		fmtprint(&out, "%s", lines[i]);
+
+	result = fmtstrflush(&out);
+
+	/* write back */
+	fd = create(path, OWRITE, 0666);
+	if(fd < 0){
+		for(i = 0; i < nfile; i++) free(lines[i]);
+		free(lines);
+		free(result);
+		return esmprint("error: create %s: %r", path);
+	}
+	if(writeall(fd, result, strlen(result)) < 0){
+		close(fd);
+		for(i = 0; i < nfile; i++) free(lines[i]);
+		free(lines);
+		free(result);
+		return esmprint("error: write %s: %r", path);
+	}
+	close(fd);
+	free(result);
+
+	for(i = 0; i < nfile; i++) free(lines[i]);
+	free(lines);
+
+	if(end < start)
+		return esmprint("inserted %d lines before line %d in %s (%d lines now)",
+			nrepl, start, path, nfile + nrepl);
+	return esmprint("replaced lines %d-%d (%d lines) with %d lines in %s (%d lines now)",
+		start, end, delta, nrepl, path, nfile - delta + nrepl);
+}
+
+/*
  * Execute a tool call. Returns result string (caller frees).
  */
 static char*
@@ -1391,14 +1083,8 @@ exectool(ToolCall *tc)
 		return esmprint("created %s (%d bytes)",
 			tc->path, (int)strlen(tc->body));
 
-	case Apatch:
-		/*
-		 * Use the in-tree fuzzy unified-diff applier
-		 * (patch.c:applydiff). Tolerant of off-by-one line
-		 * numbers, missing --- / +++ headers, and minor
-		 * whitespace drift.
-		 */
-		return applydiff(tc->path, tc->body);
+	case Aedit:
+		return tooledit(tc->path, tc->start, tc->end, tc->body);
 
 	case Adelete:
 		if(remove(tc->path) < 0)
@@ -1414,9 +1100,6 @@ exectool(ToolCall *tc)
 	case Amanpage:
 		return toolman(tc->path);
 
-	case Amemcheck:
-		return toolmemcheck(tc->path);
-
 	case Amk:
 		return toolmk(tc->path, tc->body);
 	}
@@ -1424,9 +1107,6 @@ exectool(ToolCall *tc)
 	return esmprint("error: unknown tool type %d", tc->type);
 }
 
-/*
- * Build a tool_result user message JSON content array.
- */
 static char*
 mktoolresults(ToolCall *calls)
 {
@@ -1449,90 +1129,9 @@ mktoolresults(ToolCall *calls)
 }
 
 /*
- * Full tool loop: send, execute tools, send results, repeat.
- * Appends all messages to the conversation.
- * Returns final assistant text (caller frees).
- */
-char*
-claudeconverse(Conv *c, Usage *usage)
-{
-	Reply *r;
-	ToolCall *tc;
-	char *resultjson, *alltext;
-	int round, alllen, tlen;
-
-	alltext = estrdup("");
-	alllen = 0;
-
-	for(round = 0; round < 20; round++){
-		r = sendonce(c, usage);
-		if(r == nil){
-			if(alllen > 0)
-				return alltext;
-			free(alltext);
-			return nil;
-		}
-
-		/* accumulate text */
-		if(r->text != nil && r->text[0] != '\0'){
-			tlen = strlen(r->text);
-			alltext = erealloc(alltext, alllen + tlen + 2);
-			if(alllen > 0)
-				alltext[alllen++] = '\n';
-			memmove(alltext + alllen, r->text, tlen);
-			alllen += tlen;
-			alltext[alllen] = '\0';
-		}
-
-		/* add assistant message with raw content */
-		convappend(c, msgnewraw(Massistant,
-			r->text ? r->text : "", r->rawjson));
-
-		if(r->stopped || r->tools == nil){
-			replyfree(r);
-			return alltext;
-		}
-
-		/* execute each tool */
-		for(tc = r->tools; tc != nil; tc = tc->next)
-			tc->result = exectool(tc);
-
-		/* build tool_result message */
-		resultjson = mktoolresults(r->tools);
-		convappend(c, msgnewraw(Muser, "", resultjson));
-		free(resultjson);
-
-		replyfree(r);
-	}
-
-	return alltext;
-}
-
-/*
- * Streaming path.
- *
- * We reuse buildreq() but set "stream":true, then parse
- * Server-Sent Events from webfs's body file.  For each
- * incremental text delta we invoke cb(chunk, aux).  The assistant's full
- * content array is reconstructed locally (text blocks and
- * tool_use blocks with their JSON input) so that the existing
- * tool-loop logic still works: we build a Reply just like
- * sendonce() would have, and let claudeconverse_stream drive
- * the rounds.
- *
- * Only a small subset of the SSE event stream matters to us:
- *
- *   content_block_start  -- announces a new block; if type is
- *                           tool_use, remember id/name/index
- *   content_block_delta  -- text_delta carries text to emit;
- *                           input_json_delta carries partial
- *                           tool input JSON to accumulate
- *   content_block_stop   -- finalize current block
- *   message_delta        -- carries stop_reason and usage
- *   message_stop         -- end of message
- *   error / overloaded_error -- propagate as werrstr
- *
- * Anything else is ignored.
+ * Streaming SSE parser.  Reconstructs the assistant's content
+ * array from incremental events so the tool loop can work
+ * exactly as with a non-streaming response.
  */
 
 enum {
@@ -1542,14 +1141,12 @@ enum {
 typedef struct Sblock Sblock;
 struct Sblock {
 	int istool;
-	/* text block */
 	char *text;
 	int textlen;
 	int textcap;
-	/* tool_use block */
 	char *toolid;
 	char *toolname;
-	char *tooljson;	/* accumulated input_json_delta partials */
+	char *tooljson;
 	int tooljsonlen;
 	int tooljsoncap;
 };
@@ -1586,10 +1183,6 @@ sblock_appendjson(Sblock *b, char *s, int n)
 	b->tooljson[b->tooljsonlen] = '\0';
 }
 
-/*
- * Convert accumulated Sblocks into a Reply (text + tools +
- * rawjson) shaped exactly like sendonce() returns.
- */
 static Reply*
 blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 {
@@ -1602,7 +1195,6 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 
 	r = emallocz(sizeof *r, 1);
 
-	/* build rawjson content array */
 	content = jarray();
 	alltext = estrdup("");
 	alllen = 0;
@@ -1625,7 +1217,6 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			continue;
 		}
 
-		/* tool_use */
 		block = jobject();
 		jset(block, "type", jstring("tool_use"));
 		jset(block, "id",
@@ -1677,11 +1268,6 @@ freeblocks(Sblock *blocks, int nblocks)
 	}
 }
 
-/*
- * Parse a single SSE "data: ..." JSON payload and update state.
- * Returns 0 normally, -1 on API error (werrstr set), 1 on
- * message_stop.
- */
 static int
 ssehandle(char *json, Sblock *blocks, int *nblocksp,
 	char **stopreasonp, Usage *usage,
@@ -1779,13 +1365,12 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 		jsonfree(ev);
 		return 0;
 	}
-	/* content_block_stop, ping, etc. -- ignore */
 	jsonfree(ev);
 	return 0;
 }
 
 static Reply*
-sendonce_stream(Conv *c, Usage *usage,
+sendonce(Conv *c, Usage *usage,
 	void (*cb)(char*, void*), void *aux)
 {
 	Json *req;
@@ -1805,7 +1390,7 @@ sendonce_stream(Conv *c, Usage *usage,
 		return nil;
 	}
 
-	fd = webfssend_stream(c, body, &clonefd);
+	fd = websend(c, body, 1, &clonefd);
 	free(body);
 	if(fd < 0)
 		return nil;
@@ -1825,7 +1410,6 @@ sendonce_stream(Conv *c, Usage *usage,
 	err = 0;
 
 	while(!done && (line = Brdstr(bp, '\n', 1)) != nil){
-		/* SSE: we only care about "data: ..." lines */
 		if(strncmp(line, "data:", 5) != 0){
 			free(line);
 			continue;
@@ -1863,7 +1447,7 @@ sendonce_stream(Conv *c, Usage *usage,
 }
 
 char*
-claudeconverse_stream(Conv *c, Usage *usage,
+claudeconverse(Conv *c, Usage *usage,
 	void (*cb)(char*, void*), void *aux)
 {
 	Reply *r;
@@ -1875,7 +1459,7 @@ claudeconverse_stream(Conv *c, Usage *usage,
 	alllen = 0;
 
 	for(round = 0; round < 20; round++){
-		r = sendonce_stream(c, usage, cb, aux);
+		r = sendonce(c, usage, cb, aux);
 		if(r == nil){
 			if(alllen > 0) return alltext;
 			free(alltext);
@@ -1900,7 +1484,6 @@ claudeconverse_stream(Conv *c, Usage *usage,
 		}
 
 		for(tc = r->tools; tc != nil; tc = tc->next){
-			/* emit a marker so the user sees why text paused */
 			if(cb != nil){
 				Tooldef *td;
 				char *tname;
@@ -1924,10 +1507,6 @@ claudeconverse_stream(Conv *c, Usage *usage,
 	return alltext;
 }
 
-/*
- * GET a URL from the API and return the response as a malloc'd
- * string (caller frees), or nil with werrstr set.
- */
 static char*
 webfsget(char *apikey, char *url)
 {
@@ -1944,7 +1523,12 @@ webfsget(char *apikey, char *url)
 	if(clonefd < 0)
 		return nil;
 
-	fd = webbody(webdir);
+	{
+		char *page;
+		page = esmprint("%s/body", webdir);
+		fd = open(page, OREAD);
+		free(page);
+	}
 	free(webdir);
 	if(fd < 0){
 		close(clonefd);

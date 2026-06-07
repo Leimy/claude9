@@ -6,10 +6,9 @@
 # the main server's namespace includes the sub-agent mount.
 # On exit (unless -d), both servers are torn down.
 #
-# usage: claudetalk [-d] [-a session] [-l convfile] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
+# usage: claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
 #   -a name       attach to existing session (skip server startup)
 #   -d            detach on exit: leave session and servers alive
-#   -l file       load conversation from file on startup
 #   -M model      default model for claude9fs
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
@@ -19,15 +18,14 @@ rfork e
 
 attach=()
 detach=0
-loadfile=()
 model=()
 maxtokens=()
 skills=()
 namepath=()
-flagfmt='a:attach session,d,l:loadfile file,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
+flagfmt='a:attach session,d,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
 args=''
 if(! ifs=() eval `{aux/getflags $*}){
-	echo 'usage: claudetalk [-d] [-a session] [-l convfile] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
+	echo 'usage: claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
 	exit usage
 }
 
@@ -109,8 +107,6 @@ if(~ $#attach 0){
 }
 if not {
 	# Attach mode: servers must already exist.
-	# If srv files exist but aren't mounted in our namespace
-	# (e.g. reattaching from a different window), mount them.
 	if(test -f /srv/$subsrvname){
 		if(! test -f $submnt/clone)
 			mount -c /srv/$subsrvname $submnt
@@ -124,19 +120,6 @@ if not {
 		exit 'no fs'
 	}
 }
-
-# Memory store check: beads gives Claude persistent, structured
-# memory across sessions.  If $beads is set we use that path,
-# otherwise default to /n/beads.  Absence is non-fatal; tools
-# that touch the store will just see ENOENT.
-if(~ $#beads 0)
-	beads=/n/beads
-if(! test -d $beads/by-id){
-	echo 'memory: '$beads' not mounted (beadsfs disabled)' >[1=2]
-	echo 'hint: beadsfs -s beads -m '$beads' <store>' >[1=2]
-}
-if not
-	echo 'memory: '$beads >[1=2]
 
 if(~ $#attach 0){
 	n=`{cat $mnt/clone}
@@ -175,10 +158,16 @@ if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
 echo '' >[1=2]
 
-# load conversation from file if requested
-if(! ~ $#loadfile 0){
-	echo 'load '$loadfile > $sess/ctl
-	echo 'loaded '$loadfile >[1=2]
+fn setget {
+	file=$1
+	label=$2
+	shift 2
+	if(~ $#* 0)
+		echo $label': '^`{cat $file} >[1=2]
+	if not {
+		echo -n $"* > $file
+		echo $label': '^`{cat $file} >[1=2]
+	}
 }
 
 fn docmd {
@@ -208,22 +197,12 @@ fn docmd {
 		cat $mnt/models >[1=2]
 	}
 	if not if(~ $cmd /model){
-		if(~ $#* 1)
-			echo 'model: '^`{cat $sess/model} >[1=2]
-		if not {
-			shift
-			echo -n $"* > $sess/model
-			echo 'model: '^`{cat $sess/model} >[1=2]
-		}
+		shift
+		setget $sess/model model $*
 	}
 	if not if(~ $cmd /tokens){
-		if(~ $#* 1)
-			echo 'tokens: '^`{cat $sess/tokens} >[1=2]
-		if not {
-			shift
-			echo -n $"* > $sess/tokens
-			echo 'tokens: '^`{cat $sess/tokens} >[1=2]
-		}
+		shift
+		setget $sess/tokens tokens $*
 	}
 	if not if(~ $cmd /status){
 		cat $sess/ctl >[1=2]
@@ -242,30 +221,10 @@ fn docmd {
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /status        show session info' >[1=2]
 		echo '  /usage         show token usage' >[1=2]
-		echo '  /save <path>   save conversation' >[1=2]
-		echo '  /load <path>   load conversation' >[1=2]
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
 		echo '  /noautocontinue   disable auto-continue' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
 		echo '  /quit          exit' >[1=2]
-	}
-	if not if(~ $cmd /save){
-		shift
-		if(! ~ $#* 0){
-			echo 'save '$"* > $sess/ctl
-			echo 'saved to '$"* >[1=2]
-		}
-		if not
-			echo 'usage: /save <path>' >[1=2]
-	}
-	if not if(~ $cmd /load){
-		shift
-		if(! ~ $#* 0){
-			echo 'load '$"* > $sess/ctl
-			echo 'loaded '$"* >[1=2]
-		}
-		if not
-			echo 'usage: /load <path>' >[1=2]
 	}
 	if not if(~ $cmd /autocontinue /ac){
 		shift
@@ -286,19 +245,11 @@ fn docmd {
 }
 
 # Read user input preserving newlines and whitespace.
-# cat reads until EOF (^D); we capture into a temp file
-# so that blank lines and indentation survive intact.
-# Returns the content via $msg (tokenized) for command
-# detection, and writes the raw text to $msgfile.
 msgfile=/tmp/claudetalk.$pid
 fn cleanup {
 	rm -f $msgfile
 }
 
-# On Plan 9, the interrupt note (sent by the DEL key) maps to
-# sigint.  Without an explicit handler rc just keeps looping
-# because the inner subprocess absorbs the note.  Define
-# handlers that tear down the session and exit.
 fn sigexit {
 	teardown
 	cleanup
@@ -332,9 +283,7 @@ while(){
 		docmd $first
 	if not {
 		# Start the streaming reader first so it is blocked in
-		# open() before we write the prompt.  The read on stream
-		# waits for the next round to begin, streams text as it
-		# arrives, then EOFs when the round is complete.
+		# open() before we write the prompt.
 		cat $sess/stream &
 		cpid=$apid
 		if(cat $msgfile > $sess/prompt){

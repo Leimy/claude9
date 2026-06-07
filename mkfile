@@ -6,7 +6,7 @@ SKILLSDIR=$home/lib/claude9/skills
 
 TARG=claude9fs
 
-COMMONO=claude.$O patch.$O json.$O
+COMMONO=claude.$O json.$O
 
 claude9fs:V: claude9fs.$O $COMMONO
 	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO

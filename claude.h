@@ -2,12 +2,11 @@
 
 enum {
 	Acreate,
-	Apatch,
+	Aedit,
 	Aread,
 	Alist,
 	Adelete,
 	Amanpage,
-	Amemcheck,
 	Amk,
 };
 
@@ -20,9 +19,11 @@ enum {
 typedef struct ToolCall ToolCall;
 struct ToolCall {
 	char *id;		/* tool_use_id */
-	int type;		/* Acreate, Apatch, Adelete, Aread, Alist, Amanpage, Amemcheck, Amk */
+	int type;		/* Acreate, Aedit, Adelete, Aread, Alist, Amanpage, Amk */
 	char *path;		/* file path */
-	char *body;		/* contents / diff */
+	char *body;		/* contents / replacement / targets */
+	int start;		/* Aedit: first line (1-based, inclusive) */
+	int end;		/* Aedit: last line (1-based, inclusive) */
 	char *result;		/* result text after execution */
 	ToolCall *next;
 };
@@ -89,21 +90,14 @@ void	convappend(Conv *c, Msg *m);
  * Run the full tool loop: send the conversation, execute any
  * tool calls Claude makes, send the results back, repeat until
  * a non-tool stop_reason.  Appends all rounds (assistant +
- * tool_result) to the conversation.  Returns the final
- * assistant text (caller frees) or nil on error.
- */
-char*	claudeconverse(Conv *c, Usage *usage);
-/*
- * Like claudeconverse, but invokes cb(chunk, aux) with each
- * incremental text delta as it arrives from the API.  Between
- * tool-use rounds, cb may be called with a short marker string
- * such as "\n[running tool: ...]\n" so the user sees progress.
+ * tool_result) to the conversation.  When cb is non-nil, invokes
+ * cb(chunk, aux) with each incremental text delta as it arrives
+ * from the API.  Between tool-use rounds, cb may be called with
+ * a short marker string such as "\n[running tool: ...]\n".
  * Returns the full concatenated assistant text (caller frees),
- * same as claudeconverse.  Falls back to claudeconverse when
- * webfs is not available (e.g. plan9port with only curl); in
- * that case cb is called once with the entire final text.
+ * or nil on error.
  */
-char*	claudeconverse_stream(Conv *c, Usage *usage,
+char*	claudeconverse(Conv *c, Usage *usage,
 		void (*cb)(char *chunk, void *aux), void *aux);
 void	replyfree(Reply *r);
 void	toolfree(ToolCall *t);
@@ -119,12 +113,3 @@ char*	esmprint(char *fmt, ...);
 
 void	mkparents(char *path);
 int	fetchmodels(char *apikey, ModelInfo **out);
-
-/* patch.c */
-/*
- * Apply a unified diff to the file at path using an in-process
- * unified diff applier. Returns a malloc'd status string describing
- * success ("patched foo.c (N hunks)") or failure ("error: ...").
- * Never returns nil.
- */
-char*	applydiff(char *path, char *diff);
