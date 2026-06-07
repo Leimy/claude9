@@ -54,10 +54,9 @@ typedef struct Faux Faux;
 struct Faux {
 	Session *clone;
 	int streamoff;
-	int streamgen;
-	int streamgenset;
-	int streamopengen;	/* s->streamgen captured at open time */
-	int streamopendone;	/* s->streamdone captured at open time */
+	int streamgen;		/* -1 = not latched, >=0 = latched generation */
+	int streamopengen;	/* s->streamgen at open time */
+	int streamidle;		/* stream was idle (done) at open time */
 };
 
 static Srv clsrv;
@@ -269,12 +268,9 @@ static void
 streamreset(Session *s)
 {
 	qlock(&s->streamlk);
-	/* Completely clear the buffer */
 	s->streamlen = 0;
-	if(s->streambuf != nil){
+	if(s->streambuf != nil)
 		s->streambuf[0] = '\0';
-		memset(s->streambuf, 0, s->streamcap);
-	}
 	s->streamdone = 0;
 	s->streamgen++;
 	rwakeupall(&s->streamrz);
@@ -332,7 +328,7 @@ static struct {
 } sessfiles[] = {
 	{ "ctl",	Qctl,		0666 },
 	{ "prompt",	Qprompt,	0666 },
-	{ "conv",	Qconv,		0666 },
+	{ "conv",	Qconv,		0444 },
 	{ "model",	Qmodel,		0666 },
 	{ "tokens",	Qtokens,	0666 },
 	{ "system",	Qsystem,	0666 },
@@ -340,6 +336,19 @@ static struct {
 	{ "error",	Qerror,		0444 },
 	{ "stream",	Qstream,	0444 },
 };
+
+static void
+filldir(Dir *d, Qid qid, char *name, ulong mode)
+{
+	d->qid = qid;
+	d->mode = mode;
+	d->atime = d->mtime = time(0);
+	d->length = 0;
+	d->name = estrdup9p(name);
+	d->uid = estrdup9p("claude");
+	d->gid = estrdup9p("claude");
+	d->muid = estrdup9p("");
+}
 
 static int
 rootgen(int i, Dir *d, void *v)
@@ -349,26 +358,12 @@ rootgen(int i, Dir *d, void *v)
 
 	USED(v);
 	if(i == 0){
-		d->qid = (Qid){Qclone, 0, QTFILE};
-		d->mode = 0444;
-		d->atime = d->mtime = time(0);
-		d->length = 0;
-		d->name = estrdup9p("clone");
-		d->uid = estrdup9p("claude");
-		d->gid = estrdup9p("claude");
-		d->muid = estrdup9p("");
+		filldir(d, (Qid){Qclone, 0, QTFILE}, "clone", 0444);
 		return 0;
 	}
 	i--;
 	if(i == 0){
-		d->qid = (Qid){Qmodels, 0, QTFILE};
-		d->mode = 0444;
-		d->atime = d->mtime = time(0);
-		d->length = 0;
-		d->name = estrdup9p("models");
-		d->uid = estrdup9p("claude");
-		d->gid = estrdup9p("claude");
-		d->muid = estrdup9p("");
+		filldir(d, (Qid){Qmodels, 0, QTFILE}, "models", 0444);
 		return 0;
 	}
 	i--;
@@ -376,14 +371,8 @@ rootgen(int i, Dir *d, void *v)
 	n = 0;
 	for(s = sessions; s != nil; s = s->next){
 		if(n == i){
-			d->qid = (Qid){QPATH(s->id, Qsess), 0, QTDIR};
-			d->mode = DMDIR|0555;
-			d->atime = d->mtime = time(0);
-			d->length = 0;
-			d->name = estrdup9p(s->name);
-			d->uid = estrdup9p("claude");
-			d->gid = estrdup9p("claude");
-			d->muid = estrdup9p("");
+			filldir(d, (Qid){QPATH(s->id, Qsess), 0, QTDIR},
+				s->name, DMDIR|0555);
 			qunlock(&sessionlk);
 			return 0;
 		}
@@ -396,24 +385,15 @@ rootgen(int i, Dir *d, void *v)
 static int
 sessgen(int i, Dir *d, void *aux)
 {
-	Session *s;
 	int sid;
 
 	sid = (int)(uintptr)aux;
-	s = findsession(sid);
-	if(s == nil)
+	if(findsession(sid) == nil)
 		return -1;
 	if(i < 0 || i >= nelem(sessfiles))
 		return -1;
-
-	d->qid = (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE};
-	d->mode = sessfiles[i].mode;
-	d->atime = d->mtime = time(0);
-	d->length = 0;
-	d->name = estrdup9p(sessfiles[i].name);
-	d->uid = estrdup9p("claude");
-	d->gid = estrdup9p("claude");
-	d->muid = estrdup9p("");
+	filldir(d, (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE},
+		sessfiles[i].name, sessfiles[i].mode);
 	return 0;
 }
 
@@ -527,30 +507,18 @@ fsstat(Req *r)
 	type = QTYPE(path);
 	sid = QSID(path);
 
-	r->d.uid = estrdup9p("claude");
-	r->d.gid = estrdup9p("claude");
-	r->d.muid = estrdup9p("");
-	r->d.atime = r->d.mtime = time(0);
-	r->d.length = 0;
-
 	if(path == Qroot){
-		r->d.name = estrdup9p("/");
-		r->d.qid = (Qid){Qroot, 0, QTDIR};
-		r->d.mode = DMDIR|0555;
+		filldir(&r->d, (Qid){Qroot, 0, QTDIR}, "/", DMDIR|0555);
 		respond(r, nil);
 		return;
 	}
 	if(path == Qclone){
-		r->d.name = estrdup9p("clone");
-		r->d.qid = (Qid){Qclone, 0, QTFILE};
-		r->d.mode = 0444;
+		filldir(&r->d, (Qid){Qclone, 0, QTFILE}, "clone", 0444);
 		respond(r, nil);
 		return;
 	}
 	if(path == Qmodels){
-		r->d.name = estrdup9p("models");
-		r->d.qid = (Qid){Qmodels, 0, QTFILE};
-		r->d.mode = 0444;
+		filldir(&r->d, (Qid){Qmodels, 0, QTFILE}, "models", 0444);
 		respond(r, nil);
 		return;
 	}
@@ -560,9 +528,7 @@ fsstat(Req *r)
 			respond(r, "session gone");
 			return;
 		}
-		r->d.name = estrdup9p(s->name);
-		r->d.qid = r->fid->qid;
-		r->d.mode = DMDIR|0555;
+		filldir(&r->d, r->fid->qid, s->name, DMDIR|0555);
 		respond(r, nil);
 		return;
 	}
@@ -573,11 +539,10 @@ fsstat(Req *r)
 		respond(r, "session gone");
 		return;
 	}
-	r->d.qid = r->fid->qid;
 	for(i = 0; i < nelem(sessfiles); i++){
 		if(sessfiles[i].type == type){
-			r->d.name = estrdup9p(sessfiles[i].name);
-			r->d.mode = sessfiles[i].mode;
+			filldir(&r->d, r->fid->qid,
+				sessfiles[i].name, sessfiles[i].mode);
 			respond(r, nil);
 			return;
 		}
@@ -620,31 +585,28 @@ modelstext(Req *r)
  * or EOF when the current round's stream is done, or blocks
  * waiting for data / end-of-round / start-of-next-round.
  *
- * A newly-opened fid whose session was idle at open time (as
- * captured by fsopen into fa->streamopendone) blocks until the
- * next round starts.  To see the last round's text after the
- * fact, read the prompt file instead.
+ * A newly-opened fid whose session was idle at open time
+ * blocks until the next round starts.  To see the last round's
+ * text after the fact, read the prompt file instead.
  */
 static void
 streamread(Req *r, Session *s, Faux *fa)
 {
 	long avail, want;
-	char *data;
 
 	qlock(&s->streamlk);
 	/*
-	 * On first read, decide which generation this fid belongs
-	 * to.  If the session was idle at open time, wait for the
-	 * next round to start.
+	 * On first read, latch to the current generation.
+	 * If the session was idle at open time, wait for the
+	 * next round to start first.
 	 */
-	if(!fa->streamgenset){
-		if(fa->streamopendone){
+	if(fa->streamgen < 0){
+		if(fa->streamidle){
 			while(s->streamgen == fa->streamopengen
 			   && s->streamdone)
 				rsleep(&s->streamrz);
 		}
 		fa->streamgen = s->streamgen;
-		fa->streamgenset = 1;
 	}
 	for(;;){
 		/* fid's generation retired -- EOF */
@@ -658,13 +620,10 @@ streamread(Req *r, Session *s, Faux *fa)
 			avail = s->streamlen - fa->streamoff;
 			want = r->ifcall.count;
 			if(want > avail) want = avail;
-			data = emalloc(want);
-			memmove(data, s->streambuf + fa->streamoff, want);
+			memmove(r->ofcall.data, s->streambuf + fa->streamoff, want);
+			r->ofcall.count = want;
 			fa->streamoff += want;
 			qunlock(&s->streamlk);
-			memmove(r->ofcall.data, data, want);
-			r->ofcall.count = want;
-			free(data);
 			respond(r, nil);
 			return;
 		}
@@ -696,12 +655,13 @@ fsopen(Req *r)
 	type = QTYPE(path);
 	sid = QSID(path);
 
+	fa->streamgen = -1;	/* not yet latched */
 	if(type == Qstream){
 		s = findsession(sid);
 		if(s != nil){
 			qlock(&s->streamlk);
 			fa->streamopengen = s->streamgen;
-			fa->streamopendone = s->streamdone;
+			fa->streamidle = s->streamdone;
 			qunlock(&s->streamlk);
 		}
 	}
@@ -963,7 +923,7 @@ fswrite(Req *r)
 		if(reply == nil){
 			char errbuf[256];
 			rerrstr(errbuf, sizeof errbuf);
-			s->lasterror = estrdup9p(errbuf);
+			s->lasterror = estrdup(errbuf);
 			free(s->lastreply);
 			s->lastreply = nil;
 			qunlock(&s->lk);
@@ -973,7 +933,7 @@ fswrite(Req *r)
 		}
 
 		free(s->lastreply);
-		s->lastreply = estrdup9p(reply);
+		s->lastreply = estrdup(reply);
 		free(reply);
 		qunlock(&s->lk);
 		srvacquire(&clsrv);
@@ -1044,19 +1004,6 @@ fsdestroyfid(Fid *fid)
 	}
 }
 
-void
-initclsrv(void)
-{
-	memset(&clsrv, 0, sizeof clsrv);
-	clsrv.attach = fsattach;
-	clsrv.walk1 = fswalk1;
-	clsrv.open = fsopen;
-	clsrv.stat = fsstat;
-	clsrv.read = fsread;
-	clsrv.write = fswrite;
-	clsrv.destroyfid = fsdestroyfid;
-}
-
 static void
 usage(void)
 {
@@ -1110,7 +1057,14 @@ threadmain(int argc, char **argv)
 			fprint(2, "loaded skills from %s\n", skillsdir);
 	}
 
-	initclsrv();
+	memset(&clsrv, 0, sizeof clsrv);
+	clsrv.attach = fsattach;
+	clsrv.walk1 = fswalk1;
+	clsrv.open = fsopen;
+	clsrv.stat = fsstat;
+	clsrv.read = fsread;
+	clsrv.write = fswrite;
+	clsrv.destroyfid = fsdestroyfid;
 	threadpostmountsrv(&clsrv, srvname, mtpt, MREPL|MCREATE);
 	threadexits(nil);
 }

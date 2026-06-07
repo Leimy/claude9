@@ -267,14 +267,12 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 	c->apikey = estrdup(apikey);
 	c->model = estrdup(model);
 	c->maxtokens = maxtokens;
-	if(sysprompt && skills)
+	if(sysprompt == nil)
+		sysprompt = defaultsysprompt;
+	if(skills != nil)
 		c->sysprompt = esmprint("%s%s", sysprompt, skills);
-	else if(sysprompt)
-		c->sysprompt = estrdup(sysprompt);
-	else if(skills)
-		c->sysprompt = esmprint("%s%s", defaultsysprompt, skills);
 	else
-		c->sysprompt = estrdup(defaultsysprompt);
+		c->sysprompt = estrdup(sysprompt);
 	return c;
 }
 
@@ -294,7 +292,6 @@ convfree(Conv *c)
 	free(c->apikey);
 	free(c->model);
 	free(c->sysprompt);
-	free(c->webdir);
 	free(c);
 }
 
@@ -577,7 +574,7 @@ static int
 websend(Conv *c, char *body, int stream, int *clonefdp)
 {
 	int clonefd, fd;
-	char *webdir, *bodyf, *page;
+	char *webdir, *path;
 	Webreq w;
 
 	memset(&w, 0, sizeof w);
@@ -587,32 +584,32 @@ websend(Conv *c, char *body, int stream, int *clonefdp)
 	w.ctype = 1;
 	w.stream = stream;
 
-	free(c->webdir);
-	c->webdir = nil;
-	clonefd = webopen(&w, &c->webdir);
+	clonefd = webopen(&w, &webdir);
 	if(clonefd < 0)
 		return -1;
-	webdir = c->webdir;
 
-	bodyf = esmprint("%s/postbody", webdir);
-	fd = open(bodyf, OWRITE);
-	free(bodyf);
+	path = esmprint("%s/postbody", webdir);
+	fd = open(path, OWRITE);
+	free(path);
 	if(fd < 0){
 		close(clonefd);
+		free(webdir);
 		werrstr("open postbody: %r");
 		return -1;
 	}
 	if(writeall(fd, body, strlen(body)) < 0){
 		close(fd);
 		close(clonefd);
+		free(webdir);
 		werrstr("write postbody: %r");
 		return -1;
 	}
 	close(fd);
 
-	page = esmprint("%s/body", webdir);
-	fd = open(page, OREAD);
-	free(page);
+	path = esmprint("%s/body", webdir);
+	fd = open(path, OREAD);
+	free(path);
+	free(webdir);
 	if(fd < 0){
 		close(clonefd);
 		werrstr("open body: %r");
@@ -621,54 +618,6 @@ websend(Conv *c, char *body, int stream, int *clonefdp)
 
 	*clonefdp = clonefd;
 	return fd;
-}
-
-static ToolCall*
-parsetools(Json *content)
-{
-	ToolCall *head, *tail, *tc;
-	Json *block, *input;
-	char *type, *name, *id;
-	Tooldef *td;
-	int i;
-
-	head = nil;
-	tail = nil;
-
-	for(i = 0; i < content->nitem; i++){
-		block = jidx(content, i);
-		if(block == nil)
-			continue;
-		type = jstr(block, "type");
-		if(type == nil || strcmp(type, "tool_use") != 0)
-			continue;
-
-		name = jstr(block, "name");
-		id = jstr(block, "id");
-		if(name == nil || id == nil)
-			continue;
-
-		td = findtool(name);
-		if(td == nil)
-			continue;
-
-		input = jget(block, "input");
-		if(input == nil)
-			continue;
-
-		tc = emallocz(sizeof *tc, 1);
-		tc->id = estrdup(id);
-		tc->name = estrdup(name);
-		tc->type = td->type;
-		parseinput(tc, td, input);
-
-		if(tail == nil)
-			head = tc;
-		else
-			tail->next = tc;
-		tail = tc;
-	}
-	return head;
 }
 
 void

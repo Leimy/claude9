@@ -60,7 +60,6 @@ struct Conv {
 	char *model;
 	int maxtokens;
 	char *sysprompt;
-	char *webdir;
 	Msg *msgs;
 	Msg *tail;
 };
