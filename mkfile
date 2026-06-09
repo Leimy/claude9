@@ -8,11 +8,13 @@ TARG=claude9fs
 
 COMMONO=claude.$O json.$O
 
-claude9fs:V: claude9fs.$O $COMMONO
+claude9fs: claude9fs.$O $COMMONO
 	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO
 
 %.$O: %.c
 	$CC $CFLAGS $stem.c
+
+claude9fs.$O claude.$O json.$O: claude.h json.h
 
 clean:V:
 	rm -f *.[$OS] claude9fs
@@ -20,7 +22,7 @@ clean:V:
 install:V: claude9fs
 	cp claude9fs $BIN/
 	cp claudetalk $RCBIN/
-	chmod +x /bin/claudetalk
+	chmod +x $RCBIN/claudetalk
 	mkdir -p $SKILLSDIR
 	for(f in skills/*) cp $f $SKILLSDIR/
 

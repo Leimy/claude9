@@ -196,11 +196,12 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 void
 mkparents(char *path)
 {
-	char buf[1024];
-	char *p;
+	char *buf, *p;
 	int fd;
 
-	snprint(buf, sizeof buf, "%s", path);
+	if(path == nil || path[0] == '\0')
+		return;
+	buf = estrdup(path);
 	for(p = buf + 1; *p != '\0'; p++){
 		if(*p == '/'){
 			*p = '\0';
@@ -210,6 +211,7 @@ mkparents(char *path)
 			*p = '/';
 		}
 	}
+	free(buf);
 }
 
 char*
@@ -452,6 +454,28 @@ buildreq(Conv *c)
 	jset(req, "model", jstring(c->model));
 	jset(req, "max_tokens", jintval(c->maxtokens));
 
+	/*
+	 * Extended thinking.  budget_tokens must be < max_tokens;
+	 * clamp rather than let the API reject the request.
+	 */
+	if(c->thinking > 0){
+		Json *think;
+		int budget;
+
+		budget = c->thinking;
+		if(budget < 1024)
+			budget = 1024;
+		if(budget >= c->maxtokens)
+			budget = c->maxtokens / 2;
+		think = jobject();
+		if(budget >= 1024){
+			jset(think, "type", jstring("enabled"));
+			jset(think, "budget_tokens", jintval(budget));
+			jset(req, "thinking", think);
+		} else
+			jsonfree(think);
+	}
+
 	if(c->sysprompt){
 		sys = jarray();
 		block = jobject();
@@ -473,6 +497,17 @@ buildreq(Conv *c)
 		content = nil;
 		if(m->rawjson != nil)
 			content = jsonparse(m->rawjson);
+		/*
+		 * A raw content array can end up empty (e.g. an
+		 * assistant turn whose only text blocks were empty
+		 * and were skipped).  The API rejects empty content
+		 * arrays, so fall through to the placeholder.
+		 */
+		if(content != nil && content->type == Jarray
+		&& content->nitem == 0){
+			jsonfree(content);
+			content = nil;
+		}
 		if(content == nil){
 			/*
 			 * Guard against empty text content blocks:
@@ -976,7 +1011,7 @@ exectool(ToolCall *tc)
 		fd = create(tc->path, OWRITE, 0666);
 		if(fd < 0)
 			return esmprint("error: create %s: %r", tc->path);
-		if(write(fd, tc->body, strlen(tc->body)) != (long)strlen(tc->body)){
+		if(writeall(fd, tc->body, strlen(tc->body)) < 0){
 			close(fd);
 			return esmprint("error: write %s: %r", tc->path);
 		}
@@ -1005,7 +1040,8 @@ exectool(ToolCall *tc)
 		return toolmk(tc->path, tc->body);
 	}
 
-	return esmprint("error: unknown tool type %d", tc->type);
+	return esmprint("error: unknown tool '%s'",
+		tc->name ? tc->name : "");
 }
 
 static char*
@@ -1042,9 +1078,18 @@ enum {
 typedef struct Sblock Sblock;
 struct Sblock {
 	int istool;
+	int isthinking;
 	char *text;
 	int textlen;
 	int textcap;
+	/* thinking blocks: streamed text + closing signature */
+	char *thinking;
+	int thinkinglen;
+	int thinkingcap;
+	char *sig;
+	int siglen;
+	int sigcap;
+	char *redacted;		/* redacted_thinking: opaque data blob */
 	char *toolid;
 	char *toolname;
 	char *tooljson;
@@ -1088,6 +1133,26 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 	head = tail = nil;
 
 	for(i = 0; i < nblocks; i++){
+		if(blocks[i].isthinking){
+			/*
+			 * Thinking blocks must be passed back verbatim
+			 * (with signature) when the turn continues with
+			 * tool results, or the API rejects the request.
+			 */
+			block = jobject();
+			if(blocks[i].redacted != nil){
+				jset(block, "type", jstring("redacted_thinking"));
+				jset(block, "data", jstring(blocks[i].redacted));
+			} else {
+				jset(block, "type", jstring("thinking"));
+				jset(block, "thinking",
+					jstring(blocks[i].thinking ? blocks[i].thinking : ""));
+				jset(block, "signature",
+					jstring(blocks[i].sig ? blocks[i].sig : ""));
+			}
+			jappend(content, block);
+			continue;
+		}
 		if(!blocks[i].istool){
 			/* skip empty text blocks: the API rejects them */
 			if(blocks[i].text == nil || blocks[i].text[0] == '\0')
@@ -1115,15 +1180,26 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		jset(block, "input", input);
 		jappend(content, block);
 
+		/*
+		 * Always create a ToolCall, even for an unknown tool
+		 * name: every tool_use block in the assistant content
+		 * must get a matching tool_result in the next user
+		 * message, or the API rejects the whole conversation.
+		 * Unknown tools get type -1 and exectool returns an
+		 * error result for them.
+		 */
 		td = findtool(blocks[i].toolname);
-		if(td == nil)
-			continue;
-
 		tc = emallocz(sizeof *tc, 1);
 		tc->id = estrdup(blocks[i].toolid ? blocks[i].toolid : "");
 		tc->name = estrdup(blocks[i].toolname ? blocks[i].toolname : "");
-		tc->type = td->type;
-		parseinput(tc, td, input);
+		if(td != nil){
+			tc->type = td->type;
+			parseinput(tc, td, input);
+		} else {
+			tc->type = -1;
+			tc->path = estrdup("");
+			tc->body = estrdup("");
+		}
 		if(tail == nil) head = tc;
 		else tail->next = tc;
 		tail = tc;
@@ -1146,6 +1222,9 @@ freeblocks(Sblock *blocks, int nblocks)
 	int i;
 	for(i = 0; i < nblocks; i++){
 		free(blocks[i].text);
+		free(blocks[i].thinking);
+		free(blocks[i].sig);
+		free(blocks[i].redacted);
 		free(blocks[i].toolid);
 		free(blocks[i].toolname);
 		free(blocks[i].tooljson);
@@ -1222,7 +1301,25 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			blocks[idx].toolid = estrdup(s ? s : "");
 			s = jstr(cb0, "name");
 			blocks[idx].toolname = estrdup(s ? s : "");
+		} else if(dtype != nil && strcmp(dtype, "thinking") == 0){
+			blocks[idx].isthinking = 1;
+			if(cb != nil) cb("[thinking]\n", aux);
+		} else if(dtype != nil && strcmp(dtype, "redacted_thinking") == 0){
+			char *s;
+			blocks[idx].isthinking = 1;
+			s = jstr(cb0, "data");
+			blocks[idx].redacted = estrdup(s ? s : "");
+			if(cb != nil) cb("[redacted thinking]\n", aux);
 		}
+		jsonfree(ev);
+		return 0;
+	}
+	if(strcmp(etype, "content_block_stop") == 0){
+		idx = jint(ev, "index");
+		if(idx >= 0 && idx < Maxblocks
+		&& blocks[idx].isthinking && blocks[idx].redacted == nil
+		&& cb != nil)
+			cb("\n[/thinking]\n", aux);
 		jsonfree(ev);
 		return 0;
 	}
@@ -1251,6 +1348,24 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 					&blocks[idx].tooljsonlen,
 					&blocks[idx].tooljsoncap,
 					pj, strlen(pj));
+		} else if(strcmp(dtype, "thinking_delta") == 0){
+			char *t;
+			t = jstr(delta, "thinking");
+			if(t != nil){
+				sbappend(&blocks[idx].thinking,
+					&blocks[idx].thinkinglen,
+					&blocks[idx].thinkingcap,
+					t, strlen(t));
+				if(cb != nil) cb(t, aux);
+			}
+		} else if(strcmp(dtype, "signature_delta") == 0){
+			char *t;
+			t = jstr(delta, "signature");
+			if(t != nil)
+				sbappend(&blocks[idx].sig,
+					&blocks[idx].siglen,
+					&blocks[idx].sigcap,
+					t, strlen(t));
 		}
 		jsonfree(ev);
 		return 0;

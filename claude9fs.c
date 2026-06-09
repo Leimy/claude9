@@ -22,6 +22,7 @@ enum {
 	Qusage,
 	Qerror,
 	Qstream,
+	Qthinking,
 };
 
 #define QPATH(sid, type)	((uvlong)(sid)<<8 | (type))
@@ -36,7 +37,10 @@ struct Session {
 	char *lastreply;
 	char *lasterror;
 	Usage usage;
+	int ref;	/* held by users outside the list; guarded by sessionlk */
+	int unlinked;	/* removed from session list; guarded by sessionlk */
 	QLock lk;
+	int busy;	/* prompt round in flight; guarded by lk */
 	/* streaming */
 	QLock streamlk;
 	Rendez streamrz;
@@ -45,6 +49,7 @@ struct Session {
 	int streamcap;
 	int streamdone;
 	int streamgen;
+	int closed;	/* session destroyed; guarded by streamlk */
 	/* auto-continue on max_tokens */
 	int autocont;	/* max auto-continue rounds; 0 = disabled */
 	Session *next;
@@ -57,6 +62,8 @@ struct Faux {
 	int streamgen;		/* -1 = not latched, >=0 = latched generation */
 	int streamopengen;	/* s->streamgen at open time */
 	int streamidle;		/* stream was idle (done) at open time */
+	Req *curreq;		/* in-progress stream read; guarded by streamlk */
+	int flushing;		/* curreq has been flushed; guarded by streamlk */
 };
 
 static Srv clsrv;
@@ -137,8 +144,20 @@ readskills(char *dir)
 	return fmtstrflush(&f);
 }
 
+static void freesession(Session*);
+
+/*
+ * Session lifetime: sessions live on the global list until a
+ * hangup unlinks them (s->unlinked).  Any code that uses a
+ * session outside sessionlk must hold a reference taken by
+ * sessget/sessgetname and drop it with sessput.  The session
+ * memory is freed only when it is unlinked and the last
+ * reference is gone, so a hangup cannot pull the Session (or
+ * its Conv) out from under an in-flight prompt round or a
+ * blocked stream reader.
+ */
 static Session*
-findsession(int id)
+sessget(int id)
 {
 	Session *s;
 
@@ -146,12 +165,14 @@ findsession(int id)
 	for(s = sessions; s != nil; s = s->next)
 		if(s->id == id)
 			break;
+	if(s != nil)
+		s->ref++;
 	qunlock(&sessionlk);
 	return s;
 }
 
 static Session*
-findsessionname(char *name)
+sessgetname(char *name)
 {
 	Session *s;
 
@@ -159,8 +180,25 @@ findsessionname(char *name)
 	for(s = sessions; s != nil; s = s->next)
 		if(strcmp(s->name, name) == 0)
 			break;
+	if(s != nil)
+		s->ref++;
 	qunlock(&sessionlk);
 	return s;
+}
+
+static void
+sessput(Session *s)
+{
+	int dofree;
+
+	if(s == nil)
+		return;
+	qlock(&sessionlk);
+	s->ref--;
+	dofree = s->unlinked && s->ref == 0;
+	qunlock(&sessionlk);
+	if(dofree)
+		freesession(s);
 }
 
 /*
@@ -188,6 +226,10 @@ genname(void)
 	return estrdup(buf);
 }
 
+/*
+ * Create a session and link it onto the global list.
+ * Returns with one reference held for the caller.
+ */
 static Session*
 newsession(void)
 {
@@ -198,6 +240,7 @@ newsession(void)
 	s = emallocz(sizeof *s, 1);
 	qlock(&sessionlk);
 	s->id = nextsid++;
+	s->ref = 1;
 	/*
 	 * Try namefs for a goofy name; on collision or
 	 * failure, fall back to the integer id.
@@ -241,18 +284,36 @@ freesession(Session *s)
 	free(s);
 }
 
+/*
+ * Unlink a session from the global list.  The memory is
+ * reclaimed by sessput when the last reference drops.
+ * Blocked stream readers are woken so they see EOF instead
+ * of sleeping forever on a dead session.
+ */
 static void
 delsession(int id)
 {
 	Session **pp, *s;
+	int dofree;
 
 	qlock(&sessionlk);
 	for(pp = &sessions; *pp != nil; pp = &(*pp)->next){
 		if((*pp)->id == id){
 			s = *pp;
 			*pp = s->next;
+			s->next = nil;
+			s->unlinked = 1;
+			dofree = s->ref == 0;
 			qunlock(&sessionlk);
-			freesession(s);
+			if(dofree){
+				/* no users left; reclaim now */
+				freesession(s);
+				return;
+			}
+			qlock(&s->streamlk);
+			s->closed = 1;
+			rwakeupall(&s->streamrz);
+			qunlock(&s->streamlk);
 			return;
 		}
 	}
@@ -335,6 +396,7 @@ static struct {
 	{ "usage",	Qusage,		0444 },
 	{ "error",	Qerror,		0444 },
 	{ "stream",	Qstream,	0444 },
+	{ "thinking",	Qthinking,	0666 },
 };
 
 static void
@@ -386,10 +448,13 @@ static int
 sessgen(int i, Dir *d, void *aux)
 {
 	int sid;
+	Session *s;
 
 	sid = (int)(uintptr)aux;
-	if(findsession(sid) == nil)
+	s = sessget(sid);
+	if(s == nil)
 		return -1;
+	sessput(s);
 	if(i < 0 || i >= nelem(sessfiles))
 		return -1;
 	filldir(d, (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE},
@@ -437,13 +502,15 @@ ctltext(Session *s)
 		"tokens %d\n"
 		"messages %d\n"
 		"bytes %ld\n"
-		"autocontinue %d\n",
+		"autocontinue %d\n"
+		"thinking %d\n",
 		s->name,
 		s->conv->model,
 		s->conv->maxtokens,
 		convcount(s->conv),
 		convsize(s->conv),
-		s->autocont);
+		s->autocont,
+		s->conv->thinking);
 }
 
 static void
@@ -473,18 +540,20 @@ fswalk1(Fid *fid, char *name, Qid *qid)
 			*qid = (Qid){Qmodels, 0, QTFILE};
 			return nil;
 		}
-		s = findsessionname(name);
+		s = sessgetname(name);
 		if(s == nil)
 			return "not found";
 		*qid = (Qid){QPATH(s->id, Qsess), 0, QTDIR};
+		sessput(s);
 		return nil;
 	}
 	if(type == Qsess){
 		int sid;
 		sid = QSID(path);
-		s = findsession(sid);
+		s = sessget(sid);
 		if(s == nil)
 			return "session gone";
+		sessput(s);
 		for(i = 0; i < nelem(sessfiles); i++){
 			if(strcmp(name, sessfiles[i].name) == 0){
 				*qid = (Qid){QPATH(sid, sessfiles[i].type), 0, QTFILE};
@@ -523,22 +592,24 @@ fsstat(Req *r)
 		return;
 	}
 	if(type == Qsess){
-		s = findsession(sid);
+		s = sessget(sid);
 		if(s == nil){
 			respond(r, "session gone");
 			return;
 		}
 		filldir(&r->d, r->fid->qid, s->name, DMDIR|0555);
+		sessput(s);
 		respond(r, nil);
 		return;
 	}
 
 	/* session file -- look up in table */
-	s = findsession(sid);
+	s = sessget(sid);
 	if(s == nil){
 		respond(r, "session gone");
 		return;
 	}
+	sessput(s);
 	for(i = 0; i < nelem(sessfiles); i++){
 		if(sessfiles[i].type == type){
 			filldir(&r->d, r->fid->qid,
@@ -588,6 +659,13 @@ modelstext(Req *r)
  * A newly-opened fid whose session was idle at open time
  * blocks until the next round starts.  To see the last round's
  * text after the fact, read the prompt file instead.
+ *
+ * While blocked, the request is registered in fa->curreq so
+ * fsflush can cancel it; a hangup of the session sets s->closed
+ * and wakes us so we return EOF instead of sleeping forever.
+ * (If a client somehow issues multiple concurrent reads on one
+ * fid, only the latest is flushable; the others still wake and
+ * terminate normally.)
  */
 static void
 streamread(Req *r, Session *s, Faux *fa)
@@ -595,6 +673,8 @@ streamread(Req *r, Session *s, Faux *fa)
 	long avail, want;
 
 	qlock(&s->streamlk);
+	fa->curreq = r;
+	fa->flushing = 0;
 	/*
 	 * On first read, latch to the current generation.
 	 * If the session was idle at open time, wait for the
@@ -603,14 +683,22 @@ streamread(Req *r, Session *s, Faux *fa)
 	if(fa->streamgen < 0){
 		if(fa->streamidle){
 			while(s->streamgen == fa->streamopengen
-			   && s->streamdone)
+			   && s->streamdone && !s->closed && !fa->flushing)
 				rsleep(&s->streamrz);
 		}
 		fa->streamgen = s->streamgen;
 	}
 	for(;;){
-		/* fid's generation retired -- EOF */
-		if(fa->streamgen != s->streamgen){
+		if(fa->flushing){
+			fa->curreq = nil;
+			fa->flushing = 0;
+			qunlock(&s->streamlk);
+			respond(r, "interrupted");
+			return;
+		}
+		/* session hung up, or fid's generation retired -- EOF */
+		if(s->closed || fa->streamgen != s->streamgen){
+			fa->curreq = nil;
 			qunlock(&s->streamlk);
 			r->ofcall.count = 0;
 			respond(r, nil);
@@ -623,11 +711,13 @@ streamread(Req *r, Session *s, Faux *fa)
 			memmove(r->ofcall.data, s->streambuf + fa->streamoff, want);
 			r->ofcall.count = want;
 			fa->streamoff += want;
+			fa->curreq = nil;
 			qunlock(&s->streamlk);
 			respond(r, nil);
 			return;
 		}
 		if(s->streamdone){
+			fa->curreq = nil;
 			qunlock(&s->streamlk);
 			r->ofcall.count = 0;
 			respond(r, nil);
@@ -635,6 +725,42 @@ streamread(Req *r, Session *s, Faux *fa)
 		}
 		rsleep(&s->streamrz);
 	}
+}
+
+/*
+ * Tflush: if the flushed request is a stream read blocked in
+ * streamread, mark it and wake the sleeper; it responds to the
+ * old request with "interrupted".  For anything else (e.g. an
+ * in-flight prompt write, which cannot be cancelled mid-API
+ * call) we just respond to the flush; lib9p delays the Rflush
+ * until the old request's response is sent.
+ */
+static void
+fsflush(Req *r)
+{
+	Req *old;
+	Faux *fa;
+	Session *s;
+	uvlong path;
+
+	old = r->oldreq;
+	if(old != nil && old->fid != nil){
+		path = old->fid->qid.path;
+		if(QTYPE(path) == Qstream){
+			fa = old->fid->aux;
+			s = sessget(QSID(path));
+			if(s != nil && fa != nil){
+				qlock(&s->streamlk);
+				if(fa->curreq == old){
+					fa->flushing = 1;
+					rwakeupall(&s->streamrz);
+				}
+				qunlock(&s->streamlk);
+			}
+			sessput(s);
+		}
+	}
+	respond(r, nil);
 }
 
 static void
@@ -657,12 +783,13 @@ fsopen(Req *r)
 
 	fa->streamgen = -1;	/* not yet latched */
 	if(type == Qstream){
-		s = findsession(sid);
+		s = sessget(sid);
 		if(s != nil){
 			qlock(&s->streamlk);
 			fa->streamopengen = s->streamgen;
 			fa->streamidle = s->streamdone;
 			qunlock(&s->streamlk);
+			sessput(s);
 		}
 	}
 	respond(r, nil);
@@ -716,7 +843,7 @@ fsread(Req *r)
 		return;
 	}
 
-	s = findsession(sid);
+	s = sessget(sid);
 	if(s == nil){
 		respond(r, "session gone");
 		return;
@@ -724,17 +851,19 @@ fsread(Req *r)
 
 	switch(type){
 	case Qctl:
+		qlock(&s->lk);
 		text = ctltext(s);
+		qunlock(&s->lk);
 		readstr(r, text);
 		free(text);
 		respond(r, nil);
-		return;
+		break;
 	case Qprompt:
 		qlock(&s->lk);
 		readstr(r, s->lastreply ? s->lastreply : "");
 		qunlock(&s->lk);
 		respond(r, nil);
-		return;
+		break;
 	case Qconv:
 		qlock(&s->lk);
 		text = convtext(s->conv);
@@ -742,51 +871,71 @@ fsread(Req *r)
 		readstr(r, text);
 		free(text);
 		respond(r, nil);
-		return;
+		break;
 	case Qmodel:
 		qlock(&s->lk);
 		readstr(r, s->conv->model);
 		qunlock(&s->lk);
 		respond(r, nil);
-		return;
+		break;
 	case Qtokens:
+		qlock(&s->lk);
 		snprint(buf, sizeof buf, "%d", s->conv->maxtokens);
+		qunlock(&s->lk);
 		readstr(r, buf);
 		respond(r, nil);
-		return;
+		break;
+	case Qthinking:
+		qlock(&s->lk);
+		snprint(buf, sizeof buf, "%d", s->conv->thinking);
+		qunlock(&s->lk);
+		readstr(r, buf);
+		respond(r, nil);
+		break;
 	case Qsystem:
 		qlock(&s->lk);
 		readstr(r, s->conv->sysprompt ? s->conv->sysprompt : "");
 		qunlock(&s->lk);
 		respond(r, nil);
-		return;
+		break;
 	case Qusage:
+		qlock(&s->lk);
 		text = usagetext(s);
+		qunlock(&s->lk);
 		readstr(r, text);
 		free(text);
 		respond(r, nil);
-		return;
+		break;
 	case Qerror:
 		qlock(&s->lk);
 		readstr(r, s->lasterror ? s->lasterror : "");
 		qunlock(&s->lk);
 		respond(r, nil);
-		return;
+		break;
 	case Qstream:
 		srvrelease(&clsrv);
 		streamread(r, s, fa);
 		srvacquire(&clsrv);
-		return;
+		break;
+	default:
+		respond(r, "bug in fsread");
+		break;
 	}
-	respond(r, "bug in fsread");
+	sessput(s);
 }
 
-static void
+/*
+ * Handle a ctl command.  Called with s->lk held.
+ * Returns nil on success or an error string.
+ */
+static char*
 handlectl(Session *s, char *cmd, int *hangup)
 {
 	Msg *m, *next;
 
 	if(strcmp(cmd, "clear") == 0){
+		if(s->busy)
+			return "session busy";
 		for(m = s->conv->msgs; m != nil; m = next){
 			next = m->next;
 			free(m->text);
@@ -824,7 +973,114 @@ handlectl(Session *s, char *cmd, int *hangup)
 		s->autocont = n;
 	} else if(strcmp(cmd, "noautocontinue") == 0){
 		s->autocont = 0;
+	} else
+		return "unknown ctl command";
+	return nil;
+}
+
+/*
+ * Run one prompt round (plus auto-continue rounds) for a
+ * session.  Called from fswrite with the srv loop released
+ * and a session reference held.  s->busy is set, so no other
+ * prompt write, clear, or model/system/tokens change can
+ * touch s->conv while claudeconverse is walking it.
+ *
+ * Token usage accumulates in a local Usage and is published
+ * to s->usage under s->lk only when the round ends, so other
+ * fids can read the usage file at any time without racing the
+ * unlocked updates claudeconverse makes mid-round.  (Mid-round
+ * reads see the previous round's totals.)
+ */
+static void
+doprompt(Req *r, Session *s, char *data)
+{
+	char *reply, *contreply;
+	int autocont, contround;
+	Usage u;
+
+	qlock(&s->lk);
+	if(s->busy){
+		qunlock(&s->lk);
+		free(data);
+		respond(r, "session busy");
+		return;
 	}
+	s->busy = 1;
+	free(s->lasterror);
+	s->lasterror = nil;
+	convappend(s->conv, msgnew(Muser, data));
+	free(data);
+	autocont = s->autocont;
+	qunlock(&s->lk);
+
+	memset(&u, 0, sizeof u);
+
+	streamreset(s);
+
+	reply = claudeconverse(s->conv, &u,
+		streamcb, s);
+
+	streamfinish(s);
+
+	/*
+	 * Auto-continue: if Claude hit max_tokens and
+	 * autocontinue is enabled, send "Continue." messages
+	 * to keep going.
+	 */
+	if(reply != nil && autocont > 0){
+		for(contround = 0; contround < autocont; contround++){
+			if(u.stop_reason == nil
+			|| strcmp(u.stop_reason, "max_tokens") != 0)
+				break;
+
+			qlock(&s->lk);
+			convappend(s->conv, msgnew(Muser, "Continue."));
+			qunlock(&s->lk);
+
+			free(u.stop_reason);
+			u.stop_reason = nil;
+
+			qlock(&s->streamlk);
+			s->streamdone = 0;
+			qunlock(&s->streamlk);
+
+			contreply = claudeconverse(s->conv,
+				&u, streamcb, s);
+
+			streamfinish(s);
+
+			if(contreply != nil){
+				reply = erealloc(reply,
+					strlen(reply) + strlen(contreply) + 2);
+				strcat(reply, "\n");
+				strcat(reply, contreply);
+				free(contreply);
+			} else
+				break;
+		}
+	}
+
+	qlock(&s->lk);
+	s->busy = 0;
+	free(s->usage.stop_reason);
+	s->usage = u;	/* struct copy; stop_reason ownership moves */
+	if(reply == nil){
+		char errbuf[256];
+		rerrstr(errbuf, sizeof errbuf);
+		s->lasterror = estrdup(errbuf);
+		free(s->lastreply);
+		s->lastreply = nil;
+		qunlock(&s->lk);
+		respond(r, errbuf);
+		return;
+	}
+
+	free(s->lastreply);
+	s->lastreply = estrdup(reply);
+	free(reply);
+	qunlock(&s->lk);
+	r->ofcall.count = r->ifcall.count;
+	respond(r, nil);
 }
 
 static void
@@ -834,15 +1090,14 @@ fswrite(Req *r)
 	int type, sid;
 	int hangup, n;
 	Session *s;
-	char *data, *reply;
-	char *contreply;
+	char *data, *err;
 	long count;
 
 	path = r->fid->qid.path;
 	type = QTYPE(path);
 	sid = QSID(path);
 
-	s = findsession(sid);
+	s = sessget(sid);
 	if(s == nil){
 		respond(r, "session gone");
 		return;
@@ -861,135 +1116,104 @@ fswrite(Req *r)
 			free(data);
 			r->ofcall.count = r->ifcall.count;
 			respond(r, nil);
-			return;
+			break;
 		}
 		srvrelease(&clsrv);
-
-		qlock(&s->lk);
-		free(s->lasterror);
-		s->lasterror = nil;
-		free(s->usage.stop_reason);
-		memset(&s->usage, 0, sizeof s->usage);
-		convappend(s->conv, msgnew(Muser, data));
-		free(data);
-		qunlock(&s->lk);
-
-		streamreset(s);
-
-		reply = claudeconverse(s->conv, &s->usage,
-			streamcb, s);
-
-		streamfinish(s);
-
-		/*
-		 * Auto-continue: if Claude hit max_tokens and
-		 * autocontinue is enabled, send "Continue." messages
-		 * to keep going.
-		 */
-		if(reply != nil && s->autocont > 0){
-			int contround;
-			for(contround = 0; contround < s->autocont; contround++){
-				if(s->usage.stop_reason == nil
-				|| strcmp(s->usage.stop_reason, "max_tokens") != 0)
-					break;
-
-				qlock(&s->lk);
-				convappend(s->conv, msgnew(Muser, "Continue."));
-				free(s->usage.stop_reason);
-				s->usage.stop_reason = nil;
-				qunlock(&s->lk);
-
-				qlock(&s->streamlk);
-				s->streamdone = 0;
-				qunlock(&s->streamlk);
-
-				contreply = claudeconverse(s->conv,
-					&s->usage, streamcb, s);
-
-				streamfinish(s);
-
-				if(contreply != nil){
-					reply = erealloc(reply,
-						strlen(reply) + strlen(contreply) + 2);
-					strcat(reply, "\n");
-					strcat(reply, contreply);
-					free(contreply);
-				} else
-					break;
-			}
-		}
-
-		qlock(&s->lk);
-		if(reply == nil){
-			char errbuf[256];
-			rerrstr(errbuf, sizeof errbuf);
-			s->lasterror = estrdup(errbuf);
-			free(s->lastreply);
-			s->lastreply = nil;
-			qunlock(&s->lk);
-			srvacquire(&clsrv);
-			respond(r, errbuf);
-			return;
-		}
-
-		free(s->lastreply);
-		s->lastreply = estrdup(reply);
-		free(reply);
-		qunlock(&s->lk);
+		doprompt(r, s, data);
 		srvacquire(&clsrv);
-		r->ofcall.count = r->ifcall.count;
-		respond(r, nil);
-		return;
+		break;
 
 	case Qctl:
 		hangup = 0;
 		qlock(&s->lk);
-		handlectl(s, data, &hangup);
+		err = handlectl(s, data, &hangup);
 		qunlock(&s->lk);
 		free(data);
+		if(err != nil){
+			respond(r, err);
+			break;
+		}
 		if(hangup)
 			delsession(sid);
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
-		return;
+		break;
 
 	case Qmodel:
 		qlock(&s->lk);
+		if(s->busy){
+			qunlock(&s->lk);
+			free(data);
+			respond(r, "session busy");
+			break;
+		}
 		free(s->conv->model);
 		s->conv->model = data;
 		qunlock(&s->lk);
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
-		return;
+		break;
 
 	case Qtokens:
 		n = atoi(data);
 		free(data);
 		if(n <= 0){
 			respond(r, "invalid token count");
-			return;
+			break;
 		}
 		qlock(&s->lk);
+		if(s->busy){
+			qunlock(&s->lk);
+			respond(r, "session busy");
+			break;
+		}
 		s->conv->maxtokens = n;
 		qunlock(&s->lk);
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
-		return;
+		break;
+
+	case Qthinking:
+		/* budget tokens for extended thinking; 0 disables */
+		n = atoi(data);
+		free(data);
+		if(n < 0){
+			respond(r, "invalid thinking budget");
+			break;
+		}
+		qlock(&s->lk);
+		if(s->busy){
+			qunlock(&s->lk);
+			respond(r, "session busy");
+			break;
+		}
+		s->conv->thinking = n;
+		qunlock(&s->lk);
+		r->ofcall.count = r->ifcall.count;
+		respond(r, nil);
+		break;
 
 	case Qsystem:
 		qlock(&s->lk);
+		if(s->busy){
+			qunlock(&s->lk);
+			free(data);
+			respond(r, "session busy");
+			break;
+		}
 		free(s->conv->sysprompt);
 		s->conv->sysprompt = data;
 		qunlock(&s->lk);
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
-		return;
+		break;
 
 	default:
 		free(data);
 		respond(r, "permission denied");
-		return;
+		break;
 	}
+	sessput(s);
 }
 
 static void
@@ -999,6 +1223,8 @@ fsdestroyfid(Fid *fid)
 
 	fa = fid->aux;
 	if(fa != nil){
+		/* drop the reference held by a clone fid */
+		sessput(fa->clone);
 		free(fa);
 		fid->aux = nil;
 	}
@@ -1064,6 +1290,7 @@ threadmain(int argc, char **argv)
 	clsrv.stat = fsstat;
 	clsrv.read = fsread;
 	clsrv.write = fswrite;
+	clsrv.flush = fsflush;
 	clsrv.destroyfid = fsdestroyfid;
 	threadpostmountsrv(&clsrv, srvname, mtpt, MREPL|MCREATE);
 	threadexits(nil);

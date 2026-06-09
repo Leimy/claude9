@@ -57,13 +57,25 @@ through the API**.  Concretely that includes things like:
 
 It cannot escape the permissions of the user running
 claude9fs, and it does not get raw shell or network access -
-the only side effects are the five file tools above plus the
-HTTPS calls claude9fs itself makes to the Anthropic API.  But
-within those limits it can do real damage.
+the only side effects are the file tools above, the utility
+tools (`read_man_page`, `mk`), plus the HTTPS calls claude9fs
+itself makes to the Anthropic API.  But within those limits it
+can do real damage.
+
+**Note that the `mk` tool is arbitrary code execution.**  mk
+recipes are rc commands run with your full authority; a model
+that writes a mkfile and then "checks the build" has run
+whatever it likes.  The system prompt forbids using mk for
+anything but compilation, but a prompt is policy, not a
+mechanism - prompt-injected input can argue the model out of
+it.  The only real boundary is the namespace the server runs
+in.
 
 ### Recommendations
 
-- **Sandbox the namespace.**  Run claudetalk (and its
+- **Sandbox the namespace.**  This is the actual security
+  boundary; everything else below is harm reduction.  Run
+  claudetalk (and its
   underlying claude9fs) inside an `rfork n` namespace that
   only exposes what the model needs to see.  For example,
   hide `/mnt/term` if you are a drawterm/cpu client, hide
@@ -133,6 +145,7 @@ and returns its number.
 			conv      read full conversation history
 			model     read/write the model name
 			tokens    read/write max output tokens
+			thinking  read/write extended thinking budget (0 = off)
 			system    read/write the system prompt
 			usage     read token usage statistics
 			error     read last error message
@@ -173,6 +186,29 @@ hits EOF.
 
 To see the last round's text after the fact, read `prompt`
 instead.
+
+### Extended Thinking
+
+Some models (e.g. the fable/opus families) support extended
+thinking: the model reasons in a separate "thinking" block
+before its visible answer.  Write a token budget to the
+session's `thinking` file to enable it:
+
+	echo 4096 > /mnt/claude/$n/thinking   # enable, 4096-token budget
+	echo 0 > /mnt/claude/$n/thinking      # disable
+
+The budget is clamped to at least 1024 (the API minimum) and
+below the session's max output tokens.  Thinking text streams
+to the `stream` file as it arrives, bracketed by `[thinking]`
+and `[/thinking]` markers, so interactive clients show
+progress instead of a long silent gap.  Thinking blocks are
+preserved verbatim (with their signatures) when the turn
+continues with tool results, as the API requires; they are not
+included in the text you read back from `prompt`.
+
+Note that enabling thinking increases output-token usage: the
+thinking tokens are billed as output even though they are not
+part of the visible reply.
 
 ### Auto-Continue
 
@@ -291,6 +327,8 @@ file in the background while writing to `prompt`.
 	/model <name>  switch model
 	/tokens        show current max tokens
 	/tokens <n>    set max tokens
+	/thinking      show extended thinking budget
+	/thinking <n>  set thinking budget tokens (0 = off, min 1024)
 	/clear         clear conversation
 	/status        show session info
 	/usage         show token usage

@@ -593,7 +593,12 @@ fmtjstr(Fmt *f, char *s)
 			extra += 1;
 			break;
 		default:
-			if(*p < 0x20)
+			/*
+			 * cast to uchar: plain char may be signed, and
+			 * UTF-8 continuation bytes (>= 0x80) must not
+			 * be mistaken for control characters.
+			 */
+			if((uchar)*p < 0x20)
 				extra += 5;
 			break;
 		}
@@ -635,13 +640,13 @@ fmtjstr(Fmt *f, char *s)
 			*q++ = 't';
 			break;
 		default:
-			if(*p < 0x20){
+			if((uchar)*p < 0x20){
 				*q++ = '\\';
 				*q++ = 'u';
 				*q++ = '0';
 				*q++ = '0';
-				*q++ = hexdigits[(*p >> 4) & 0xF];
-				*q++ = hexdigits[*p & 0xF];
+				*q++ = hexdigits[((uchar)*p >> 4) & 0xF];
+				*q++ = hexdigits[(uchar)*p & 0xF];
 			} else {
 				*q++ = *p;
 			}

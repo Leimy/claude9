@@ -59,6 +59,7 @@ struct Conv {
 	char *apikey;
 	char *model;
 	int maxtokens;
+	int thinking;	/* extended thinking budget tokens; 0 = off */
 	char *sysprompt;
 	Msg *msgs;
 	Msg *tail;

@@ -145,14 +145,10 @@ fn teardown {
 	}
 }
 
-fn sigexit {
-	teardown
-}
-
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /autocontinue [n] /clear /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /autocontinue [n] /clear /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -204,6 +200,10 @@ fn docmd {
 		shift
 		setget $sess/tokens tokens $*
 	}
+	if not if(~ $cmd /thinking){
+		shift
+		setget $sess/thinking thinking $*
+	}
 	if not if(~ $cmd /status){
 		cat $sess/ctl >[1=2]
 	}
@@ -218,6 +218,8 @@ fn docmd {
 		echo '  /model <name>  switch model' >[1=2]
 		echo '  /tokens        show max output tokens' >[1=2]
 		echo '  /tokens <n>    set max output tokens' >[1=2]
+		echo '  /thinking      show thinking budget tokens' >[1=2]
+		echo '  /thinking <n>  set thinking budget (0 = off, min 1024)' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /status        show session info' >[1=2]
 		echo '  /usage         show token usage' >[1=2]
