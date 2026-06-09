@@ -218,8 +218,9 @@ fn docmd {
 		echo '  /model <name>  switch model' >[1=2]
 		echo '  /tokens        show max output tokens' >[1=2]
 		echo '  /tokens <n>    set max output tokens' >[1=2]
-		echo '  /thinking      show thinking budget tokens' >[1=2]
-		echo '  /thinking <n>  set thinking budget (0 = off, min 1024)' >[1=2]
+		echo '  /thinking      show extended thinking setting' >[1=2]
+		echo '  /thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)' >[1=2]
+		echo '  /thinking adaptive [effort]  adaptive mode (fable; effort e.g. low/medium/high)' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /status        show session info' >[1=2]
 		echo '  /usage         show token usage' >[1=2]
@@ -294,6 +295,13 @@ while(){
 			cat $sess/usage >[1=2]
 		}
 		if not {
+			# The prompt write can fail before a round ever
+			# starts (e.g. 'session busy'), leaving the
+			# stream reader latched on an idle session,
+			# waiting for a round that will never come.
+			# Kill it so wait does not hang; the resulting
+			# Tflush is handled cleanly by claude9fs.
+			echo kill > /proc/$cpid/note >[2]/dev/null
 			wait $cpid
 			echo 'error:' >[1=2]
 			cat $sess/error >[1=2]

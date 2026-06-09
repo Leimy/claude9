@@ -493,24 +493,94 @@ usagetext(Session *s)
 		s->usage.stop_reason ? s->usage.stop_reason : "none");
 }
 
+/*
+ * Format the session's thinking setting as text:
+ *   "0"                  off
+ *   "<n>"                budget mode, n tokens (opus etc.)
+ *   "adaptive"           adaptive mode (fable)
+ *   "adaptive <effort>"  adaptive mode with output effort
+ * The same syntax is accepted by writes to the thinking file.
+ */
+static char*
+thinkingtext(Conv *c)
+{
+	switch(c->thinkmode){
+	case Thinkbudget:
+		return esmprint("%d", c->thinking);
+	case Thinkadaptive:
+		if(c->effort != nil && c->effort[0] != '\0')
+			return esmprint("adaptive %s", c->effort);
+		return estrdup("adaptive");
+	}
+	return estrdup("0");
+}
+
+/*
+ * Parse a write to the thinking file.  Called with s->lk held.
+ * Returns nil on success or an error string.
+ */
+static char*
+setthinking(Conv *c, char *data)
+{
+	char *p;
+	int n;
+
+	while(*data == ' ' || *data == '\t')
+		data++;
+	if(strcmp(data, "off") == 0 || strcmp(data, "0") == 0){
+		c->thinkmode = Thinkoff;
+		c->thinking = 0;
+		free(c->effort);
+		c->effort = nil;
+		return nil;
+	}
+	if(strncmp(data, "adaptive", 8) == 0
+	&& (data[8] == '\0' || data[8] == ' ' || data[8] == '\t')){
+		p = data + 8;
+		while(*p == ' ' || *p == '\t')
+			p++;
+		c->thinkmode = Thinkadaptive;
+		c->thinking = 0;
+		free(c->effort);
+		c->effort = *p != '\0' ? estrdup(p) : nil;
+		return nil;
+	}
+	if(data[0] >= '0' && data[0] <= '9'){
+		n = atoi(data);
+		if(n > 0){
+			c->thinkmode = Thinkbudget;
+			c->thinking = n;
+			free(c->effort);
+			c->effort = nil;
+			return nil;
+		}
+	}
+	return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
+}
+
 static char*
 ctltext(Session *s)
 {
-	return esmprint(
+	char *think, *text;
+
+	think = thinkingtext(s->conv);
+	text = esmprint(
 		"name %s\n"
 		"model %s\n"
 		"tokens %d\n"
 		"messages %d\n"
 		"bytes %ld\n"
 		"autocontinue %d\n"
-		"thinking %d\n",
+		"thinking %s\n",
 		s->name,
 		s->conv->model,
 		s->conv->maxtokens,
 		convcount(s->conv),
 		convsize(s->conv),
 		s->autocont,
-		s->conv->thinking);
+		think);
+	free(think);
+	return text;
 }
 
 static void
@@ -887,9 +957,10 @@ fsread(Req *r)
 		break;
 	case Qthinking:
 		qlock(&s->lk);
-		snprint(buf, sizeof buf, "%d", s->conv->thinking);
+		text = thinkingtext(s->conv);
 		qunlock(&s->lk);
-		readstr(r, buf);
+		readstr(r, text);
+		free(text);
 		respond(r, nil);
 		break;
 	case Qsystem:
@@ -994,7 +1065,7 @@ handlectl(Session *s, char *cmd, int *hangup)
 static void
 doprompt(Req *r, Session *s, char *data)
 {
-	char *reply, *contreply;
+	char *reply, *contreply, *err, *conterr;
 	int autocont, contround;
 	Usage u;
 
@@ -1018,16 +1089,18 @@ doprompt(Req *r, Session *s, char *data)
 	streamreset(s);
 
 	reply = claudeconverse(s->conv, &u,
-		streamcb, s);
+		streamcb, s, &err);
 
 	streamfinish(s);
 
 	/*
 	 * Auto-continue: if Claude hit max_tokens and
 	 * autocontinue is enabled, send "Continue." messages
-	 * to keep going.
+	 * to keep going.  Skipped when the round already failed
+	 * (err set): continuing a broken round compounds the
+	 * damage and hides the error.
 	 */
-	if(reply != nil && autocont > 0){
+	if(reply != nil && err == nil && autocont > 0){
 		for(contround = 0; contround < autocont; contround++){
 			if(u.stop_reason == nil
 			|| strcmp(u.stop_reason, "max_tokens") != 0)
@@ -1045,7 +1118,7 @@ doprompt(Req *r, Session *s, char *data)
 			qunlock(&s->streamlk);
 
 			contreply = claudeconverse(s->conv,
-				&u, streamcb, s);
+				&u, streamcb, s, &conterr);
 
 			streamfinish(s);
 
@@ -1055,7 +1128,12 @@ doprompt(Req *r, Session *s, char *data)
 				strcat(reply, "\n");
 				strcat(reply, contreply);
 				free(contreply);
-			} else
+			}
+			if(conterr != nil){
+				err = conterr;
+				break;
+			}
+			if(contreply == nil)
 				break;
 		}
 	}
@@ -1066,7 +1144,11 @@ doprompt(Req *r, Session *s, char *data)
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
 	if(reply == nil){
 		char errbuf[256];
-		rerrstr(errbuf, sizeof errbuf);
+		if(err != nil)
+			snprint(errbuf, sizeof errbuf, "%s", err);
+		else
+			rerrstr(errbuf, sizeof errbuf);
+		free(err);
 		s->lasterror = estrdup(errbuf);
 		free(s->lastreply);
 		s->lastreply = nil;
@@ -1074,6 +1156,17 @@ doprompt(Req *r, Session *s, char *data)
 		respond(r, errbuf);
 		return;
 	}
+
+	/*
+	 * Partial success: we got some text, but a later round
+	 * failed (API error mid-tool-loop, round cap, dropped
+	 * connection).  Keep the partial reply readable, but
+	 * record the error so it is visible in the error file
+	 * instead of silently passing off a truncated answer
+	 * as complete.
+	 */
+	if(err != nil)
+		s->lasterror = err;	/* ownership moves */
 
 	free(s->lastreply);
 	s->lastreply = estrdup(reply);
@@ -1174,21 +1267,26 @@ fswrite(Req *r)
 		break;
 
 	case Qthinking:
-		/* budget tokens for extended thinking; 0 disables */
-		n = atoi(data);
-		free(data);
-		if(n < 0){
-			respond(r, "invalid thinking budget");
-			break;
-		}
+		/*
+		 * "0"/"off" disables; a number sets budget mode
+		 * (thinking.type=enabled, for opus-family models);
+		 * "adaptive [effort]" sets adaptive mode (for
+		 * fable-family models, which reject type=enabled).
+		 */
 		qlock(&s->lk);
 		if(s->busy){
 			qunlock(&s->lk);
+			free(data);
 			respond(r, "session busy");
 			break;
 		}
-		s->conv->thinking = n;
+		err = setthinking(s->conv, data);
 		qunlock(&s->lk);
+		free(data);
+		if(err != nil){
+			respond(r, err);
+			break;
+		}
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
 		break;

@@ -191,14 +191,38 @@ instead.
 
 Some models (e.g. the fable/opus families) support extended
 thinking: the model reasons in a separate "thinking" block
-before its visible answer.  Write a token budget to the
-session's `thinking` file to enable it:
+before its visible answer.  There are two API shapes,
+depending on the model family, and the session's `thinking`
+file accepts both:
 
-	echo 4096 > /mnt/claude/$n/thinking   # enable, 4096-token budget
-	echo 0 > /mnt/claude/$n/thinking      # disable
+	# Budget mode (opus/sonnet/haiku families):
+	#   thinking: {type: "enabled", budget_tokens: n}
+	echo 4096 > /mnt/claude/$n/thinking      # enable, 4096-token budget
 
-The budget is clamped to at least 1024 (the API minimum) and
-below the session's max output tokens.  Thinking text streams
+	# Adaptive mode (fable family):
+	#   thinking: {type: "adaptive"}, output_config: {effort: "..."}
+	echo adaptive > /mnt/claude/$n/thinking        # adaptive, default effort
+	echo 'adaptive high' > /mnt/claude/$n/thinking # adaptive, high effort
+
+	# Either mode:
+	echo 0 > /mnt/claude/$n/thinking         # disable (or 'off')
+
+The two modes are not interchangeable: fable-family models
+reject `thinking.type=enabled` ("use thinking.type.adaptive
+and output_config.effort"), and older models do not understand
+`adaptive`.  If you set the wrong mode for a model, the round
+fails cleanly and the API's explanation appears in the
+session's `error` file; fix the setting (or write `0`) and
+resend.  Switching models mid-session does not adjust the
+thinking setting automatically.
+
+The effort word in adaptive mode is passed through to
+`output_config.effort` verbatim (e.g. `low`, `medium`,
+`high`); omit it to let the model decide.
+
+In budget mode the budget is clamped to at least 1024 (the API
+minimum) and below the session's max output tokens.  Thinking
+text streams
 to the `stream` file as it arrives, bracketed by `[thinking]`
 and `[/thinking]` markers, so interactive clients show
 progress instead of a long silent gap.  Thinking blocks are
@@ -327,8 +351,9 @@ file in the background while writing to `prompt`.
 	/model <name>  switch model
 	/tokens        show current max tokens
 	/tokens <n>    set max tokens
-	/thinking      show extended thinking budget
-	/thinking <n>  set thinking budget tokens (0 = off, min 1024)
+	/thinking      show extended thinking setting
+	/thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)
+	/thinking adaptive [effort]  adaptive mode (fable)
 	/clear         clear conversation
 	/status        show session info
 	/usage         show token usage

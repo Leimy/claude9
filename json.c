@@ -452,9 +452,18 @@ jint(Json *j, char *name)
 	Json *v;
 
 	v = jget(j, name);
-	if(v == nil || v->type != Jint)
+	if(v == nil)
 		return 0;
-	return v->ival;
+	if(v->type == Jint)
+		return v->ival;
+	/*
+	 * Tolerate numbers that arrive as reals (e.g. "123.0"):
+	 * JSON has only one number type, so a serializer is free
+	 * to add a fraction part to an integral value.
+	 */
+	if(v->type == Jreal)
+		return (vlong)v->fval;
+	return 0;
 }
 
 Json*

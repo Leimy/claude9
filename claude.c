@@ -293,6 +293,7 @@ convfree(Conv *c)
 	}
 	free(c->apikey);
 	free(c->model);
+	free(c->effort);
 	free(c->sysprompt);
 	free(c);
 }
@@ -455,10 +456,19 @@ buildreq(Conv *c)
 	jset(req, "max_tokens", jintval(c->maxtokens));
 
 	/*
-	 * Extended thinking.  budget_tokens must be < max_tokens;
-	 * clamp rather than let the API reject the request.
+	 * Extended thinking.  Two API shapes, model-dependent:
+	 *
+	 * Thinkbudget (opus/sonnet/haiku families):
+	 *   thinking: {type: "enabled", budget_tokens: N}
+	 * budget_tokens must be < max_tokens; clamp rather than
+	 * let the API reject the request.
+	 *
+	 * Thinkadaptive (fable family):
+	 *   thinking: {type: "adaptive"}
+	 *   output_config: {effort: "..."}   (optional)
+	 * These models reject type "enabled" outright.
 	 */
-	if(c->thinking > 0){
+	if(c->thinkmode == Thinkbudget && c->thinking > 0){
 		Json *think;
 		int budget;
 
@@ -474,6 +484,17 @@ buildreq(Conv *c)
 			jset(req, "thinking", think);
 		} else
 			jsonfree(think);
+	} else if(c->thinkmode == Thinkadaptive){
+		Json *think, *oc;
+
+		think = jobject();
+		jset(think, "type", jstring("adaptive"));
+		jset(req, "thinking", think);
+		if(c->effort != nil && c->effort[0] != '\0'){
+			oc = jobject();
+			jset(oc, "effort", jstring(c->effort));
+			jset(req, "output_config", oc);
+		}
 	}
 
 	if(c->sysprompt){
@@ -1290,7 +1311,18 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 	}
 	if(strcmp(etype, "content_block_start") == 0){
 		idx = jint(ev, "index");
-		if(idx < 0 || idx >= Maxblocks){ jsonfree(ev); return 0; }
+		if(idx < 0 || idx >= Maxblocks){
+			/*
+			 * Silently dropping a block here would desync
+			 * the tool protocol (a tool_use with no
+			 * tool_result wedges the conversation), so
+			 * fail the round loudly instead.
+			 */
+			jsonfree(ev);
+			werrstr("content block index %d exceeds limit (%d)",
+				idx, Maxblocks);
+			return -1;
+		}
 		if(idx >= *nblocksp) *nblocksp = idx + 1;
 		cb0 = jget(ev, "content_block");
 		dtype = jstr(cb0, "type");
@@ -1325,7 +1357,12 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 	}
 	if(strcmp(etype, "content_block_delta") == 0){
 		idx = jint(ev, "index");
-		if(idx < 0 || idx >= Maxblocks){ jsonfree(ev); return 0; }
+		if(idx < 0 || idx >= Maxblocks){
+			jsonfree(ev);
+			werrstr("content block index %d exceeds limit (%d)",
+				idx, Maxblocks);
+			return -1;
+		}
 		if(idx >= *nblocksp) *nblocksp = idx + 1;
 		delta = jget(ev, "delta");
 		dtype = jstr(delta, "type");
@@ -1434,6 +1471,17 @@ sendonce(Conv *c, Usage *usage,
 	close(fd);
 	close(clonefd);
 
+	/*
+	 * The SSE stream must end with a message_stop event.  If it
+	 * just stops (connection drop, webfs hiccup), the response
+	 * is incomplete: treat it as an error rather than passing
+	 * off partial blocks as a finished turn.
+	 */
+	if(!done && !err){
+		werrstr("response stream ended unexpectedly (connection lost?)");
+		err = 1;
+	}
+
 	if(err){
 		freeblocks(blocks, nblocks);
 		free(stopreason);
@@ -1451,21 +1499,41 @@ sendonce(Conv *c, Usage *usage,
 	return r;
 }
 
+enum {
+	Maxrounds = 20,	/* tool-loop round cap per prompt */
+};
+
 char*
 claudeconverse(Conv *c, Usage *usage,
-	void (*cb)(char*, void*), void *aux)
+	void (*cb)(char*, void*), void *aux, char **errp)
 {
 	Reply *r;
 	ToolCall *tc;
-	char *resultjson, *alltext, marker[256];
+	char *resultjson, *alltext, marker[256], errbuf[ERRMAX];
 	int round, alllen, tlen;
 
+	if(errp != nil)
+		*errp = nil;
 	alltext = estrdup("");
 	alllen = 0;
 
-	for(round = 0; round < 20; round++){
+	for(round = 0; round < Maxrounds; round++){
 		r = sendonce(c, usage, cb, aux);
 		if(r == nil){
+			/*
+			 * Surface the failure even when we have
+			 * partial text from earlier rounds: the
+			 * stream gets a marker and the caller gets
+			 * the error string via errp.
+			 */
+			rerrstr(errbuf, sizeof errbuf);
+			if(errp != nil)
+				*errp = estrdup(errbuf);
+			if(cb != nil){
+				snprint(marker, sizeof marker,
+					"\n[error: %s]\n", errbuf);
+				cb(marker, aux);
+			}
 			if(alllen > 0) return alltext;
 			free(alltext);
 			return nil;
@@ -1505,6 +1573,16 @@ claudeconverse(Conv *c, Usage *usage,
 		replyfree(r);
 	}
 
+	/*
+	 * Tool-loop round cap reached: the model was still asking
+	 * for tools when we cut it off.  The conversation ends with
+	 * tool results appended, so it can be resumed with another
+	 * prompt, but the user must be told this answer is not done.
+	 */
+	if(errp != nil)
+		*errp = esmprint("tool loop limit reached (%d rounds)", Maxrounds);
+	if(cb != nil)
+		cb("\n[tool loop limit reached; send another prompt to continue]\n", aux);
 	return alltext;
 }
 

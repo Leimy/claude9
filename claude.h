@@ -15,6 +15,13 @@ enum {
 	Massistant,
 };
 
+/* extended thinking modes (Conv.thinkmode) */
+enum {
+	Thinkoff,	/* no thinking requested */
+	Thinkbudget,	/* thinking.type=enabled, budget_tokens (opus etc.) */
+	Thinkadaptive,	/* thinking.type=adaptive, output_config.effort (fable) */
+};
+
 /* tool call from Claude */
 typedef struct ToolCall ToolCall;
 struct ToolCall {
@@ -59,7 +66,9 @@ struct Conv {
 	char *apikey;
 	char *model;
 	int maxtokens;
-	int thinking;	/* extended thinking budget tokens; 0 = off */
+	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
+	int thinking;	/* Thinkbudget: budget tokens */
+	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
 	char *sysprompt;
 	Msg *msgs;
 	Msg *tail;
@@ -97,9 +106,16 @@ void	convappend(Conv *c, Msg *m);
  * a short marker string such as "\n[running tool: ...]\n".
  * Returns the full concatenated assistant text (caller frees),
  * or nil on error.
+ *
+ * If errp is non-nil, *errp is set to a malloc'd error string
+ * when something went wrong, even if partial text is returned
+ * (e.g. an API failure after several successful tool rounds).
+ * *errp is set to nil on full success.  This is how callers
+ * distinguish "complete answer" from "answer truncated by an
+ * error mid-loop".
  */
 char*	claudeconverse(Conv *c, Usage *usage,
-		void (*cb)(char *chunk, void *aux), void *aux);
+		void (*cb)(char *chunk, void *aux), void *aux, char **errp);
 void	replyfree(Reply *r);
 void	toolfree(ToolCall *t);
 char*	readfile(int fd);
