@@ -473,8 +473,18 @@ buildreq(Conv *c)
 		content = nil;
 		if(m->rawjson != nil)
 			content = jsonparse(m->rawjson);
-		if(content == nil)
-			content = mktextcontent(m->text);
+		if(content == nil){
+			/*
+			 * Guard against empty text content blocks:
+			 * the API rejects {"type":"text","text":""}.
+			 * Use a single space as a harmless placeholder
+			 * when the message text is empty.
+			 */
+			if(m->text == nil || m->text[0] == '\0')
+				content = mktextcontent(" ");
+			else
+				content = mktextcontent(m->text);
+		}
 		jset(msg, "content", content);
 		jappend(msgs, msg);
 	}
@@ -556,8 +566,7 @@ webopen(Webreq *w, char **webdirp)
 	|| (w->ctype && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
 	|| (w->stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
 	|| fprint(fd, "headers x-api-key: %s\r\n", w->apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
-	|| fprint(fd, "headers anthropic-beta: prompt-caching-2024-07-31\r\n") < 0){
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
 		close(fd);
 		close(clonefd);
 		free(webdir);
@@ -609,12 +618,45 @@ websend(Conv *c, char *body, int stream, int *clonefdp)
 	path = esmprint("%s/body", webdir);
 	fd = open(path, OREAD);
 	free(path);
-	free(webdir);
 	if(fd < 0){
+		char *ebody, *emsg;
+		int efd;
+
+		/*
+		 * HTTP error.  Read the errorbody file from webfs
+		 * to get the server's response, which for the
+		 * Anthropic API is JSON with a detailed message.
+		 */
+		path = esmprint("%s/errorbody", webdir);
+		efd = open(path, OREAD);
+		free(path);
+		free(webdir);
+		if(efd >= 0){
+			ebody = readfile(efd);
+			close(efd);
+		} else
+			ebody = nil;
+		if(ebody != nil){
+			Json *ej, *eo;
+			ej = jsonparse(ebody);
+			emsg = nil;
+			if(ej != nil){
+				eo = jget(ej, "error");
+				if(eo != nil)
+					emsg = jstr(eo, "message");
+			}
+			if(emsg != nil)
+				werrstr("API error: %s", emsg);
+			else
+				werrstr("API error: %s", ebody);
+			jsonfree(ej);
+			free(ebody);
+		} else
+			werrstr("open body: %r");
 		close(clonefd);
-		werrstr("open body: %r");
 		return -1;
 	}
+	free(webdir);
 
 	*clonefdp = clonefd;
 	return fd;
@@ -1047,13 +1089,14 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 
 	for(i = 0; i < nblocks; i++){
 		if(!blocks[i].istool){
+			/* skip empty text blocks: the API rejects them */
+			if(blocks[i].text == nil || blocks[i].text[0] == '\0')
+				continue;
 			block = jobject();
 			jset(block, "type", jstring("text"));
-			jset(block, "text",
-				jstring(blocks[i].text ? blocks[i].text : ""));
+			jset(block, "text", jstring(blocks[i].text));
 			jappend(content, block);
-			if(blocks[i].text != nil)
-				fmtprint(&f, "%s", blocks[i].text);
+			fmtprint(&f, "%s", blocks[i].text);
 			continue;
 		}
 
