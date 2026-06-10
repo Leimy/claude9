@@ -413,6 +413,58 @@ mktools(void)
 }
 
 /*
+ * True if s is nil, empty, or contains only whitespace.
+ * The API rejects text content blocks that are empty OR
+ * whitespace-only ("text content blocks must contain
+ * non-whitespace text"), so both cases must be treated
+ * identically everywhere a text block is emitted.
+ */
+static int
+blankstr(char *s)
+{
+	if(s == nil)
+		return 1;
+	for(; *s != '\0'; s++)
+		if(*s != ' ' && *s != '\t' && *s != '\n'
+		&& *s != '\r' && *s != '\v' && *s != '\f')
+			return 0;
+	return 1;
+}
+
+/*
+ * Remove text content blocks that are empty or whitespace-only
+ * from a parsed content array, in place.  Tool_use, tool_result,
+ * thinking and non-blank text blocks are kept.  This repairs a
+ * rawjson snapshot replayed from an earlier round (or a wedged
+ * conversation) before it is sent: the API rejects any text
+ * block without non-whitespace text, and a single bad block
+ * makes every resend fail.  Returns the number of blocks kept.
+ */
+static int
+striptextblocks(Json *content)
+{
+	Json *block;
+	char *btype;
+	int i, keep;
+
+	if(content == nil || content->type != Jarray)
+		return content != nil ? content->nitem : 0;
+	keep = 0;
+	for(i = 0; i < content->nitem; i++){
+		block = content->items[i];
+		btype = jstr(block, "type");
+		if(btype != nil && strcmp(btype, "text") == 0
+		&& blankstr(jstr(block, "text"))){
+			jsonfree(block);
+			continue;	/* drop this blank text block */
+		}
+		content->items[keep++] = block;
+	}
+	content->nitem = keep;
+	return keep;
+}
+
+/*
  * Wrap a plain text string in a JSON content array:
  *   [{"type":"text","text":"..."}]
  */
@@ -495,6 +547,14 @@ buildreq(Conv *c)
 		if(m->rawjson != nil)
 			content = jsonparse(m->rawjson);
 		/*
+		 * Repair the replayed content array: strip any
+		 * empty/whitespace-only text blocks the API would
+		 * reject.  This also recovers a conversation that
+		 * was wedged by an earlier build of this program.
+		 */
+		if(content != nil)
+			striptextblocks(content);
+		/*
 		 * A raw content array can end up empty (e.g. an
 		 * assistant turn whose only text blocks were empty
 		 * and were skipped).  The API rejects empty content
@@ -507,13 +567,14 @@ buildreq(Conv *c)
 		}
 		if(content == nil){
 			/*
-			 * Guard against empty text content blocks:
-			 * the API rejects {"type":"text","text":""}.
-			 * Use a single space as a harmless placeholder
-			 * when the message text is empty.
+			 * Guard against empty/whitespace-only text
+			 * content blocks: the API rejects both
+			 * {"type":"text","text":""} and a block whose
+			 * text is only whitespace.  Use a harmless
+			 * placeholder when the message text is blank.
 			 */
-			if(m->text == nil || m->text[0] == '\0')
-				content = mktextcontent(" ");
+			if(blankstr(m->text))
+				content = mktextcontent("(no text)");
 			else
 				content = mktextcontent(m->text);
 		}
@@ -1081,8 +1142,16 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			continue;
 		}
 		if(!blocks[i].istool){
-			/* skip empty text blocks: the API rejects them */
-			if(blocks[i].text.len == 0)
+			/*
+			 * Skip empty AND whitespace-only text blocks:
+			 * the API rejects both ("text content blocks
+			 * must contain non-whitespace text").  A text
+			 * delta of just "\n" or " " right before a tool
+			 * call is common and must not be stored in the
+			 * rawjson we replay on later rounds, or every
+			 * resend wedges the conversation.
+			 */
+			if(blankstr(blocks[i].text.s))
 				continue;
 			block = jobject();
 			jset(block, "type", jstring("text"));
