@@ -126,8 +126,8 @@ Flags:
 	-K skillsdir   load skill files from this directory into the system prompt
 	-s srvname     post to /srv with this name
 	-m mtpt        mount point (default: /mnt/claude)
-	-M model       default model (default: claude-opus-4-6)
-	-t maxtokens   default max tokens (default: 16384)
+	-M model       default model (default: claude-opus-4-8)
+	-t maxtokens   default max tokens per round (default: 16384)
 
 claude9fs serves a 9P filesystem where each Claude conversation
 is a numbered directory.  Reading `clone` allocates a new session
@@ -144,8 +144,8 @@ and returns its number.
 			stream    read incremental text deltas of current round
 			conv      read full conversation history
 			model     read/write the model name
-			tokens    read/write max output tokens
-			thinking  read/write extended thinking budget (0 = off)
+			tokens    read/write max output tokens per round
+			thinking  read/write extended thinking setting (0 = off)
 			system    read/write the system prompt
 			usage     read token usage statistics
 			error     read last error message
@@ -156,6 +156,35 @@ and returns its number.
 	hangup             destroy the session
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
+
+### Defaults
+
+New sessions start with:
+
+	model         claude-opus-4-8   (override with -M)
+	tokens        16384             (override with -t)
+	thinking      off
+	autocontinue  off
+
+The defaults are chosen to interlock: 16384 output tokens per
+round is enough that ordinary coding work never hits the cap,
+and leaves room for a generous thinking budget (e.g. 8192)
+underneath it.  Thinking is off by default because the right
+mode depends on the model family (see Extended Thinking), and
+because thinking tokens are billed output.  Auto-continue is
+off by default so a runaway response costs one round, not n+1.
+
+Two invariants are enforced when you write the files, rather
+than silently patched up at request time:
+
+- a budget written to `thinking` must satisfy
+  1024 <= budget < tokens, or the write fails;
+- a value written to `tokens` must exceed an active thinking
+  budget, or the write fails.
+
+The error strings name the other file, so an interactive
+client always sees why a setting was refused and which knob
+to turn.
 
 ### Tool Use
 
@@ -186,6 +215,42 @@ hits EOF.
 
 To see the last round's text after the fact, read `prompt`
 instead.
+
+### Output Tokens: the Guillotine
+
+The `tokens` file sets the `max_tokens` parameter sent with
+every API request.  It is a hard decode cap, not a hint: the
+model stops generating the instant it reaches the limit --
+mid-sentence, mid-word, mid tool call -- and the response
+comes back with `stop_reason max_tokens` (visible in the
+`usage` file).  The model does not pace itself against the
+limit.  Think guillotine, not word count.
+
+Three things follow from where the cap is applied:
+
+- **It is per round, not per prompt.**  One prompt can run up
+  to 20 tool-use rounds, and each round gets a fresh
+  `max_tokens` budget.  `tokens` bounds the worst-case output
+  (and output cost) of each round, not of the whole exchange.
+
+- **It does not limit input.**  Conversation history, system
+  prompt, skills, and tool results are input tokens and are
+  unaffected.  `tokens` is purely an output throttle.
+
+- **Thinking spends from the same budget.**  In budget mode
+  (next section) thinking tokens are output tokens under the
+  same cap, which is why the budget must be smaller than
+  `tokens`: whatever thinking uses is unavailable to the
+  visible answer.
+
+If the guillotine falls mid tool call, the truncated
+`tool_use` block would normally wedge the conversation: the
+API refuses any follow-up message that does not answer it.
+claude9fs answers such orphaned tool calls automatically with
+a `not executed: response truncated` result, so the
+conversation stays well-formed and a follow-up -- yours, or
+auto-continue's -- lets the model reissue the tool call
+intact.
 
 ### Extended Thinking
 
@@ -220,15 +285,29 @@ The effort word in adaptive mode is passed through to
 `output_config.effort` verbatim (e.g. `low`, `medium`,
 `high`); omit it to let the model decide.
 
-In budget mode the budget is clamped to at least 1024 (the API
-minimum) and below the session's max output tokens.  Thinking
-text streams
-to the `stream` file as it arrives, bracketed by `[thinking]`
-and `[/thinking]` markers, so interactive clients show
-progress instead of a long silent gap.  Thinking blocks are
-preserved verbatim (with their signatures) when the turn
-continues with tool results, as the API requires; they are not
-included in the text you read back from `prompt`.
+In budget mode the API requires 1024 <= budget < max_tokens,
+because thinking tokens spend from the same per-round output
+budget as the visible answer (see the guillotine section
+above).  claude9fs enforces this when you write the setting:
+a budget below 1024 or at/above the session's `tokens` value
+is rejected with an error, as is a later `tokens` write that
+would sink below an active budget.  Nothing is silently
+clamped; what you set is what is sent.
+
+Thinking text streams to the `stream` file as it arrives,
+bracketed by `[thinking]` and `[/thinking]` markers, so
+interactive clients show progress instead of a long silent
+gap.  How much appears between the markers depends on the
+model: budget-mode models stream their (summarized) reasoning
+as text, but some adaptive models return no reasoning text at
+all -- only an opaque signature -- so the markers come back
+empty even though thinking happened.  The spent tokens are
+still visible in the `usage` file either way.
+
+Thinking blocks are preserved verbatim (with their
+signatures) when the turn continues with tool results, as the
+API requires; they are not included in the text you read back
+from `prompt`.
 
 Note that enabling thinking increases output-token usage: the
 thinking tokens are billed as output even though they are not
@@ -247,6 +326,11 @@ claude9fs checks the stop reason after each response; if it is
 message and sends another request, keeping the stream open so
 the reader sees seamless text.  This repeats up to *n* times or
 until the model stops on its own (e.g. `end_turn`).
+
+This works even when the cut lands mid tool call: the orphaned
+tool_use is answered with a `not executed` result (see the
+guillotine section), so the continuation request is accepted
+and the model simply reissues the tool call.
 
 	echo autocontinue > /mnt/claude/$n/ctl     # enable, default 3 rounds
 	echo autocontinue 5 > /mnt/claude/$n/ctl   # enable, up to 5 rounds
@@ -386,8 +470,8 @@ up (by reattaching without `-d` and quitting, or by writing
 
 	# Window 1: start a session, decide to keep it
 	% claudetalk
-	claude9 session 0 - claude-opus-4-6
-	claude-opus-4-6/16384> What files are in /sys/src/cmd?
+	claude9 session 0 - claude-opus-4-8
+	claude-opus-4-8/16384> What files are in /sys/src/cmd?
 	^D
 	...
 	/detach
@@ -396,19 +480,19 @@ up (by reattaching without `-d` and quitting, or by writing
 
 	# Window 2: pick up where we left off
 	% claudetalk -a 0
-	claude9 session 0 - claude-opus-4-6
-	claude-opus-4-6/16384> Now look at /sys/src/cmd/ls.c
+	claude9 session 0 - claude-opus-4-8
+	claude-opus-4-8/16384> Now look at /sys/src/cmd/ls.c
 	^D
 	...
 
 #### Example: list and manage sessions
 
 	% claudetalk -d
-	claude9 session 1 - claude-opus-4-6
+	claude9 session 1 - claude-opus-4-8
 	/sessions
 	sessions:
-	  0 claude-opus-4-6 (14 msgs)
-	  1 claude-opus-4-6 (0 msgs) *
+	  0 claude-opus-4-8 (14 msgs)
+	  1 claude-opus-4-8 (0 msgs) *
 
 The `*` marks the session you are currently attached to.
 

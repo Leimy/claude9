@@ -44,9 +44,7 @@ struct Session {
 	/* streaming */
 	QLock streamlk;
 	Rendez streamrz;
-	char *streambuf;
-	int streamlen;
-	int streamcap;
+	Sbuf stream;
 	int streamdone;
 	int streamgen;
 	int closed;	/* session destroyed; guarded by streamlk */
@@ -69,7 +67,7 @@ struct Faux {
 static Srv clsrv;
 
 static char *apikey;
-static char *defmodel = "claude-opus-4-6";
+static char *defmodel = "claude-opus-4-8";
 static int defmaxtokens = 16384;
 static char *defsysprompt = nil;
 static char *skillsdir = nil;
@@ -280,7 +278,7 @@ freesession(Session *s)
 	free(s->lasterror);
 	free(s->name);
 	free(s->usage.stop_reason);
-	free(s->streambuf);
+	free(s->stream.s);
 	free(s);
 }
 
@@ -321,18 +319,21 @@ delsession(int id)
 }
 
 /*
- * Streaming helpers.  Text deltas from claudeconverse
- * are appended to s->streambuf; blocked readers on Qstream are
- * woken via s->streamrz.  All state guarded by s->streamlk.
+ * Streaming helpers.  Text deltas from claudeconverse are
+ * appended to s->stream; blocked readers on Qstream are woken
+ * via s->streamrz.  All state guarded by s->streamlk.
+ *
+ * streamclear empties the buffer and bumps the generation;
+ * done says whether the session is idle or a round is starting.
  */
 static void
-streamreset(Session *s)
+streamclear(Session *s, int done)
 {
 	qlock(&s->streamlk);
-	s->streamlen = 0;
-	if(s->streambuf != nil)
-		s->streambuf[0] = '\0';
-	s->streamdone = 0;
+	s->stream.len = 0;
+	if(s->stream.s != nil)
+		s->stream.s[0] = '\0';
+	s->streamdone = done;
 	s->streamgen++;
 	rwakeupall(&s->streamrz);
 	qunlock(&s->streamlk);
@@ -341,18 +342,8 @@ streamreset(Session *s)
 static void
 streamappend(Session *s, char *data, int n)
 {
-	int need;
-
 	qlock(&s->streamlk);
-	need = s->streamlen + n + 1;
-	if(need > s->streamcap){
-		while(need > s->streamcap)
-			s->streamcap = s->streamcap ? s->streamcap * 2 : 4096;
-		s->streambuf = erealloc(s->streambuf, s->streamcap);
-	}
-	memmove(s->streambuf + s->streamlen, data, n);
-	s->streamlen += n;
-	s->streambuf[s->streamlen] = '\0';
+	sbappend(&s->stream, data, n);
 	rwakeupall(&s->streamrz);
 	qunlock(&s->streamlk);
 }
@@ -380,23 +371,57 @@ streamcb(char *chunk, void *aux)
 }
 
 /*
- * Session file table: maps file names to qid types and modes.
+ * Session file table: maps file names to qid types, modes,
+ * and I/O handlers.  rd returns the file's contents as a
+ * malloc'd string; wr applies a write and returns nil or an
+ * error string.  Both are called with s->lk held (and, for
+ * wr, s->busy already checked).  Files with rd == nil
+ * (stream) or that need to block or act outside the lock
+ * (prompt and ctl writes) are special-cased in fsread and
+ * fswrite.
  */
+static char* rdctl(Session*);
+static char* rdprompt(Session*);
+static char* rdconv(Session*);
+static char* rdmodel(Session*);
+static char* rdtokens(Session*);
+static char* rdthinking(Session*);
+static char* rdsystem(Session*);
+static char* rdusage(Session*);
+static char* rderror(Session*);
+static char* wrmodel(Session*, char*);
+static char* wrtokens(Session*, char*);
+static char* wrthinking(Session*, char*);
+static char* wrsystem(Session*, char*);
+
 static struct {
 	char *name;
 	int type;
 	int mode;
+	char* (*rd)(Session*);
+	char* (*wr)(Session*, char*);
 } sessfiles[] = {
-	{ "ctl",	Qctl,		0666 },
-	{ "prompt",	Qprompt,	0666 },
-	{ "conv",	Qconv,		0444 },
-	{ "model",	Qmodel,		0666 },
-	{ "tokens",	Qtokens,	0666 },
-	{ "system",	Qsystem,	0666 },
-	{ "usage",	Qusage,		0444 },
-	{ "error",	Qerror,		0444 },
-	{ "stream",	Qstream,	0444 },
-	{ "thinking",	Qthinking,	0666 },
+	{ "ctl",	Qctl,		0666,	rdctl,		nil },
+	{ "prompt",	Qprompt,	0666,	rdprompt,	nil },
+	{ "conv",	Qconv,		0444,	rdconv,		nil },
+	{ "model",	Qmodel,		0666,	rdmodel,	wrmodel },
+	{ "tokens",	Qtokens,	0666,	rdtokens,	wrtokens },
+	{ "system",	Qsystem,	0666,	rdsystem,	wrsystem },
+	{ "usage",	Qusage,		0444,	rdusage,	nil },
+	{ "error",	Qerror,		0444,	rderror,	nil },
+	{ "stream",	Qstream,	0444,	nil,		nil },
+	{ "thinking",	Qthinking,	0666,	rdthinking,	wrthinking },
+};
+
+/*
+ * Root file table, likewise shared by walk, stat, and dirread.
+ */
+static struct {
+	char *name;
+	int type;
+} rootfiles[] = {
+	{ "clone",	Qclone },
+	{ "models",	Qmodels },
 };
 
 static void
@@ -419,16 +444,12 @@ rootgen(int i, Dir *d, void *v)
 	int n;
 
 	USED(v);
-	if(i == 0){
-		filldir(d, (Qid){Qclone, 0, QTFILE}, "clone", 0444);
+	if(i < nelem(rootfiles)){
+		filldir(d, (Qid){rootfiles[i].type, 0, QTFILE},
+			rootfiles[i].name, 0444);
 		return 0;
 	}
-	i--;
-	if(i == 0){
-		filldir(d, (Qid){Qmodels, 0, QTFILE}, "models", 0444);
-		return 0;
-	}
-	i--;
+	i -= nelem(rootfiles);
 	qlock(&sessionlk);
 	n = 0;
 	for(s = sessions; s != nil; s = s->next){
@@ -476,7 +497,7 @@ convtext(Conv *c)
 }
 
 static char*
-usagetext(Session *s)
+rdusage(Session *s)
 {
 	return esmprint(
 		"input_tokens %d\n"
@@ -516,15 +537,23 @@ thinkingtext(Conv *c)
 }
 
 /*
- * Parse a write to the thinking file.  Called with s->lk held.
- * Returns nil on success or an error string.
+ * Parse a write to the thinking file.
+ *
+ * Budget mode enforces the API's invariant up front:
+ * 1024 <= budget < maxtokens.  Thinking tokens come out of
+ * the same max_tokens output budget as the visible reply, so
+ * a budget at or above maxtokens would leave no room for an
+ * answer (and the API rejects it).  buildreq passes the value
+ * through unchecked, so the invariant must hold here.
  */
 static char*
-setthinking(Conv *c, char *data)
+wrthinking(Session *s, char *data)
 {
+	Conv *c;
 	char *p;
 	int n;
 
+	c = s->conv;
 	while(*data == ' ' || *data == '\t')
 		data++;
 	if(strcmp(data, "off") == 0 || strcmp(data, "0") == 0){
@@ -547,40 +576,123 @@ setthinking(Conv *c, char *data)
 	}
 	if(data[0] >= '0' && data[0] <= '9'){
 		n = atoi(data);
-		if(n > 0){
-			c->thinkmode = Thinkbudget;
-			c->thinking = n;
-			free(c->effort);
-			c->effort = nil;
-			return nil;
-		}
+		if(n < 1024)
+			return "thinking budget must be at least 1024 tokens";
+		if(n >= c->maxtokens)
+			return "thinking budget must be less than max tokens (see tokens file)";
+		c->thinkmode = Thinkbudget;
+		c->thinking = n;
+		free(c->effort);
+		c->effort = nil;
+		return nil;
 	}
 	return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
 }
 
 static char*
-ctltext(Session *s)
+rdctl(Session *s)
 {
 	char *think, *text;
+	Msg *m;
+	long nmsg, nbytes;
 
+	nmsg = 0;
+	nbytes = 0;
+	for(m = s->conv->msgs; m != nil; m = m->next){
+		nmsg++;
+		nbytes += strlen(m->text);
+	}
 	think = thinkingtext(s->conv);
 	text = esmprint(
 		"name %s\n"
 		"model %s\n"
 		"tokens %d\n"
-		"messages %d\n"
+		"messages %ld\n"
 		"bytes %ld\n"
 		"autocontinue %d\n"
 		"thinking %s\n",
 		s->name,
 		s->conv->model,
 		s->conv->maxtokens,
-		convcount(s->conv),
-		convsize(s->conv),
+		nmsg,
+		nbytes,
 		s->autocont,
 		think);
 	free(think);
 	return text;
+}
+
+static char*
+rdprompt(Session *s)
+{
+	return estrdup(s->lastreply ? s->lastreply : "");
+}
+
+static char*
+rdconv(Session *s)
+{
+	return convtext(s->conv);
+}
+
+static char*
+rdmodel(Session *s)
+{
+	return estrdup(s->conv->model);
+}
+
+static char*
+rdtokens(Session *s)
+{
+	return esmprint("%d", s->conv->maxtokens);
+}
+
+static char*
+rdthinking(Session *s)
+{
+	return thinkingtext(s->conv);
+}
+
+static char*
+rdsystem(Session *s)
+{
+	return estrdup(s->conv->sysprompt ? s->conv->sysprompt : "");
+}
+
+static char*
+rderror(Session *s)
+{
+	return estrdup(s->lasterror ? s->lasterror : "");
+}
+
+static char*
+wrmodel(Session *s, char *data)
+{
+	free(s->conv->model);
+	s->conv->model = estrdup(data);
+	return nil;
+}
+
+static char*
+wrtokens(Session *s, char *data)
+{
+	int n;
+
+	n = atoi(data);
+	if(n <= 0)
+		return "invalid token count";
+	/* keep the thinking-budget invariant (see wrthinking) */
+	if(s->conv->thinkmode == Thinkbudget && n <= s->conv->thinking)
+		return "tokens must exceed thinking budget (see thinking file)";
+	s->conv->maxtokens = n;
+	return nil;
+}
+
+static char*
+wrsystem(Session *s, char *data)
+{
+	free(s->conv->sysprompt);
+	s->conv->sysprompt = estrdup(data);
+	return nil;
 }
 
 static void
@@ -602,13 +714,11 @@ fswalk1(Fid *fid, char *name, Qid *qid)
 	type = QTYPE(path);
 
 	if(path == Qroot){
-		if(strcmp(name, "clone") == 0){
-			*qid = (Qid){Qclone, 0, QTFILE};
-			return nil;
-		}
-		if(strcmp(name, "models") == 0){
-			*qid = (Qid){Qmodels, 0, QTFILE};
-			return nil;
+		for(i = 0; i < nelem(rootfiles); i++){
+			if(strcmp(name, rootfiles[i].name) == 0){
+				*qid = (Qid){rootfiles[i].type, 0, QTFILE};
+				return nil;
+			}
 		}
 		s = sessgetname(name);
 		if(s == nil)
@@ -651,15 +761,12 @@ fsstat(Req *r)
 		respond(r, nil);
 		return;
 	}
-	if(path == Qclone){
-		filldir(&r->d, (Qid){Qclone, 0, QTFILE}, "clone", 0444);
-		respond(r, nil);
-		return;
-	}
-	if(path == Qmodels){
-		filldir(&r->d, (Qid){Qmodels, 0, QTFILE}, "models", 0444);
-		respond(r, nil);
-		return;
+	for(i = 0; i < nelem(rootfiles); i++){
+		if(path == rootfiles[i].type){
+			filldir(&r->d, r->fid->qid, rootfiles[i].name, 0444);
+			respond(r, nil);
+			return;
+		}
 	}
 	if(type == Qsess){
 		s = sessget(sid);
@@ -694,28 +801,11 @@ fsstat(Req *r)
 static void
 modelstext(Req *r)
 {
-	ModelInfo *list;
-	int n, i;
 	char *buf;
-	Fmt f;
 
-	n = fetchmodels(apikey, &list);
-	if(n < 0){
-		readstr(r, "error fetching models\n");
-		respond(r, nil);
-		return;
-	}
-	fmtstrinit(&f);
-	for(i = 0; i < n; i++){
-		if(list[i].id != nil)
-			fmtprint(&f, "%s\n", list[i].id);
-	}
-	buf = fmtstrflush(&f);
-	for(i = 0; i < n; i++){
-		free(list[i].id);
-		free(list[i].display_name);
-	}
-	free(list);
+	buf = fetchmodels(apikey);
+	if(buf == nil)
+		buf = esmprint("error fetching models: %r\n");
 	readstr(r, buf);
 	free(buf);
 	respond(r, nil);
@@ -774,11 +864,11 @@ streamread(Req *r, Session *s, Faux *fa)
 			respond(r, nil);
 			return;
 		}
-		if(fa->streamoff < s->streamlen){
-			avail = s->streamlen - fa->streamoff;
+		if(fa->streamoff < s->stream.len){
+			avail = s->stream.len - fa->streamoff;
 			want = r->ifcall.count;
 			if(want > avail) want = avail;
-			memmove(r->ofcall.data, s->streambuf + fa->streamoff, want);
+			memmove(r->ofcall.data, s->stream.s + fa->streamoff, want);
 			r->ofcall.count = want;
 			fa->streamoff += want;
 			fa->curreq = nil;
@@ -869,9 +959,8 @@ static void
 fsread(Req *r)
 {
 	uvlong path;
-	int type, sid;
+	int type, sid, i;
 	Session *s;
-	char buf[64];
 	char *text;
 	Faux *fa;
 
@@ -879,11 +968,7 @@ fsread(Req *r)
 	type = QTYPE(path);
 	sid = QSID(path);
 
-	fa = r->fid->aux;
-	if(fa == nil){
-		fa = emallocz(sizeof *fa, 1);
-		r->fid->aux = fa;
-	}
+	fa = r->fid->aux;	/* always set by fsopen */
 
 	if(path == Qroot){
 		dirread9p(r, rootgen, nil);
@@ -919,79 +1004,28 @@ fsread(Req *r)
 		return;
 	}
 
-	switch(type){
-	case Qctl:
-		qlock(&s->lk);
-		text = ctltext(s);
-		qunlock(&s->lk);
-		readstr(r, text);
-		free(text);
-		respond(r, nil);
-		break;
-	case Qprompt:
-		qlock(&s->lk);
-		readstr(r, s->lastreply ? s->lastreply : "");
-		qunlock(&s->lk);
-		respond(r, nil);
-		break;
-	case Qconv:
-		qlock(&s->lk);
-		text = convtext(s->conv);
-		qunlock(&s->lk);
-		readstr(r, text);
-		free(text);
-		respond(r, nil);
-		break;
-	case Qmodel:
-		qlock(&s->lk);
-		readstr(r, s->conv->model);
-		qunlock(&s->lk);
-		respond(r, nil);
-		break;
-	case Qtokens:
-		qlock(&s->lk);
-		snprint(buf, sizeof buf, "%d", s->conv->maxtokens);
-		qunlock(&s->lk);
-		readstr(r, buf);
-		respond(r, nil);
-		break;
-	case Qthinking:
-		qlock(&s->lk);
-		text = thinkingtext(s->conv);
-		qunlock(&s->lk);
-		readstr(r, text);
-		free(text);
-		respond(r, nil);
-		break;
-	case Qsystem:
-		qlock(&s->lk);
-		readstr(r, s->conv->sysprompt ? s->conv->sysprompt : "");
-		qunlock(&s->lk);
-		respond(r, nil);
-		break;
-	case Qusage:
-		qlock(&s->lk);
-		text = usagetext(s);
-		qunlock(&s->lk);
-		readstr(r, text);
-		free(text);
-		respond(r, nil);
-		break;
-	case Qerror:
-		qlock(&s->lk);
-		readstr(r, s->lasterror ? s->lasterror : "");
-		qunlock(&s->lk);
-		respond(r, nil);
-		break;
-	case Qstream:
+	if(type == Qstream){
 		srvrelease(&clsrv);
 		streamread(r, s, fa);
 		srvacquire(&clsrv);
-		break;
-	default:
-		respond(r, "bug in fsread");
-		break;
+		sessput(s);
+		return;
 	}
+
+	for(i = 0; i < nelem(sessfiles); i++)
+		if(sessfiles[i].type == type && sessfiles[i].rd != nil)
+			break;
+	if(i == nelem(sessfiles)){
+		respond(r, "bug in fsread");
+		sessput(s);
+		return;
+	}
+	qlock(&s->lk);
+	text = sessfiles[i].rd(s);
+	qunlock(&s->lk);
+	readstr(r, text);
+	free(text);
+	respond(r, nil);
 	sessput(s);
 }
 
@@ -1002,33 +1036,17 @@ fsread(Req *r)
 static char*
 handlectl(Session *s, char *cmd, int *hangup)
 {
-	Msg *m, *next;
-
 	if(strcmp(cmd, "clear") == 0){
 		if(s->busy)
 			return "session busy";
-		for(m = s->conv->msgs; m != nil; m = next){
-			next = m->next;
-			free(m->text);
-			free(m->rawjson);
-			free(m);
-		}
-		s->conv->msgs = nil;
-		s->conv->tail = nil;
+		convclear(s->conv);
 		free(s->lastreply);
 		s->lastreply = nil;
 		free(s->lasterror);
 		s->lasterror = nil;
 		free(s->usage.stop_reason);
 		memset(&s->usage, 0, sizeof s->usage);
-		qlock(&s->streamlk);
-		s->streamlen = 0;
-		if(s->streambuf != nil)
-			s->streambuf[0] = '\0';
-		s->streamdone = 1;
-		s->streamgen++;
-		rwakeupall(&s->streamrz);
-		qunlock(&s->streamlk);
+		streamclear(s, 1);
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangup = 1;
 	} else if(strncmp(cmd, "autocontinue", 12) == 0){
@@ -1056,6 +1074,13 @@ handlectl(Session *s, char *cmd, int *hangup)
  * prompt write, clear, or model/system/tokens change can
  * touch s->conv while claudeconverse is walking it.
  *
+ * Round 0 answers the user's message; if a round was
+ * guillotined by max_tokens and auto-continue is enabled,
+ * "Continue." is sent up to autocont more times.  The stream
+ * stays open across continuations, so readers see seamless
+ * text.  A failed round stops the loop: continuing a broken
+ * round compounds the damage and hides the error.
+ *
  * Token usage accumulates in a local Usage and is published
  * to s->usage under s->lk only when the round ends, so other
  * fids can read the usage file at any time without racing the
@@ -1065,9 +1090,10 @@ handlectl(Session *s, char *cmd, int *hangup)
 static void
 doprompt(Req *r, Session *s, char *data)
 {
-	char *reply, *contreply, *err, *conterr;
-	int autocont, contround;
+	char *reply, *err;
+	int autocont, round, ok;
 	Usage u;
+	Fmt f;
 
 	qlock(&s->lk);
 	if(s->busy){
@@ -1079,76 +1105,50 @@ doprompt(Req *r, Session *s, char *data)
 	s->busy = 1;
 	free(s->lasterror);
 	s->lasterror = nil;
-	convappend(s->conv, msgnew(Muser, data));
+	convappend(s->conv, msgnew(Muser, data, nil));
 	free(data);
 	autocont = s->autocont;
 	qunlock(&s->lk);
 
 	memset(&u, 0, sizeof u);
+	streamclear(s, 0);
+	fmtstrinit(&f);
+	ok = 0;
+	err = nil;
 
-	streamreset(s);
-
-	reply = claudeconverse(s->conv, &u,
-		streamcb, s, &err);
+	for(round = 0; ; round++){
+		reply = claudeconverse(s->conv, &u, streamcb, s, &err);
+		if(reply != nil){
+			fmtprint(&f, "%s%s", round ? "\n" : "", reply);
+			free(reply);
+			ok = 1;
+		}
+		if(reply == nil || err != nil || round >= autocont)
+			break;
+		if(u.stop_reason == nil || strcmp(u.stop_reason, "max_tokens") != 0)
+			break;
+		qlock(&s->lk);
+		convappend(s->conv, msgnew(Muser, "Continue.", nil));
+		qunlock(&s->lk);
+		free(u.stop_reason);
+		u.stop_reason = nil;
+	}
 
 	streamfinish(s);
-
-	/*
-	 * Auto-continue: if Claude hit max_tokens and
-	 * autocontinue is enabled, send "Continue." messages
-	 * to keep going.  Skipped when the round already failed
-	 * (err set): continuing a broken round compounds the
-	 * damage and hides the error.
-	 */
-	if(reply != nil && err == nil && autocont > 0){
-		for(contround = 0; contround < autocont; contround++){
-			if(u.stop_reason == nil
-			|| strcmp(u.stop_reason, "max_tokens") != 0)
-				break;
-
-			qlock(&s->lk);
-			convappend(s->conv, msgnew(Muser, "Continue."));
-			qunlock(&s->lk);
-
-			free(u.stop_reason);
-			u.stop_reason = nil;
-
-			qlock(&s->streamlk);
-			s->streamdone = 0;
-			qunlock(&s->streamlk);
-
-			contreply = claudeconverse(s->conv,
-				&u, streamcb, s, &conterr);
-
-			streamfinish(s);
-
-			if(contreply != nil){
-				reply = erealloc(reply,
-					strlen(reply) + strlen(contreply) + 2);
-				strcat(reply, "\n");
-				strcat(reply, contreply);
-				free(contreply);
-			}
-			if(conterr != nil){
-				err = conterr;
-				break;
-			}
-			if(contreply == nil)
-				break;
-		}
-	}
+	reply = fmtstrflush(&f);
 
 	qlock(&s->lk);
 	s->busy = 0;
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
-	if(reply == nil){
+	if(!ok){
 		char errbuf[256];
 		if(err != nil)
 			snprint(errbuf, sizeof errbuf, "%s", err);
 		else
 			rerrstr(errbuf, sizeof errbuf);
 		free(err);
+		free(reply);
 		s->lasterror = estrdup(errbuf);
 		free(s->lastreply);
 		s->lastreply = nil;
@@ -1169,8 +1169,7 @@ doprompt(Req *r, Session *s, char *data)
 		s->lasterror = err;	/* ownership moves */
 
 	free(s->lastreply);
-	s->lastreply = estrdup(reply);
-	free(reply);
+	s->lastreply = reply;
 	qunlock(&s->lk);
 	r->ofcall.count = r->ifcall.count;
 	respond(r, nil);
@@ -1180,8 +1179,7 @@ static void
 fswrite(Req *r)
 {
 	uvlong path;
-	int type, sid;
-	int hangup, n;
+	int type, sid, hangup, i;
 	Session *s;
 	char *data, *err;
 	long count;
@@ -1232,7 +1230,16 @@ fswrite(Req *r)
 		respond(r, nil);
 		break;
 
-	case Qmodel:
+	default:
+		/* settings files: dispatch through the table */
+		for(i = 0; i < nelem(sessfiles); i++)
+			if(sessfiles[i].type == type && sessfiles[i].wr != nil)
+				break;
+		if(i == nelem(sessfiles)){
+			free(data);
+			respond(r, "permission denied");
+			break;
+		}
 		qlock(&s->lk);
 		if(s->busy){
 			qunlock(&s->lk);
@@ -1240,47 +1247,7 @@ fswrite(Req *r)
 			respond(r, "session busy");
 			break;
 		}
-		free(s->conv->model);
-		s->conv->model = data;
-		qunlock(&s->lk);
-		r->ofcall.count = r->ifcall.count;
-		respond(r, nil);
-		break;
-
-	case Qtokens:
-		n = atoi(data);
-		free(data);
-		if(n <= 0){
-			respond(r, "invalid token count");
-			break;
-		}
-		qlock(&s->lk);
-		if(s->busy){
-			qunlock(&s->lk);
-			respond(r, "session busy");
-			break;
-		}
-		s->conv->maxtokens = n;
-		qunlock(&s->lk);
-		r->ofcall.count = r->ifcall.count;
-		respond(r, nil);
-		break;
-
-	case Qthinking:
-		/*
-		 * "0"/"off" disables; a number sets budget mode
-		 * (thinking.type=enabled, for opus-family models);
-		 * "adaptive [effort]" sets adaptive mode (for
-		 * fable-family models, which reject type=enabled).
-		 */
-		qlock(&s->lk);
-		if(s->busy){
-			qunlock(&s->lk);
-			free(data);
-			respond(r, "session busy");
-			break;
-		}
-		err = setthinking(s->conv, data);
+		err = sessfiles[i].wr(s, data);
 		qunlock(&s->lk);
 		free(data);
 		if(err != nil){
@@ -1289,26 +1256,6 @@ fswrite(Req *r)
 		}
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
-		break;
-
-	case Qsystem:
-		qlock(&s->lk);
-		if(s->busy){
-			qunlock(&s->lk);
-			free(data);
-			respond(r, "session busy");
-			break;
-		}
-		free(s->conv->sysprompt);
-		s->conv->sysprompt = data;
-		qunlock(&s->lk);
-		r->ofcall.count = r->ifcall.count;
-		respond(r, nil);
-		break;
-
-	default:
-		free(data);
-		respond(r, "permission denied");
 		break;
 	}
 	sessput(s);

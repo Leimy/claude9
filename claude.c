@@ -69,37 +69,72 @@ esmprint(char *fmt, ...)
 	return p;
 }
 
+enum {
+	Acreate,	/* tool types */
+	Areplace,
+	Aread,
+	Alist,
+	Adelete,
+	Amanpage,
+	Amk,
+
+	Maxargs = 3,	/* max parameters per tool */
+};
+
+/* tool call from Claude */
+typedef struct ToolCall ToolCall;
+struct ToolCall {
+	char *id;		/* tool_use_id */
+	char *name;		/* tool name for display */
+	int type;		/* Acreate, ...; -1 = unknown tool */
+	char *args[Maxargs];	/* values in Tooldef param order; args[0] is the path */
+	char *result;		/* result text after execution */
+	ToolCall *next;
+};
+
+/*
+ * Reply assembled from a single API round: text, tool_use
+ * blocks, and a raw JSON snapshot of the assistant's content
+ * array suitable for appending back into a follow-up request.
+ */
+typedef struct Reply Reply;
+struct Reply {
+	char *text;		/* concatenated text blocks */
+	char *rawjson;		/* raw JSON content array string */
+	ToolCall *tools;	/* linked list of tool calls */
+	int stopped;		/* 1 unless stop_reason was tool_use */
+};
+
 /*
  * Single source of truth for the tools we expose to Claude.
  *
- * Most tools take a "path" parameter plus an optional body
- * string (bodyparam/bodydesc).  replace_string is special:
- * it has old_str and new_str parameters, handled via custom
- * code in mktools() and parseinput().  findtool() maps API
- * names to the Acreate/Areplace/... enum.
+ * Each tool takes up to Maxargs string parameters, all
+ * required; params[0] is always the path.  The same table
+ * drives the JSON schema (mktools) and argument extraction
+ * (parseinput); ToolCall.args holds the values in params
+ * order.  findtool() maps API names to the Acreate/... enum.
  */
+typedef struct Toolparam Toolparam;
+struct Toolparam {
+	char *name;
+	char *desc;
+};
+
 typedef struct Tooldef Tooldef;
 struct Tooldef {
 	int type;
 	char *name;
 	char *desc;
-	char *pathdesc;
-	char *bodyparam;	/* nil for path-only tools */
-	char *bodydesc;
+	Toolparam params[Maxargs];	/* nil name terminates */
 };
 
 static Tooldef tools[] = {
 	{ Acreate, "create_file",
 		"Create or overwrite a file with the given contents. "
 		"Parent directories are created automatically.",
-		"File path to create",
-		"contents", "Complete file contents" },
+		{{ "path", "File path to create" },
+		 { "contents", "Complete file contents" }}},
 
-	/*
-	 * replace_string has a custom schema (old_str, new_str)
-	 * built by mktools(); bodyparam is nil because parseinput()
-	 * handles it specially.
-	 */
 	{ Areplace, "replace_string",
 		"Replace the first exact match of old_str with new_str "
 		"in a file.  The old_str must match exactly one location "
@@ -110,24 +145,23 @@ static Tooldef tools[] = {
 		"To delete text, set new_str to the empty string.  "
 		"The file must already exist.  "
 		"Returns a summary of the replacement on success.",
-		"File path to edit",
-		nil, nil },
+		{{ "path", "File path to edit" },
+		 { "old_str", "The exact text to search for in the file. "
+			"Must match exactly once." },
+		 { "new_str", "The replacement text. Use empty string to delete." }}},
 
 	{ Adelete, "delete_file",
 		"Delete a file.",
-		"File path to delete",
-		nil, nil },
+		{{ "path", "File path to delete" }}},
 
 	{ Aread, "read_file",
 		"Read the contents of a file and return them.",
-		"File path to read",
-		nil, nil },
+		{{ "path", "File path to read" }}},
 
 	{ Alist, "list_directory",
 		"List the contents of a directory. "
 		"Returns one entry per line.",
-		"Directory path to list",
-		nil, nil },
+		{{ "path", "Directory path to list" }}},
 
 	{ Amanpage, "read_man_page",
 		"Read a Plan 9 manual page. Returns the formatted man page "
@@ -136,9 +170,8 @@ static Tooldef tools[] = {
 		"numbers: 1 commands, 2 syscalls, 3 C library, 4 file "
 		"formats, 5 filesystems, 6 games/misc, 7 databases, "
 		"8 admin. If no section is given, man searches all sections.",
-		"Man page query: page name, optionally preceded by section "
-		"(e.g. \"open\", \"2 open\", \"rio\")",
-		nil, nil },
+		{{ "path", "Man page query: page name, optionally preceded by "
+			"section (e.g. \"open\", \"2 open\", \"rio\")" }}},
 
 	{ Amk, "mk",
 		"Run mk(1) in a working directory and return the combined "
@@ -151,8 +184,8 @@ static Tooldef tools[] = {
 		"targets and/or arguments (e.g. \"\", \"clean\", "
 		"\"clean all\"); empty means the default "
 		"target.  Output is truncated if it grows very large.",
-		"Directory to run mk in (empty for current directory)",
-		"targets", "Space-separated mk targets/args, or empty for the default target" },
+		{{ "path", "Directory to run mk in (empty for current directory)" },
+		 { "targets", "Space-separated mk targets/args, or empty for the default target" }}},
 };
 
 static Tooldef*
@@ -169,31 +202,25 @@ findtool(char *name)
 }
 
 /*
- * Pull parameters out of a tool_use block's "input" object.
- * For most tools: path + optional body string.
- * For replace_string: path + old_str + new_str.
+ * Pull parameters out of a tool_use block's "input" object,
+ * in Tooldef param order.  Missing parameters (and all
+ * parameters of an unknown tool, td == nil) become "".
  */
 static void
 parseinput(ToolCall *tc, Tooldef *td, Json *input)
 {
 	char *s;
+	int i;
 
-	s = jstr(input, "path");
-	tc->path = estrdup(s ? s : "");
-	if(td->type == Areplace){
-		s = jstr(input, "old_str");
-		tc->oldstr = estrdup(s ? s : "");
-		s = jstr(input, "new_str");
-		tc->newstr = estrdup(s ? s : "");
-	} else if(td->bodyparam != nil){
-		s = jstr(input, td->bodyparam);
-		tc->body = estrdup(s ? s : "");
-	} else {
-		tc->body = estrdup("");
+	for(i = 0; i < Maxargs; i++){
+		s = nil;
+		if(td != nil && td->params[i].name != nil)
+			s = jstr(input, td->params[i].name);
+		tc->args[i] = estrdup(s ? s : "");
 	}
 }
 
-void
+static void
 mkparents(char *path)
 {
 	char *buf, *p;
@@ -218,20 +245,22 @@ char*
 readfile(int fd)
 {
 	char *buf;
-	vlong len;
-	long n;
+	long n, len, cap;
 
-	buf = emalloc(8192);
+	cap = 8192;
+	buf = emalloc(cap);
 	len = 0;
-	while((n = read(fd, buf + len, 8192)) > 0){
+	while((n = read(fd, buf + len, cap - len - 1)) > 0){
 		len += n;
-		buf = erealloc(buf, len + 8192);
+		if(len >= cap - 1){
+			cap *= 2;
+			buf = erealloc(buf, cap);
+		}
 	}
 	if(n < 0){
 		free(buf);
 		return nil;
 	}
-	buf = erealloc(buf, len + 1);
 	buf[len] = '\0';
 	return buf;
 }
@@ -278,19 +307,31 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 	return c;
 }
 
+/*
+ * Free all messages, leaving the conversation empty but
+ * otherwise configured (model, tokens, thinking, system).
+ */
 void
-convfree(Conv *c)
+convclear(Conv *c)
 {
 	Msg *m, *next;
 
-	if(c == nil)
-		return;
 	for(m = c->msgs; m != nil; m = next){
 		next = m->next;
 		free(m->text);
 		free(m->rawjson);
 		free(m);
 	}
+	c->msgs = nil;
+	c->tail = nil;
+}
+
+void
+convfree(Conv *c)
+{
+	if(c == nil)
+		return;
+	convclear(c);
 	free(c->apikey);
 	free(c->model);
 	free(c->effort);
@@ -298,47 +339,14 @@ convfree(Conv *c)
 	free(c);
 }
 
-int
-convcount(Conv *c)
-{
-	Msg *m;
-	int n;
-
-	n = 0;
-	for(m = c->msgs; m != nil; m = m->next)
-		n++;
-	return n;
-}
-
-long
-convsize(Conv *c)
-{
-	Msg *m;
-	long sz;
-
-	sz = 0;
-	for(m = c->msgs; m != nil; m = m->next)
-		sz += strlen(m->text);
-	return sz;
-}
-
 Msg*
-msgnew(int role, char *text)
+msgnew(int role, char *text, char *rawjson)
 {
 	Msg *m;
 
 	m = emallocz(sizeof *m, 1);
 	m->role = role;
 	m->text = estrdup(text);
-	return m;
-}
-
-Msg*
-msgnewraw(int role, char *text, char *rawjson)
-{
-	Msg *m;
-
-	m = msgnew(role, text);
 	if(rawjson != nil)
 		m->rawjson = estrdup(rawjson);
 	return m;
@@ -364,6 +372,7 @@ mktools(void)
 {
 	Json *arr, *t, *input, *props, *p, *req, *cc;
 	Tooldef *td;
+	Toolparam *tp;
 	int i;
 
 	arr = jarray();
@@ -378,38 +387,13 @@ mktools(void)
 		jset(input, "type", jstring("object"));
 
 		props = jobject();
-		p = jobject();
-		jset(p, "type", jstring("string"));
-		jset(p, "description", jstring(td->pathdesc));
-		jset(props, "path", p);
-
 		req = jarray();
-		jappend(req, jstring("path"));
-
-		/* replace_string has a custom schema */
-		if(td->type == Areplace){
+		for(tp = td->params; tp < td->params + Maxargs && tp->name != nil; tp++){
 			p = jobject();
 			jset(p, "type", jstring("string"));
-			jset(p, "description", jstring(
-				"The exact text to search for in the file. "
-				"Must match exactly once."));
-			jset(props, "old_str", p);
-			jappend(req, jstring("old_str"));
-
-			p = jobject();
-			jset(p, "type", jstring("string"));
-			jset(p, "description", jstring(
-				"The replacement text. Use empty string to delete."));
-			jset(props, "new_str", p);
-			jappend(req, jstring("new_str"));
-		}
-
-		if(td->bodyparam != nil){
-			p = jobject();
-			jset(p, "type", jstring("string"));
-			jset(p, "description", jstring(td->bodydesc));
-			jset(props, td->bodyparam, p);
-			jappend(req, jstring(td->bodyparam));
+			jset(p, "description", jstring(tp->desc));
+			jset(props, tp->name, p);
+			jappend(req, jstring(tp->name));
 		}
 
 		jset(input, "properties", props);
@@ -460,8 +444,9 @@ buildreq(Conv *c)
 	 *
 	 * Thinkbudget (opus/sonnet/haiku families):
 	 *   thinking: {type: "enabled", budget_tokens: N}
-	 * budget_tokens must be < max_tokens; clamp rather than
-	 * let the API reject the request.
+	 * Whoever sets Conv.thinking enforces the API's invariant
+	 * 1024 <= budget < maxtokens (see wrthinking in claude9fs.c),
+	 * so the value is passed through as-is.
 	 *
 	 * Thinkadaptive (fable family):
 	 *   thinking: {type: "adaptive"}
@@ -470,20 +455,11 @@ buildreq(Conv *c)
 	 */
 	if(c->thinkmode == Thinkbudget && c->thinking > 0){
 		Json *think;
-		int budget;
 
-		budget = c->thinking;
-		if(budget < 1024)
-			budget = 1024;
-		if(budget >= c->maxtokens)
-			budget = c->maxtokens / 2;
 		think = jobject();
-		if(budget >= 1024){
-			jset(think, "type", jstring("enabled"));
-			jset(think, "budget_tokens", jintval(budget));
-			jset(req, "thinking", think);
-		} else
-			jsonfree(think);
+		jset(think, "type", jstring("enabled"));
+		jset(think, "budget_tokens", jintval(c->thinking));
+		jset(req, "thinking", think);
 	} else if(c->thinkmode == Thinkadaptive){
 		Json *think, *oc;
 
@@ -573,171 +549,128 @@ writeall(int fd, char *buf, long len)
 	return 0;
 }
 
-typedef struct Webreq Webreq;
-struct Webreq {
-	char *url;
-	char *apikey;
-	int post;
-	int ctype;
-	int stream;
-};
+/*
+ * Opening the response body failed: pull the HTTP error body
+ * from webfs, which for the Anthropic API is JSON with a
+ * detailed message, and put it in errstr.
+ */
+static void
+weberror(char *webdir)
+{
+	char *path, *ebody, *emsg;
+	Json *ej;
+	int fd;
 
+	path = esmprint("%s/errorbody", webdir);
+	fd = open(path, OREAD);
+	free(path);
+	if(fd < 0)
+		return;	/* keep errstr from the failed body open */
+	ebody = readfile(fd);
+	close(fd);
+	if(ebody == nil)
+		return;
+	ej = jsonparse(ebody);
+	emsg = jstr(jget(ej, "error"), "message");
+	if(emsg != nil)
+		werrstr("API error: %s", emsg);
+	else
+		werrstr("API error: %.256s", ebody);
+	jsonfree(ej);
+	free(ebody);
+}
+
+/*
+ * Perform an HTTP request to the Anthropic API through webfs.
+ * postbody nil means GET.  On success returns an open fd for
+ * the response body and stores the connection fd in *clonefdp
+ * (caller closes both); on error returns -1 with errstr set.
+ */
 static int
-webopen(Webreq *w, char **webdirp)
+webhttp(char *apikey, char *url, char *postbody, int stream, int *clonefdp)
 {
 	int clonefd, fd, n;
-	char buf[256];
-	char *webdir, *ctl;
+	char buf[256], *webdir, *path;
 
 	clonefd = open("/mnt/web/clone", ORDWR);
-	if(clonefd < 0){
-		werrstr("open /mnt/web/clone: %r");
+	if(clonefd < 0)
 		return -1;
-	}
-
 	n = read(clonefd, buf, sizeof buf - 1);
 	if(n <= 0){
+		werrstr("read web clone: %r");
 		close(clonefd);
-		werrstr("read clone: %r");
 		return -1;
 	}
 	buf[n] = '\0';
 	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
 		buf[--n] = '\0';
-
 	webdir = esmprint("/mnt/web/%s", buf);
 
-	ctl = esmprint("%s/ctl", webdir);
-	fd = open(ctl, OWRITE);
-	free(ctl);
-	if(fd < 0){
-		close(clonefd);
-		free(webdir);
-		werrstr("open ctl: %r");
-		return -1;
-	}
-
-	if(fprint(fd, "url %s\n", w->url) < 0
-	|| fprint(fd, "request %s\n", w->post ? "POST" : "GET") < 0
-	|| (w->ctype && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
-	|| (w->stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
-	|| fprint(fd, "headers x-api-key: %s\r\n", w->apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
-		close(fd);
-		close(clonefd);
-		free(webdir);
-		werrstr("write ctl: %r");
-		return -1;
-	}
-	close(fd);
-
-	*webdirp = webdir;
-	return clonefd;
-}
-
-static int
-websend(Conv *c, char *body, int stream, int *clonefdp)
-{
-	int clonefd, fd;
-	char *webdir, *path;
-	Webreq w;
-
-	memset(&w, 0, sizeof w);
-	w.url = apiurl;
-	w.apikey = c->apikey;
-	w.post = 1;
-	w.ctype = 1;
-	w.stream = stream;
-
-	clonefd = webopen(&w, &webdir);
-	if(clonefd < 0)
-		return -1;
-
-	path = esmprint("%s/postbody", webdir);
+	path = esmprint("%s/ctl", webdir);
 	fd = open(path, OWRITE);
 	free(path);
-	if(fd < 0){
-		close(clonefd);
-		free(webdir);
-		werrstr("open postbody: %r");
-		return -1;
-	}
-	if(writeall(fd, body, strlen(body)) < 0){
+	if(fd < 0)
+		goto err;
+	if(fprint(fd, "url %s\n", url) < 0
+	|| fprint(fd, "request %s\n", postbody ? "POST" : "GET") < 0
+	|| (postbody && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
+	|| (stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
+	|| fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
 		close(fd);
-		close(clonefd);
-		free(webdir);
-		werrstr("write postbody: %r");
-		return -1;
+		goto err;
 	}
 	close(fd);
+
+	if(postbody != nil){
+		path = esmprint("%s/postbody", webdir);
+		fd = open(path, OWRITE);
+		free(path);
+		if(fd < 0)
+			goto err;
+		if(writeall(fd, postbody, strlen(postbody)) < 0){
+			close(fd);
+			goto err;
+		}
+		close(fd);
+	}
 
 	path = esmprint("%s/body", webdir);
 	fd = open(path, OREAD);
 	free(path);
 	if(fd < 0){
-		char *ebody, *emsg;
-		int efd;
-
-		/*
-		 * HTTP error.  Read the errorbody file from webfs
-		 * to get the server's response, which for the
-		 * Anthropic API is JSON with a detailed message.
-		 */
-		path = esmprint("%s/errorbody", webdir);
-		efd = open(path, OREAD);
-		free(path);
-		free(webdir);
-		if(efd >= 0){
-			ebody = readfile(efd);
-			close(efd);
-		} else
-			ebody = nil;
-		if(ebody != nil){
-			Json *ej, *eo;
-			ej = jsonparse(ebody);
-			emsg = nil;
-			if(ej != nil){
-				eo = jget(ej, "error");
-				if(eo != nil)
-					emsg = jstr(eo, "message");
-			}
-			if(emsg != nil)
-				werrstr("API error: %s", emsg);
-			else
-				werrstr("API error: %s", ebody);
-			jsonfree(ej);
-			free(ebody);
-		} else
-			werrstr("open body: %r");
-		close(clonefd);
-		return -1;
+		weberror(webdir);
+		goto err;
 	}
 	free(webdir);
-
 	*clonefdp = clonefd;
 	return fd;
+
+err:
+	free(webdir);
+	close(clonefd);
+	return -1;
 }
 
-void
+static void
 toolfree(ToolCall *t)
 {
 	ToolCall *next;
+	int i;
 
 	while(t != nil){
 		next = t->next;
 		free(t->id);
 		free(t->name);
-		free(t->path);
-		free(t->body);
-		free(t->oldstr);
-		free(t->newstr);
+		for(i = 0; i < Maxargs; i++)
+			free(t->args[i]);
 		free(t->result);
 		free(t);
 		t = next;
 	}
 }
 
-void
+static void
 replyfree(Reply *r)
 {
 	if(r == nil)
@@ -784,63 +717,77 @@ toollist(char *path)
 	return fmtstrflush(&f);
 }
 
+/*
+ * Run a command with stdout and stderr captured through a
+ * pipe, optionally chdir'd to dir first.  Returns the combined
+ * output (caller frees) or nil with errstr set.
+ */
+static char*
+runcmd(char *dir, char *cmd, char **argv)
+{
+	int pfd[2];
+	char *data;
+
+	if(pipe(pfd) < 0)
+		return nil;
+	switch(fork()){
+	case -1:
+		close(pfd[0]);
+		close(pfd[1]);
+		return nil;
+	case 0:
+		close(pfd[0]);
+		dup(pfd[1], 1);
+		dup(pfd[1], 2);
+		close(pfd[1]);
+		if(dir != nil && dir[0] != '\0' && chdir(dir) < 0){
+			fprint(2, "chdir %s: %r\n", dir);
+			exits("chdir");
+		}
+		exec(cmd, argv);
+		fprint(2, "exec %s: %r\n", cmd);
+		exits("exec");
+	}
+	close(pfd[1]);
+	data = readfile(pfd[0]);
+	close(pfd[0]);
+	waitpid();
+	return data;
+}
+
 static char*
 toolman(char *query)
 {
-	int pfd[2];
-	char *data, *argv[8];
+	char *argv[4], *data, *q, *page, qbuf[256];
 	int argc;
-	char *q, *section, *page;
-	char qbuf[256];
 
 	if(query == nil || query[0] == '\0')
 		return esmprint("error: empty man page query");
 
 	snprint(qbuf, sizeof qbuf, "%s", query);
 	q = qbuf;
-	while(*q == ' ') q++;
+	while(*q == ' ')
+		q++;
 
-	section = nil;
-	page = q;
-
+	argc = 0;
+	argv[argc++] = "man";
 	if(q[0] >= '1' && q[0] <= '9' && (q[1] == ' ' || q[1] == '\t')){
-		section = q;
+		argv[argc++] = q;	/* section */
 		q[1] = '\0';
 		page = q + 2;
-		while(*page == ' ' || *page == '\t') page++;
+		while(*page == ' ' || *page == '\t')
+			page++;
 		if(*page == '\0')
-			return esmprint("error: missing page name after section %s", section);
-	}
-
-	if(pipe(pfd) < 0)
-		return esmprint("error: pipe: %r");
-
-	switch(fork()){
-	case -1:
-		close(pfd[0]);
-		close(pfd[1]);
-		return esmprint("error: fork: %r");
-	case 0:
-		close(pfd[0]);
-		dup(pfd[1], 1);
-		dup(pfd[1], 2);
-		close(pfd[1]);
-		argc = 0;
-		argv[argc++] = "man";
-		if(section != nil)
-			argv[argc++] = section;
+			return esmprint("error: missing page name after section %s", q);
 		argv[argc++] = page;
-		argv[argc] = nil;
-		exec("/bin/man", argv);
-		exits("exec man failed");
-	}
-	close(pfd[1]);
+	} else
+		argv[argc++] = q;
+	argv[argc] = nil;
 
-	data = readfile(pfd[0]);
-	close(pfd[0]);
-	waitpid();
-
-	if(data == nil || data[0] == '\0'){
+	data = runcmd(nil, "/bin/man", argv);
+	if(data == nil)
+		return esmprint("error: man: %r");
+	if(data[0] == '\0'){
 		free(data);
 		return esmprint("error: no man page found for '%s'", query);
 	}
@@ -855,80 +802,44 @@ enum {
 static char*
 toolmk(char *dir, char *args)
 {
-	int pfd[2];
-	char *data, *argv[Mkmaxargs], *buf, *p, *out;
-	int argc, outlen;
+	char *argv[Mkmaxargs], *buf, *p, *data, *out;
+	int argc, n;
 
-	if(args == nil)
-		args = "";
+	if(dir == nil || dir[0] == '\0')
+		dir = ".";
+	buf = estrdup(args ? args : "");
 
-	if(pipe(pfd) < 0)
-		return esmprint("error: pipe: %r");
-
-	buf = estrdup(args);
-
-	switch(fork()){
-	case -1:
-		close(pfd[0]);
-		close(pfd[1]);
-		free(buf);
-		return esmprint("error: fork: %r");
-	case 0:
-		close(pfd[0]);
-		dup(pfd[1], 1);
-		dup(pfd[1], 2);
-		close(pfd[1]);
-
-		if(dir != nil && dir[0] != '\0'){
-			if(chdir(dir) < 0){
-				fprint(2, "chdir %s: %r\n", dir);
-				exits("chdir");
-			}
-		}
-
-		argc = 0;
-		argv[argc++] = "mk";
-		p = buf;
-		while(argc < Mkmaxargs - 1){
-			while(*p == ' ' || *p == '\t' || *p == '\n')
-				p++;
-			if(*p == '\0')
-				break;
-			argv[argc++] = p;
-			while(*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n')
-				p++;
-			if(*p == '\0')
-				break;
+	argc = 0;
+	argv[argc++] = "mk";
+	for(p = buf; argc < Mkmaxargs - 1; ){
+		while(*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if(*p == '\0')
+			break;
+		argv[argc++] = p;
+		while(*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n')
+			p++;
+		if(*p != '\0')
 			*p++ = '\0';
-		}
-		argv[argc] = nil;
-		exec("/bin/mk", argv);
-		fprint(2, "exec mk: %r\n");
-		exits("exec mk failed");
 	}
-	close(pfd[1]);
+	argv[argc] = nil;
+
+	data = runcmd(dir, "/bin/mk", argv);
 	free(buf);
-
-	data = readfile(pfd[0]);
-	close(pfd[0]);
-	waitpid();
-
 	if(data == nil)
-		return esmprint("mk (in %s): no output, error reading: %r",
-			dir != nil && dir[0] ? dir : ".");
+		return esmprint("error: mk in %s: %r", dir);
 
-	outlen = strlen(data);
-	if(outlen > Mkmaxout){
-		out = esmprint("mk (in %s): output truncated to %d of %d bytes\n%.*s\n[... truncated ...]\n",
-			dir != nil && dir[0] ? dir : ".",
-			Mkmaxout, outlen, Mkmaxout, data);
+	n = strlen(data);
+	if(n > Mkmaxout){
+		out = esmprint("mk (in %s): output truncated to %d of %d bytes\n"
+			"%.*s\n[... truncated ...]\n",
+			dir, Mkmaxout, n, Mkmaxout, data);
 		free(data);
 		return out;
 	}
-	if(outlen == 0){
+	if(n == 0){
 		free(data);
-		return esmprint("mk (in %s): ok (no output)",
-			dir != nil && dir[0] ? dir : ".");
+		return esmprint("mk (in %s): ok (no output)", dir);
 	}
 	return data;
 }
@@ -1020,45 +931,48 @@ toolreplace(char *path, char *oldstr, char *newstr)
 
 /*
  * Execute a tool call. Returns result string (caller frees).
+ * args[] is in Tooldef param order: args[0] is the path.
  */
 static char*
 exectool(ToolCall *tc)
 {
+	char *path;
 	int fd;
 
+	path = tc->args[0];
 	switch(tc->type){
 	case Acreate:
-		mkparents(tc->path);
-		fd = create(tc->path, OWRITE, 0666);
+		mkparents(path);
+		fd = create(path, OWRITE, 0666);
 		if(fd < 0)
-			return esmprint("error: create %s: %r", tc->path);
-		if(writeall(fd, tc->body, strlen(tc->body)) < 0){
+			return esmprint("error: create %s: %r", path);
+		if(writeall(fd, tc->args[1], strlen(tc->args[1])) < 0){
 			close(fd);
-			return esmprint("error: write %s: %r", tc->path);
+			return esmprint("error: write %s: %r", path);
 		}
 		close(fd);
 		return esmprint("created %s (%d bytes)",
-			tc->path, (int)strlen(tc->body));
+			path, (int)strlen(tc->args[1]));
 
 	case Areplace:
-		return toolreplace(tc->path, tc->oldstr, tc->newstr);
+		return toolreplace(path, tc->args[1], tc->args[2]);
 
 	case Adelete:
-		if(remove(tc->path) < 0)
-			return esmprint("error: remove %s: %r", tc->path);
-		return esmprint("deleted %s", tc->path);
+		if(remove(path) < 0)
+			return esmprint("error: remove %s: %r", path);
+		return esmprint("deleted %s", path);
 
 	case Aread:
-		return toolread(tc->path);
+		return toolread(path);
 
 	case Alist:
-		return toollist(tc->path);
+		return toollist(path);
 
 	case Amanpage:
-		return toolman(tc->path);
+		return toolman(path);
 
 	case Amk:
-		return toolmk(tc->path, tc->body);
+		return toolmk(path, tc->args[1]);
 	}
 
 	return esmprint("error: unknown tool '%s'",
@@ -1100,41 +1014,33 @@ typedef struct Sblock Sblock;
 struct Sblock {
 	int istool;
 	int isthinking;
-	char *text;
-	int textlen;
-	int textcap;
-	/* thinking blocks: streamed text + closing signature */
-	char *thinking;
-	int thinkinglen;
-	int thinkingcap;
-	char *sig;
-	int siglen;
-	int sigcap;
-	char *redacted;		/* redacted_thinking: opaque data blob */
+	Sbuf text;
+	Sbuf thinking;	/* thinking blocks: streamed text... */
+	Sbuf sig;	/* ...plus closing signature */
+	Sbuf tooljson;
+	char *redacted;	/* redacted_thinking: opaque data blob */
 	char *toolid;
 	char *toolname;
-	char *tooljson;
-	int tooljsonlen;
-	int tooljsoncap;
 };
 
 /*
- * Append n bytes of s to a growable buffer.
+ * Append n bytes of s to a growable buffer, keeping it
+ * NUL-terminated.
  */
-static void
-sbappend(char **buf, int *len, int *cap, char *s, int n)
+void
+sbappend(Sbuf *b, char *s, int n)
 {
 	int need;
 
-	need = *len + n + 1;
-	if(need > *cap){
-		while(need > *cap)
-			*cap = *cap ? *cap * 2 : 256;
-		*buf = erealloc(*buf, *cap);
+	need = b->len + n + 1;
+	if(need > b->cap){
+		while(need > b->cap)
+			b->cap = b->cap ? b->cap * 2 : 256;
+		b->s = erealloc(b->s, b->cap);
 	}
-	memmove(*buf + *len, s, n);
-	*len += n;
-	(*buf)[*len] = '\0';
+	memmove(b->s + b->len, s, n);
+	b->len += n;
+	b->s[b->len] = '\0';
 }
 
 static Reply*
@@ -1167,22 +1073,22 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			} else {
 				jset(block, "type", jstring("thinking"));
 				jset(block, "thinking",
-					jstring(blocks[i].thinking ? blocks[i].thinking : ""));
+					jstring(blocks[i].thinking.s ? blocks[i].thinking.s : ""));
 				jset(block, "signature",
-					jstring(blocks[i].sig ? blocks[i].sig : ""));
+					jstring(blocks[i].sig.s ? blocks[i].sig.s : ""));
 			}
 			jappend(content, block);
 			continue;
 		}
 		if(!blocks[i].istool){
 			/* skip empty text blocks: the API rejects them */
-			if(blocks[i].text == nil || blocks[i].text[0] == '\0')
+			if(blocks[i].text.len == 0)
 				continue;
 			block = jobject();
 			jset(block, "type", jstring("text"));
-			jset(block, "text", jstring(blocks[i].text));
+			jset(block, "text", jstring(blocks[i].text.s));
 			jappend(content, block);
-			fmtprint(&f, "%s", blocks[i].text);
+			fmtprint(&f, "%s", blocks[i].text.s);
 			continue;
 		}
 
@@ -1192,8 +1098,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 			jstring(blocks[i].toolid ? blocks[i].toolid : ""));
 		jset(block, "name",
 			jstring(blocks[i].toolname ? blocks[i].toolname : ""));
-		if(blocks[i].tooljson != nil && blocks[i].tooljsonlen > 0)
-			input = jsonparse(blocks[i].tooljson);
+		if(blocks[i].tooljson.len > 0)
+			input = jsonparse(blocks[i].tooljson.s);
 		else
 			input = nil;
 		if(input == nil)
@@ -1213,14 +1119,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		tc = emallocz(sizeof *tc, 1);
 		tc->id = estrdup(blocks[i].toolid ? blocks[i].toolid : "");
 		tc->name = estrdup(blocks[i].toolname ? blocks[i].toolname : "");
-		if(td != nil){
-			tc->type = td->type;
-			parseinput(tc, td, input);
-		} else {
-			tc->type = -1;
-			tc->path = estrdup("");
-			tc->body = estrdup("");
-		}
+		tc->type = td != nil ? td->type : -1;
+		parseinput(tc, td, input);
 		if(tail == nil) head = tc;
 		else tail->next = tc;
 		tail = tc;
@@ -1242,63 +1142,82 @@ freeblocks(Sblock *blocks, int nblocks)
 {
 	int i;
 	for(i = 0; i < nblocks; i++){
-		free(blocks[i].text);
-		free(blocks[i].thinking);
-		free(blocks[i].sig);
+		free(blocks[i].text.s);
+		free(blocks[i].thinking.s);
+		free(blocks[i].sig.s);
+		free(blocks[i].tooljson.s);
 		free(blocks[i].redacted);
 		free(blocks[i].toolid);
 		free(blocks[i].toolname);
-		free(blocks[i].tooljson);
 	}
 }
 
+/*
+ * Look up (and extend the count to cover) the content block
+ * addressed by the event's index.  An index past Maxblocks
+ * fails the round loudly: silently dropping a block would
+ * desync the tool protocol (a tool_use with no tool_result
+ * wedges the conversation).
+ */
+static Sblock*
+sseblock(Json *ev, Sblock *blocks, int *nblocksp)
+{
+	int idx;
+
+	idx = jint(ev, "index");
+	if(idx < 0 || idx >= Maxblocks){
+		werrstr("content block index %d exceeds limit (%d)",
+			idx, Maxblocks);
+		return nil;
+	}
+	if(idx >= *nblocksp)
+		*nblocksp = idx + 1;
+	return &blocks[idx];
+}
+
+/*
+ * Handle one SSE event.  Returns 1 on message_stop, -1 on
+ * error (errstr set), 0 otherwise.
+ */
 static int
-ssehandle(char *json, Sblock *blocks, int *nblocksp,
+sseevent(Json *ev, Sblock *blocks, int *nblocksp,
 	char **stopreasonp, Usage *usage,
 	void (*cb)(char*, void*), void *aux)
 {
-	Json *ev, *delta, *cb0, *msg, *uobj;
-	char *etype, *dtype;
-	int idx;
+	Json *delta, *cblock, *uobj;
+	Sblock *b;
+	Sbuf *sb;
+	char *etype, *dtype, *s;
+	int docb;
 
-	ev = jsonparse(json);
-	if(ev == nil) return 0;
 	etype = jstr(ev, "type");
-	if(etype == nil){ jsonfree(ev); return 0; }
+	if(etype == nil)
+		return 0;
 
-	if(strcmp(etype, "message_stop") == 0){
-		jsonfree(ev);
+	if(strcmp(etype, "message_stop") == 0)
 		return 1;
-	}
+
 	if(strcmp(etype, "error") == 0){
-		Json *eo;
-		char *em;
-		eo = jget(ev, "error");
-		em = jstr(eo, "message");
-		werrstr("API error: %s", em ? em : "unknown");
-		jsonfree(ev);
+		s = jstr(jget(ev, "error"), "message");
+		werrstr("API error: %s", s ? s : "unknown");
 		return -1;
 	}
+
 	if(strcmp(etype, "message_start") == 0){
-		msg = jget(ev, "message");
-		uobj = jget(msg, "usage");
+		uobj = jget(jget(ev, "message"), "usage");
 		if(usage != nil && uobj != nil){
 			usage->input_tokens += jint(uobj, "input_tokens");
 			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
 			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
 		}
-		jsonfree(ev);
 		return 0;
 	}
+
 	if(strcmp(etype, "message_delta") == 0){
-		delta = jget(ev, "delta");
-		if(delta != nil){
-			char *sr;
-			sr = jstr(delta, "stop_reason");
-			if(sr != nil){
-				free(*stopreasonp);
-				*stopreasonp = estrdup(sr);
-			}
+		s = jstr(jget(ev, "delta"), "stop_reason");
+		if(s != nil){
+			free(*stopreasonp);
+			*stopreasonp = estrdup(s);
 		}
 		uobj = jget(ev, "usage");
 		if(usage != nil && uobj != nil){
@@ -1306,109 +1225,96 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 			usage->cache_creation_input_tokens += jint(uobj, "cache_creation_input_tokens");
 			usage->cache_read_input_tokens += jint(uobj, "cache_read_input_tokens");
 		}
-		jsonfree(ev);
 		return 0;
 	}
+
 	if(strcmp(etype, "content_block_start") == 0){
-		idx = jint(ev, "index");
-		if(idx < 0 || idx >= Maxblocks){
-			/*
-			 * Silently dropping a block here would desync
-			 * the tool protocol (a tool_use with no
-			 * tool_result wedges the conversation), so
-			 * fail the round loudly instead.
-			 */
-			jsonfree(ev);
-			werrstr("content block index %d exceeds limit (%d)",
-				idx, Maxblocks);
+		b = sseblock(ev, blocks, nblocksp);
+		if(b == nil)
 			return -1;
-		}
-		if(idx >= *nblocksp) *nblocksp = idx + 1;
-		cb0 = jget(ev, "content_block");
-		dtype = jstr(cb0, "type");
-		if(dtype != nil && strcmp(dtype, "tool_use") == 0){
-			char *s;
-			blocks[idx].istool = 1;
-			s = jstr(cb0, "id");
-			blocks[idx].toolid = estrdup(s ? s : "");
-			s = jstr(cb0, "name");
-			blocks[idx].toolname = estrdup(s ? s : "");
-		} else if(dtype != nil && strcmp(dtype, "thinking") == 0){
-			blocks[idx].isthinking = 1;
+		cblock = jget(ev, "content_block");
+		dtype = jstr(cblock, "type");
+		if(dtype == nil)
+			return 0;
+		if(strcmp(dtype, "tool_use") == 0){
+			b->istool = 1;
+			s = jstr(cblock, "id");
+			b->toolid = estrdup(s ? s : "");
+			s = jstr(cblock, "name");
+			b->toolname = estrdup(s ? s : "");
+		} else if(strcmp(dtype, "thinking") == 0){
+			b->isthinking = 1;
 			if(cb != nil) cb("[thinking]\n", aux);
-		} else if(dtype != nil && strcmp(dtype, "redacted_thinking") == 0){
-			char *s;
-			blocks[idx].isthinking = 1;
-			s = jstr(cb0, "data");
-			blocks[idx].redacted = estrdup(s ? s : "");
+		} else if(strcmp(dtype, "redacted_thinking") == 0){
+			b->isthinking = 1;
+			s = jstr(cblock, "data");
+			b->redacted = estrdup(s ? s : "");
 			if(cb != nil) cb("[redacted thinking]\n", aux);
 		}
-		jsonfree(ev);
 		return 0;
 	}
+
 	if(strcmp(etype, "content_block_stop") == 0){
-		idx = jint(ev, "index");
-		if(idx >= 0 && idx < Maxblocks
-		&& blocks[idx].isthinking && blocks[idx].redacted == nil
-		&& cb != nil)
+		b = sseblock(ev, blocks, nblocksp);
+		if(b == nil)
+			return -1;
+		if(b->isthinking && b->redacted == nil && cb != nil)
 			cb("\n[/thinking]\n", aux);
-		jsonfree(ev);
 		return 0;
 	}
+
 	if(strcmp(etype, "content_block_delta") == 0){
-		idx = jint(ev, "index");
-		if(idx < 0 || idx >= Maxblocks){
-			jsonfree(ev);
-			werrstr("content block index %d exceeds limit (%d)",
-				idx, Maxblocks);
+		b = sseblock(ev, blocks, nblocksp);
+		if(b == nil)
 			return -1;
-		}
-		if(idx >= *nblocksp) *nblocksp = idx + 1;
 		delta = jget(ev, "delta");
 		dtype = jstr(delta, "type");
-		if(dtype == nil){ jsonfree(ev); return 0; }
+		if(dtype == nil)
+			return 0;
+		/* route the delta text to the right per-block buffer */
+		s = nil;
+		sb = nil;
+		docb = 0;
 		if(strcmp(dtype, "text_delta") == 0){
-			char *t;
-			t = jstr(delta, "text");
-			if(t != nil){
-				sbappend(&blocks[idx].text,
-					&blocks[idx].textlen,
-					&blocks[idx].textcap,
-					t, strlen(t));
-				if(cb != nil) cb(t, aux);
-			}
-		} else if(strcmp(dtype, "input_json_delta") == 0){
-			char *pj;
-			pj = jstr(delta, "partial_json");
-			if(pj != nil)
-				sbappend(&blocks[idx].tooljson,
-					&blocks[idx].tooljsonlen,
-					&blocks[idx].tooljsoncap,
-					pj, strlen(pj));
+			s = jstr(delta, "text");
+			sb = &b->text;
+			docb = 1;
 		} else if(strcmp(dtype, "thinking_delta") == 0){
-			char *t;
-			t = jstr(delta, "thinking");
-			if(t != nil){
-				sbappend(&blocks[idx].thinking,
-					&blocks[idx].thinkinglen,
-					&blocks[idx].thinkingcap,
-					t, strlen(t));
-				if(cb != nil) cb(t, aux);
-			}
+			s = jstr(delta, "thinking");
+			sb = &b->thinking;
+			docb = 1;
+		} else if(strcmp(dtype, "input_json_delta") == 0){
+			s = jstr(delta, "partial_json");
+			sb = &b->tooljson;
 		} else if(strcmp(dtype, "signature_delta") == 0){
-			char *t;
-			t = jstr(delta, "signature");
-			if(t != nil)
-				sbappend(&blocks[idx].sig,
-					&blocks[idx].siglen,
-					&blocks[idx].sigcap,
-					t, strlen(t));
+			s = jstr(delta, "signature");
+			sb = &b->sig;
 		}
-		jsonfree(ev);
+		if(sb != nil && s != nil){
+			sbappend(sb, s, strlen(s));
+			if(docb && cb != nil)
+				cb(s, aux);
+		}
 		return 0;
 	}
-	jsonfree(ev);
+
 	return 0;
+}
+
+static int
+ssehandle(char *json, Sblock *blocks, int *nblocksp,
+	char **stopreasonp, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Json *ev;
+	int rc;
+
+	ev = jsonparse(json);
+	if(ev == nil)
+		return 0;
+	rc = sseevent(ev, blocks, nblocksp, stopreasonp, usage, cb, aux);
+	jsonfree(ev);
+	return rc;
 }
 
 static Reply*
@@ -1432,7 +1338,7 @@ sendonce(Conv *c, Usage *usage,
 		return nil;
 	}
 
-	fd = websend(c, body, 1, &clonefd);
+	fd = webhttp(c->apikey, apiurl, body, 1, &clonefd);
 	free(body);
 	if(fd < 0)
 		return nil;
@@ -1510,12 +1416,13 @@ claudeconverse(Conv *c, Usage *usage,
 	Reply *r;
 	ToolCall *tc;
 	char *resultjson, *alltext, marker[256], errbuf[ERRMAX];
-	int round, alllen, tlen;
+	int round, ntext;
+	Fmt f;
 
 	if(errp != nil)
 		*errp = nil;
-	alltext = estrdup("");
-	alllen = 0;
+	fmtstrinit(&f);
+	ntext = 0;
 
 	for(round = 0; round < Maxrounds; round++){
 		r = sendonce(c, usage, cb, aux);
@@ -1534,40 +1441,56 @@ claudeconverse(Conv *c, Usage *usage,
 					"\n[error: %s]\n", errbuf);
 				cb(marker, aux);
 			}
-			if(alllen > 0) return alltext;
+			alltext = fmtstrflush(&f);
+			if(ntext > 0) return alltext;
 			free(alltext);
 			return nil;
 		}
 
-		if(r->text != nil && r->text[0] != '\0'){
-			tlen = strlen(r->text);
-			alltext = erealloc(alltext, alllen + tlen + 2);
-			if(alllen > 0) alltext[alllen++] = '\n';
-			memmove(alltext + alllen, r->text, tlen);
-			alllen += tlen;
-			alltext[alllen] = '\0';
-		}
+		if(r->text != nil && r->text[0] != '\0')
+			fmtprint(&f, "%s%s", ntext++ ? "\n" : "", r->text);
 
-		convappend(c, msgnewraw(Massistant,
+		convappend(c, msgnew(Massistant,
 			r->text ? r->text : "", r->rawjson));
 
-		if(r->stopped || r->tools == nil){
+		if(r->stopped){
+			/*
+			 * The max_tokens guillotine can fall mid
+			 * tool call, leaving tool_use blocks that
+			 * were never executed.  The API demands a
+			 * tool_result for every tool_use, so answer
+			 * them with a refusal; otherwise the next
+			 * message on this conversation (including
+			 * autocontinue's "Continue.") is rejected.
+			 */
+			if(r->tools != nil){
+				for(tc = r->tools; tc != nil; tc = tc->next)
+					tc->result = estrdup(
+						"not executed: response truncated (max_tokens)");
+				resultjson = mktoolresults(r->tools);
+				convappend(c, msgnew(Muser, "", resultjson));
+				free(resultjson);
+			}
 			replyfree(r);
-			return alltext;
+			return fmtstrflush(&f);
+		}
+		if(r->tools == nil){
+			replyfree(r);
+			return fmtstrflush(&f);
 		}
 
 		for(tc = r->tools; tc != nil; tc = tc->next){
 			if(cb != nil){
 				snprint(marker, sizeof marker,
 					"\n[running %s %s]\n",
-					tc->name, tc->path);
+					tc->name, tc->args[0]);
 				cb(marker, aux);
 			}
 			tc->result = exectool(tc);
 		}
 
 		resultjson = mktoolresults(r->tools);
-		convappend(c, msgnewraw(Muser, "", resultjson));
+		convappend(c, msgnew(Muser, "", resultjson));
 		free(resultjson);
 
 		replyfree(r);
@@ -1583,109 +1506,57 @@ claudeconverse(Conv *c, Usage *usage,
 		*errp = esmprint("tool loop limit reached (%d rounds)", Maxrounds);
 	if(cb != nil)
 		cb("\n[tool loop limit reached; send another prompt to continue]\n", aux);
-	return alltext;
+	return fmtstrflush(&f);
 }
 
-static char*
-webfsget(char *apikey, char *url)
+/*
+ * Fetch the available model ids, one per line (caller frees).
+ * Returns nil with errstr set on failure.
+ */
+char*
+fetchmodels(char *apikey)
 {
-	int clonefd, fd;
-	char *data, *webdir, *page;
-	Webreq w;
+	int fd, clonefd, i;
+	char *data, *id, *msg;
+	Json *resp, *darr;
+	Fmt f;
 
-	memset(&w, 0, sizeof w);
-	w.url = url;
-	w.apikey = apikey;
-
-	webdir = nil;
-	clonefd = webopen(&w, &webdir);
-	if(clonefd < 0)
+	fd = webhttp(apikey, modelsurl, nil, 0, &clonefd);
+	if(fd < 0)
 		return nil;
-
-	page = esmprint("%s/body", webdir);
-	fd = open(page, OREAD);
-	free(page);
-	free(webdir);
-	if(fd < 0){
-		close(clonefd);
-		return nil;
-	}
-
 	data = readfile(fd);
 	close(fd);
 	close(clonefd);
-	return data;
-}
-
-int
-fetchmodels(char *apikey, ModelInfo **out)
-{
-	char *data, *errtype, *errmsg;
-	Json *resp, *darr, *item;
-	ModelInfo *list;
-	int i, n;
-	char *id, *name;
-
-	*out = nil;
-
-	data = webfsget(apikey, modelsurl);
-
-	if(data == nil){
-		werrstr("failed to contact models API");
-		return -1;
-	}
+	if(data == nil)
+		return nil;
 
 	resp = jsonparse(data);
 	if(resp == nil){
 		werrstr("json parse failed: %.100s", data);
 		free(data);
-		return -1;
+		return nil;
 	}
 	free(data);
 
-	errtype = jstr(resp, "type");
-	if(errtype != nil && strcmp(errtype, "error") == 0){
-		Json *errobj;
-		errobj = jget(resp, "error");
-		errmsg = jstr(errobj, "message");
-		if(errmsg == nil)
-			errmsg = "unknown API error";
-		werrstr("models API: %s", errmsg);
+	msg = jstr(jget(resp, "error"), "message");
+	if(msg != nil){
+		werrstr("models API: %s", msg);
 		jsonfree(resp);
-		return -1;
+		return nil;
 	}
-
 	darr = jget(resp, "data");
 	if(darr == nil || darr->type != Jarray){
 		werrstr("no data array in models response");
 		jsonfree(resp);
-		return -1;
+		return nil;
 	}
 
-	n = darr->nitem;
-	if(n == 0){
-		jsonfree(resp);
-		return 0;
-	}
-
-	list = emallocz(n * sizeof(ModelInfo), 1);
-
-	for(i = 0; i < n; i++){
-		item = jidx(darr, i);
-		if(item == nil)
-			continue;
-		id = jstr(item, "id");
-		name = jstr(item, "display_name");
+	fmtstrinit(&f);
+	for(i = 0; i < darr->nitem; i++){
+		id = jstr(jidx(darr, i), "id");
 		if(id != nil)
-			list[i].id = estrdup(id);
-		if(name != nil)
-			list[i].display_name = estrdup(name);
-		list[i].max_output_tokens = jint(item, "max_output_tokens");
-		if(list[i].max_output_tokens <= 0)
-			list[i].max_output_tokens = 4096;
+			fmtprint(&f, "%s\n", id);
 	}
-
 	jsonfree(resp);
-	*out = list;
-	return n;
+	return fmtstrflush(&f);
 }

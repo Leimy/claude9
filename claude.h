@@ -1,16 +1,6 @@
 #pragma once
 
 enum {
-	Acreate,
-	Areplace,
-	Aread,
-	Alist,
-	Adelete,
-	Amanpage,
-	Amk,
-};
-
-enum {
 	Muser,
 	Massistant,
 };
@@ -22,38 +12,17 @@ enum {
 	Thinkadaptive,	/* thinking.type=adaptive, output_config.effort (fable) */
 };
 
-/* tool call from Claude */
-typedef struct ToolCall ToolCall;
-struct ToolCall {
-	char *id;		/* tool_use_id */
-	char *name;		/* tool name for display */
-	int type;		/* Acreate, Areplace, Adelete, Aread, Alist, Amanpage, Amk */
-	char *path;		/* file path */
-	char *body;		/* contents / targets (Acreate, Amk) */
-	char *oldstr;		/* Areplace: text to find */
-	char *newstr;		/* Areplace: replacement text */
-	char *result;		/* result text after execution */
-	ToolCall *next;
-};
-
-/*
- * Reply assembled from a single API round (with or without
- * streaming).  May contain text, tool_use blocks, and a raw
- * JSON snapshot of the assistant's content array suitable for
- * appending back into a follow-up request.
- */
-typedef struct Reply Reply;
-struct Reply {
-	char *text;		/* concatenated text blocks */
-	char *rawjson;		/* raw JSON content array string */
-	ToolCall *tools;	/* linked list of tool calls */
-	int stopped;		/* 1 if stop_reason was end_turn */
+/* growable string buffer */
+typedef struct Sbuf Sbuf;
+struct Sbuf {
+	char *s;
+	int len;
+	int cap;
 };
 
 typedef struct Msg Msg;
 typedef struct Conv Conv;
 typedef struct Usage Usage;
-typedef struct ModelInfo ModelInfo;
 
 struct Msg {
 	int role;
@@ -67,7 +36,7 @@ struct Conv {
 	char *model;
 	int maxtokens;
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
-	int thinking;	/* Thinkbudget: budget tokens */
+	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
 	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
 	char *sysprompt;
 	Msg *msgs;
@@ -82,19 +51,11 @@ struct Usage {
 	char *stop_reason;
 };
 
-struct ModelInfo {
-	char *id;
-	char *display_name;
-	int max_output_tokens;
-};
-
 /* claude.c */
 Conv*	convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills);
 void	convfree(Conv *c);
-int	convcount(Conv *c);
-long	convsize(Conv *c);
-Msg*	msgnew(int role, char *text);
-Msg*	msgnewraw(int role, char *text, char *rawjson);
+void	convclear(Conv *c);
+Msg*	msgnew(int role, char *text, char *rawjson);
 void	convappend(Conv *c, Msg *m);
 /*
  * Run the full tool loop: send the conversation, execute any
@@ -116,9 +77,9 @@ void	convappend(Conv *c, Msg *m);
  */
 char*	claudeconverse(Conv *c, Usage *usage,
 		void (*cb)(char *chunk, void *aux), void *aux, char **errp);
-void	replyfree(Reply *r);
-void	toolfree(ToolCall *t);
+void	sbappend(Sbuf *b, char *s, int n);
 char*	readfile(int fd);
+char*	fetchmodels(char *apikey);	/* model ids, one per line */
 
 /* emalloc wrappers: succeed or sysfatal */
 void*	emalloc(ulong n);
@@ -127,6 +88,3 @@ void*	emallocz(ulong n, int clr);
 char*	estrdup(char *s);
 char*	esmprint(char *fmt, ...);
 #pragma varargck argpos esmprint 1
-
-void	mkparents(char *path);
-int	fetchmodels(char *apikey, ModelInfo **out);

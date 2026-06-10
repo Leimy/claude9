@@ -35,12 +35,9 @@ vlong	jint(Json *j, char *name);
 Json*	jidx(Json *j, int i);
 
 /* construction */
-Json*	jnull(void);
 Json*	jbool(int b);
 Json*	jstring(char *s);
-Json*	jstringn(char *s, int n);
 Json*	jintval(vlong v);
-Json*	jreal(double v);
 Json*	jarray(void);
 Json*	jobject(void);
 void	jappend(Json *arr, Json *val);

@@ -479,12 +479,6 @@ jidx(Json *j, int i)
 /* construction */
 
 Json*
-jnull(void)
-{
-	return mkjson(Jnull);
-}
-
-Json*
 jbool(int b)
 {
 	Json *j;
@@ -505,34 +499,12 @@ jstring(char *s)
 }
 
 Json*
-jstringn(char *s, int n)
-{
-	Json *j;
-
-	j = mkjson(Jstring);
-	j->str = emalloc(n + 1);
-	memmove(j->str, s, n);
-	j->str[n] = '\0';
-	return j;
-}
-
-Json*
 jintval(vlong v)
 {
 	Json *j;
 
 	j = mkjson(Jint);
 	j->ival = v;
-	return j;
-}
-
-Json*
-jreal(double v)
-{
-	Json *j;
-
-	j = mkjson(Jreal);
-	j->fval = v;
 	return j;
 }
 
@@ -581,93 +553,41 @@ jset(Json *obj, char *name, Json *val)
 
 /* JSON serialization using Fmt */
 
-static char *hexdigits = "0123456789abcdef";
-
+/*
+ * Emit s as a JSON string literal.  Runs of plain bytes go
+ * out in one piece; only quotes, backslashes, and control
+ * characters need escaping.  UTF-8 passes through untouched
+ * (cast to uchar so continuation bytes >= 0x80 are not
+ * mistaken for control characters).
+ */
 static int
 fmtjstr(Fmt *f, char *s)
 {
-	int extra, len, result;
-	char *p, *q, *buf;
+	char *p, *q, *esc;
 
-	extra = 0;
-	for(p = s; *p; p++){
-		switch(*p){
-		case '"':
-		case '\\':
-		case '\b':
-		case '\f':
-		case '\n':
-		case '\r':
-		case '\t':
-			extra += 1;
+	fmtrune(f, '"');
+	for(p = s; *p != '\0'; p = q){
+		for(q = p; *q != '\0' && *q != '"' && *q != '\\' && (uchar)*q >= 0x20; q++)
+			;
+		if(q > p)
+			fmtprint(f, "%.*s", (int)(q - p), p);
+		if(*q == '\0')
 			break;
+		switch(*q++){
+		case '"':	esc = "\\\""; break;
+		case '\\':	esc = "\\\\"; break;
+		case '\b':	esc = "\\b"; break;
+		case '\f':	esc = "\\f"; break;
+		case '\n':	esc = "\\n"; break;
+		case '\r':	esc = "\\r"; break;
+		case '\t':	esc = "\\t"; break;
 		default:
-			/*
-			 * cast to uchar: plain char may be signed, and
-			 * UTF-8 continuation bytes (>= 0x80) must not
-			 * be mistaken for control characters.
-			 */
-			if((uchar)*p < 0x20)
-				extra += 5;
-			break;
+			fmtprint(f, "\\u%04x", (uchar)q[-1]);
+			continue;
 		}
+		fmtprint(f, "%s", esc);
 	}
-
-	len = p - s;
-	buf = emalloc(len + extra + 3);
-
-	q = buf;
-	*q++ = '"';
-	for(p = s; *p; p++){
-		switch(*p){
-		case '"':
-			*q++ = '\\';
-			*q++ = '"';
-			break;
-		case '\\':
-			*q++ = '\\';
-			*q++ = '\\';
-			break;
-		case '\b':
-			*q++ = '\\';
-			*q++ = 'b';
-			break;
-		case '\f':
-			*q++ = '\\';
-			*q++ = 'f';
-			break;
-		case '\n':
-			*q++ = '\\';
-			*q++ = 'n';
-			break;
-		case '\r':
-			*q++ = '\\';
-			*q++ = 'r';
-			break;
-		case '\t':
-			*q++ = '\\';
-			*q++ = 't';
-			break;
-		default:
-			if((uchar)*p < 0x20){
-				*q++ = '\\';
-				*q++ = 'u';
-				*q++ = '0';
-				*q++ = '0';
-				*q++ = hexdigits[((uchar)*p >> 4) & 0xF];
-				*q++ = hexdigits[(uchar)*p & 0xF];
-			} else {
-				*q++ = *p;
-			}
-			break;
-		}
-	}
-	*q++ = '"';
-	*q = '\0';
-
-	result = fmtprint(f, "%s", buf);
-	free(buf);
-	return result;
+	return fmtrune(f, '"');
 }
 
 static int
