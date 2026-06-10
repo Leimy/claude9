@@ -29,10 +29,10 @@ if(! ifs=() eval `{aux/getflags $*}){
 	exit usage
 }
 
-mnt=/mnt/claude
-submnt=/mnt/claudesub
-srvname=claude
-subsrvname=claudesub
+mnt=/mnt/claude_test
+submnt=/mnt/claudesub_test
+srvname=claude_test
+subsrvname=claudesub_test
 
 # Track whether we started the servers so we know to clean up.
 started_sub=0
@@ -62,7 +62,7 @@ fn startsub {
 		echo 'sub-agent: '$submnt' (already running)' >[1=2]
 	}
 	if not {
-		claude9fs -s $subsrvname -m $submnt $fsflags
+		claude9fs_test -s $subsrvname -m $submnt $fsflags
 		started_sub=1
 		echo 'sub-agent: '$submnt >[1=2]
 	}
@@ -76,7 +76,7 @@ fn startmain {
 		echo 'claude9fs: '$mnt' (already running)' >[1=2]
 	}
 	if not {
-		claude9fs -s $srvname -m $mnt $fsflags
+		claude9fs_test -s $srvname -m $mnt $fsflags
 		started_main=1
 		echo 'claude9fs: '$mnt >[1=2]
 	}

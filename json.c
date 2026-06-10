@@ -236,7 +236,7 @@ parsenum(char **pp)
 	return j;
 }
 
-static void
+void
 jgrow(Json *j)
 {
 	if(j->nitem >= j->aitem){
@@ -554,25 +554,48 @@ jset(Json *obj, char *name, Json *val)
 /* JSON serialization using Fmt */
 
 /*
- * Emit s as a JSON string literal.  Runs of plain bytes go
- * out in one piece; only quotes, backslashes, and control
- * characters need escaping.  UTF-8 passes through untouched
- * (cast to uchar so continuation bytes >= 0x80 are not
- * mistaken for control characters).
+ * Emit s as a JSON string literal.  Runs of plain ASCII go
+ * out in one piece; quotes, backslashes, and control
+ * characters are escaped; multibyte UTF-8 is decoded and
+ * re-emitted one rune at a time.
+ *
+ * The ASCII-only batching is a correctness requirement, not
+ * an optimization: the precision of %.*s counts runes, not
+ * bytes (see fmtstrcpy in the fmt library), so handing it a
+ * byte count is only safe when every byte in the run encodes
+ * exactly one rune.  Mixing multibyte text into the batch
+ * made fmt copy runes past the end of the run, emitting the
+ * very quote/backslash/control character the scanner stopped
+ * at -- raw and unescaped -- followed by a duplicated tail.
+ * That corrupted both request bodies and stored rawjson
+ * snapshots (which then failed to reparse, silently dropping
+ * tool_use/tool_result blocks and wedging conversations).
+ *
+ * Re-encoding runes through chartorune/fmtrune also replaces
+ * invalid UTF-8 byte sequences with U+FFFD; the API rejects
+ * request bodies that are not valid UTF-8, so raw bytes from
+ * e.g. a binary file read must never pass through untouched.
  */
 static int
 fmtjstr(Fmt *f, char *s)
 {
 	char *p, *q, *esc;
+	Rune r;
 
 	fmtrune(f, '"');
 	for(p = s; *p != '\0'; p = q){
-		for(q = p; *q != '\0' && *q != '"' && *q != '\\' && (uchar)*q >= 0x20; q++)
+		for(q = p; (uchar)*q >= 0x20 && (uchar)*q < Runeself
+		&& *q != '"' && *q != '\\'; q++)
 			;
 		if(q > p)
 			fmtprint(f, "%.*s", (int)(q - p), p);
 		if(*q == '\0')
 			break;
+		if((uchar)*q >= Runeself){
+			q += chartorune(&r, q);
+			fmtrune(f, r);
+			continue;
+		}
 		switch(*q++){
 		case '"':	esc = "\\\""; break;
 		case '\\':	esc = "\\\\"; break;

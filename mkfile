@@ -26,6 +26,13 @@ install:V: claude9fs
 	mkdir -p $SKILLSDIR
 	for(f in skills/*) cp $f $SKILLSDIR/
 
+install_test:V: claude9fs
+	cp claude9fs $BIN/claude9fs_test
+	cp claudetalk_test $RCBIN/claudetalk_test
+	chmod +x $RCBIN/claudetalk
+	mkdir -p $SKILLSDIR
+	for(f in skills/*) cp $f $SKILLSDIR/
+
 nuke:V: clean
 	rm -f $BIN/claude9fs $RCBIN/claudetalk
 	rm -rf $home/lib/claude9

@@ -481,6 +481,268 @@ mktextcontent(char *text)
 	return content;
 }
 
+/*
+ * Collect all tool_use IDs from a content array.
+ * Returns a malloc'd array of estrdup'd ID strings;
+ * sets *np to the count.  Caller frees both the strings
+ * and the array.
+ */
+static char**
+collecttoolids(Json *content, int *np)
+{
+	Json *block;
+	char *btype, *id;
+	int i, n, cap;
+	char **ids;
+
+	*np = 0;
+	if(content == nil || content->type != Jarray)
+		return nil;
+	cap = 0;
+	n = 0;
+	ids = nil;
+	for(i = 0; i < content->nitem; i++){
+		block = content->items[i];
+		btype = jstr(block, "type");
+		if(btype == nil || strcmp(btype, "tool_use") != 0)
+			continue;
+		id = jstr(block, "id");
+		if(id == nil || id[0] == '\0')
+			continue;
+		if(n >= cap){
+			cap = cap ? cap * 2 : 8;
+			ids = erealloc(ids, cap * sizeof(char*));
+		}
+		ids[n++] = estrdup(id);
+	}
+	*np = n;
+	return ids;
+}
+
+/*
+ * Check whether a content array contains a tool_result
+ * block with the given tool_use_id.
+ */
+static int
+hastoolresult(Json *content, char *id)
+{
+	Json *block;
+	char *btype, *rid;
+	int i;
+
+	if(content == nil || content->type != Jarray)
+		return 0;
+	for(i = 0; i < content->nitem; i++){
+		block = content->items[i];
+		btype = jstr(block, "type");
+		if(btype == nil || strcmp(btype, "tool_result") != 0)
+			continue;
+		rid = jstr(block, "tool_use_id");
+		if(rid != nil && strcmp(rid, id) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Repair orphaned tool_use blocks in the messages array.
+ *
+ * The API requires that every tool_use block in an assistant
+ * message has a matching tool_result (same tool_use_id) in
+ * the immediately following user message.  If the conversation
+ * gets into a state where this invariant is violated (e.g.
+ * due to a dropped connection, a bug in an earlier build, or
+ * an interrupted tool loop), every subsequent API call will
+ * fail and the conversation is permanently wedged.
+ *
+ * This function scans the assembled messages array and injects
+ * synthetic tool_result blocks into the next user message for
+ * any orphaned tool_use IDs.  If the next message is not a
+ * user message (or doesn't exist), one is inserted.
+ */
+static void
+repairtooluse(Json *msgs)
+{
+	Json *msg, *content, *ncontent, *block, *newmsg;
+	char *role, **ids;
+	int i, j, nids, ninj, repaired;
+
+	if(msgs == nil || msgs->type != Jarray)
+		return;
+
+	repaired = 0;
+	for(i = 0; i < msgs->nitem; i++){
+		msg = msgs->items[i];
+		role = jstr(msg, "role");
+		if(role == nil || strcmp(role, "assistant") != 0)
+			continue;
+		content = jget(msg, "content");
+		ids = collecttoolids(content, &nids);
+		if(nids == 0){
+			free(ids);
+			continue;
+		}
+
+		/*
+		 * Find the next message; it should be a user
+		 * message containing matching tool_results.
+		 */
+		ncontent = nil;
+		if(i + 1 < msgs->nitem){
+			role = jstr(msgs->items[i + 1], "role");
+			if(role != nil && strcmp(role, "user") == 0){
+				ncontent = jget(msgs->items[i + 1], "content");
+				if(ncontent != nil && ncontent->type != Jarray)
+					ncontent = nil;
+			}
+		}
+
+		ninj = 0;
+		for(j = 0; j < nids; j++){
+			if(ncontent != nil && hastoolresult(ncontent, ids[j]))
+				continue;
+			/*
+			 * Orphaned tool_use: no matching tool_result.
+			 * Inject one into the next user message's
+			 * content array.  If there is no next user
+			 * message, create one.
+			 */
+			if(ncontent == nil){
+				newmsg = jobject();
+				jset(newmsg, "role", jstring("user"));
+				ncontent = jarray();
+				jset(newmsg, "content", ncontent);
+				/*
+				 * Insert after position i: shift everything
+				 * from i+1 onward right by one slot.
+				 */
+				jgrow(msgs);
+				memmove(msgs->items + i + 2,
+					msgs->items + i + 1,
+					(msgs->nitem - i - 1) * sizeof(Json*));
+				msgs->nitem++;
+				msgs->items[i + 1] = newmsg;
+			}
+			block = jobject();
+			jset(block, "type", jstring("tool_result"));
+			jset(block, "tool_use_id", jstring(ids[j]));
+			jset(block, "content",
+				jstring("error: tool result lost (session recovery)"));
+			/*
+			 * tool_result blocks must precede any other
+			 * content in the user message, so insert at
+			 * the front (after any already injected).
+			 */
+			jgrow(ncontent);
+			memmove(ncontent->items + ninj + 1,
+				ncontent->items + ninj,
+				(ncontent->nitem - ninj) * sizeof(Json*));
+			ncontent->items[ninj] = block;
+			ncontent->nitem++;
+			ninj++;
+			repaired++;
+		}
+
+		for(j = 0; j < nids; j++)
+			free(ids[j]);
+		free(ids);
+	}
+	if(repaired > 0)
+		fprint(2, "claude: repaired %d orphaned tool_use block%s\n",
+			repaired, repaired > 1 ? "s" : "");
+}
+
+/*
+ * Check whether a content array contains a tool_use block
+ * with the given id.
+ */
+static int
+hastooluse(Json *content, char *id)
+{
+	Json *block;
+	char *btype, *bid;
+	int i;
+
+	if(content == nil || content->type != Jarray)
+		return 0;
+	for(i = 0; i < content->nitem; i++){
+		block = content->items[i];
+		btype = jstr(block, "type");
+		if(btype == nil || strcmp(btype, "tool_use") != 0)
+			continue;
+		bid = jstr(block, "id");
+		if(bid != nil && strcmp(bid, id) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Repair orphaned tool_result blocks: the mirror image of
+ * repairtooluse.  Every tool_result in a user message must
+ * reference a tool_use in the immediately preceding assistant
+ * message; if that assistant turn was lost or mangled (e.g. a
+ * corrupt rawjson snapshot that failed to reparse and was
+ * replaced by placeholder text), the leftover tool_results
+ * make the API reject every subsequent request.  Drop them.
+ */
+static void
+repairtoolresults(Json *msgs)
+{
+	Json *msg, *content, *pcontent, *block;
+	char *role, *btype, *rid;
+	int i, j, keep, dropped;
+
+	if(msgs == nil || msgs->type != Jarray)
+		return;
+	dropped = 0;
+	for(i = 0; i < msgs->nitem; i++){
+		msg = msgs->items[i];
+		role = jstr(msg, "role");
+		if(role == nil || strcmp(role, "user") != 0)
+			continue;
+		content = jget(msg, "content");
+		if(content == nil || content->type != Jarray)
+			continue;
+		pcontent = nil;
+		if(i > 0){
+			role = jstr(msgs->items[i - 1], "role");
+			if(role != nil && strcmp(role, "assistant") == 0)
+				pcontent = jget(msgs->items[i - 1], "content");
+		}
+		keep = 0;
+		for(j = 0; j < content->nitem; j++){
+			block = content->items[j];
+			btype = jstr(block, "type");
+			if(btype != nil && strcmp(btype, "tool_result") == 0){
+				rid = jstr(block, "tool_use_id");
+				if(rid == nil || !hastooluse(pcontent, rid)){
+					jsonfree(block);
+					dropped++;
+					continue;
+				}
+			}
+			content->items[keep++] = block;
+		}
+		content->nitem = keep;
+		/*
+		 * The API rejects empty content arrays; if the
+		 * message consisted only of dropped tool_results,
+		 * leave a placeholder behind.
+		 */
+		if(keep == 0){
+			block = jobject();
+			jset(block, "type", jstring("text"));
+			jset(block, "text",
+				jstring("(tool results dropped: session recovery)"));
+			jappend(content, block);
+		}
+	}
+	if(dropped > 0)
+		fprint(2, "claude: dropped %d orphaned tool_result block%s\n",
+			dropped, dropped > 1 ? "s" : "");
+}
+
 static Json*
 buildreq(Conv *c)
 {
@@ -541,11 +803,25 @@ buildreq(Conv *c)
 
 	msgs = jarray();
 	for(m = c->msgs; m != nil; m = m->next){
-		msg = jobject();
-		jset(msg, "role", jstring(m->role == Muser ? "user" : "assistant"));
+		char *role, *prole;
+		Json *pcontent;
+		int i;
+
+		role = m->role == Muser ? "user" : "assistant";
 		content = nil;
-		if(m->rawjson != nil)
+		if(m->rawjson != nil){
 			content = jsonparse(m->rawjson);
+			/*
+			 * A reparse failure here is serious: the
+			 * snapshot carries tool_use/tool_result
+			 * blocks, and falling back to plain text
+			 * silently breaks the tool protocol.  The
+			 * repair passes below recover the protocol,
+			 * but say what happened.
+			 */
+			if(content == nil)
+				fprint(2, "claude: stored message failed to reparse: %r\n");
+		}
 		/*
 		 * Repair the replayed content array: strip any
 		 * empty/whitespace-only text blocks the API would
@@ -565,6 +841,32 @@ buildreq(Conv *c)
 			jsonfree(content);
 			content = nil;
 		}
+		/*
+		 * Merge consecutive messages with the same role into
+		 * one message.  These arise naturally: a failed or
+		 * round-capped tool loop leaves the conversation
+		 * ending with a user message of tool_results, and the
+		 * next prompt appends another user message.  Merging
+		 * keeps the tool_result blocks in the message that
+		 * immediately follows the tool_use (and first within
+		 * it), which is what the API requires.
+		 */
+		if(msgs->nitem > 0){
+			msg = msgs->items[msgs->nitem - 1];
+			prole = jstr(msg, "role");
+			if(prole != nil && strcmp(prole, role) == 0){
+				if(content == nil && !blankstr(m->text))
+					content = mktextcontent(m->text);
+				if(content != nil){
+					pcontent = jget(msg, "content");
+					for(i = 0; i < content->nitem; i++)
+						jappend(pcontent, content->items[i]);
+					content->nitem = 0;
+					jsonfree(content);
+				}
+				continue;
+			}
+		}
 		if(content == nil){
 			/*
 			 * Guard against empty/whitespace-only text
@@ -578,9 +880,20 @@ buildreq(Conv *c)
 			else
 				content = mktextcontent(m->text);
 		}
+		msg = jobject();
+		jset(msg, "role", jstring(role));
 		jset(msg, "content", content);
 		jappend(msgs, msg);
 	}
+
+	/*
+	 * Repair any orphaned tool_use and tool_result blocks
+	 * before sending.  This recovers conversations wedged by
+	 * earlier bugs, dropped connections, or interrupted tool
+	 * loops.
+	 */
+	repairtooluse(msgs);
+	repairtoolresults(msgs);
 
 	if(msgs->nitem > 0){
 		msg = jidx(msgs, msgs->nitem - 1);
