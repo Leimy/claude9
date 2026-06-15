@@ -58,6 +58,37 @@ void	convclear(Conv *c);
 Msg*	msgnew(int role, char *text, char *rawjson);
 void	convappend(Conv *c, Msg *m);
 /*
+ * Drop whole leading exchanges from the front of the
+ * conversation, keeping at least the most recent keep
+ * exchanges, so the surviving history fits a smaller context.
+ *
+ * An "exchange" begins at a real user turn (a user message
+ * with rawjson==nil: an actual prompt or a "Continue.", not a
+ * tool_results message) and runs up to but not including the
+ * next real user turn.  Cutting only on exchange boundaries
+ * keeps every tool_use paired with its tool_result and leaves
+ * the history starting on a user turn, which is what the API
+ * requires.
+ *
+ * keep must be >= 1; the most recent exchange is never
+ * dropped.  Returns the number of messages removed (0 if the
+ * conversation already had keep or fewer exchanges).
+ */
+int	convcompact(Conv *c, int keep);
+/* Count the real user turns (exchanges) in the conversation. */
+int	convnexchanges(Conv *c);
+/* Approximate input size in bytes (text + rawjson of every message). */
+long	convinputbytes(Conv *c);
+/*
+ * True if an error string from claudeconverse indicates the
+ * model's input context window was exceeded ("prompt is too
+ * long").  Such an error wedges the session at its current
+ * size -- every resend fails identically -- until history is
+ * dropped, so callers should react by compacting or clearing
+ * rather than just reporting it.
+ */
+int	overlimiterr(char *err);
+/*
  * Run the full tool loop: send the conversation, execute any
  * tool calls Claude makes, send the results back, repeat until
  * a non-tool stop_reason.  Appends all rounds (assistant +

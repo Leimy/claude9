@@ -153,6 +153,7 @@ and returns its number.
 ### Session Commands (write to ctl)
 
 	clear              clear conversation history and usage counters
+	compact [n]        drop old exchanges, keeping the n most recent (default 4)
 	hangup             destroy the session
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
@@ -347,6 +348,71 @@ new output tokens.
 Auto-continue is off by default.  Each continuation round
 counts against the same usage totals shown in the `usage` file.
 
+### Context Window and Compaction
+
+The conversation grows monotonically: every prompt, every
+assistant reply, and every tool round (the `tool_use` blocks
+and their `tool_result` bodies) is kept and resent as input on
+the next request.  Tool output dominates -- a single `mk` run
+can carry up to 64KB, and `read_file`/`list_directory` results
+are stored verbatim -- so a long tool-using session accumulates
+input fast.
+
+This matters two ways:
+
+- **Cost.**  Input tokens are billed every round.  Prompt
+  caching (see Auto-Continue) makes resending an unchanged
+  prefix cheap, but new tool results invalidate the tail of
+  the cache, and a steadily growing history steadily raises
+  the floor cost of every exchange.
+
+- **The hard limit.**  The model's input context window is
+  fixed by Anthropic (on the order of 200K tokens for current
+  models; it varies by model).  claude9fs does not set it and
+  cannot raise it; `tokens` is an *output* cap and does not
+  affect input (see the guillotine section).  When the history
+  plus system prompt plus tool definitions exceed the window,
+  the API rejects the request with "prompt is too long".  Once
+  that happens the session is **wedged**: every resend is the
+  same too-large request and fails identically.
+
+The `compact` ctl command is the escape hatch, and the cheap
+way to keep costs down before you hit the wall:
+
+	echo compact > /mnt/claude/$n/ctl     # keep 4 most recent exchanges
+	echo compact 8 > /mnt/claude/$n/ctl   # keep 8 most recent exchanges
+
+Compaction drops whole *exchanges* from the front of the
+history.  An exchange is one real user turn (a prompt, or an
+auto-continue "Continue.") together with everything it
+produced: the assistant's replies and all the tool rounds that
+followed, up to the next real user turn.  Dropping on exchange
+boundaries is what keeps the operation safe -- every `tool_use`
+stays paired with its `tool_result`, and the surviving history
+still begins on a user turn, both of which the API requires.
+The most recent exchange is never dropped, so `compact` never
+discards the conversation you are in the middle of.
+
+Unlike `clear`, which throws away the entire conversation,
+`compact` keeps recent context so the model can carry on.  When
+a prompt fails with a context-window error, the error reported
+in the `error` file says exactly this and names both `compact`
+and `clear` as the remedies; compact and resend to continue
+with recent context intact.
+
+You can watch history grow in the `ctl` file:
+
+	exchanges   number of real user turns (the unit compact drops)
+	bytes       approximate input size sent on the next request
+	            (message text plus raw tool_use/tool_result blocks)
+
+Use these to decide when to compact and how many exchanges to
+keep.  Note one limitation: because compaction keeps whole
+exchanges, it cannot shrink a single exchange that is itself
+larger than the window (for example one prompt that triggered
+many rounds of large tool output).  In that case `clear` is
+the only recovery for now.
+
 ### Skills
 
 The `-K` flag points claude9fs at a directory of skill files.
@@ -439,6 +505,7 @@ file in the background while writing to `prompt`.
 	/thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)
 	/thinking adaptive [effort]  adaptive mode (fable)
 	/clear         clear conversation
+	/compact [n]   drop old exchanges, keeping the n most recent (default 4)
 	/status        show session info
 	/usage         show token usage
 	/autocontinue [n]  enable auto-continue on max_tokens (default 3)

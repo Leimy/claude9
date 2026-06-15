@@ -365,6 +365,100 @@ convappend(Conv *c, Msg *m)
 }
 
 /*
+ * A message begins a new "exchange" iff it is a real user
+ * turn: role Muser with no rawjson.  Tool_results messages
+ * (Muser with rawjson) and assistant messages do not; they
+ * belong to the exchange opened by the preceding real user
+ * turn.  See convcompact.
+ */
+static int
+exchangestart(Msg *m)
+{
+	return m->role == Muser && m->rawjson == nil;
+}
+
+int
+convnexchanges(Conv *c)
+{
+	Msg *m;
+	int n;
+
+	n = 0;
+	for(m = c->msgs; m != nil; m = m->next)
+		if(exchangestart(m))
+			n++;
+	return n;
+}
+
+long
+convinputbytes(Conv *c)
+{
+	Msg *m;
+	long n;
+
+	n = 0;
+	for(m = c->msgs; m != nil; m = m->next){
+		if(m->text != nil)
+			n += strlen(m->text);
+		if(m->rawjson != nil)
+			n += strlen(m->rawjson);
+	}
+	return n;
+}
+
+int
+convcompact(Conv *c, int keep)
+{
+	Msg *m, *next, *cut;
+	int total, todrop, dropped;
+
+	if(keep < 1)
+		keep = 1;
+	total = convnexchanges(c);
+	/*
+	 * Keep at least the most recent keep exchanges.  If the
+	 * history is already that short, nothing is safe to drop.
+	 */
+	if(total <= keep)
+		return 0;
+	todrop = total - keep;
+
+	/*
+	 * Walk forward counting exchange starts.  cut is the
+	 * first message we keep: the (todrop+1)-th exchange start.
+	 * Everything before cut -- whole exchanges, so every
+	 * tool_use keeps its tool_result -- is freed.  cut is a
+	 * real user turn, so the surviving list starts on a user
+	 * message as the API requires.
+	 */
+	cut = nil;
+	dropped = 0;
+	for(m = c->msgs; m != nil; m = m->next){
+		if(exchangestart(m)){
+			if(dropped == todrop){
+				cut = m;
+				break;
+			}
+			dropped++;
+		}
+	}
+	if(cut == nil || cut == c->msgs)
+		return 0;	/* nothing to do (shouldn't happen) */
+
+	dropped = 0;
+	for(m = c->msgs; m != cut; m = next){
+		next = m->next;
+		free(m->text);
+		free(m->rawjson);
+		free(m);
+		dropped++;
+	}
+	c->msgs = cut;
+	/* tail is unchanged: we only removed from the front */
+	return dropped;
+}
+
+/*
  * Build tool definitions JSON.
  */
 static Json*
@@ -1785,6 +1879,26 @@ sendonce(Conv *c, Usage *usage,
 	freeblocks(blocks, nblocks);
 	free(stopreason);
 	return r;
+}
+
+/*
+ * Recognize the API's "context window exceeded" error.  The
+ * Anthropic API reports it as an invalid_request_error whose
+ * message contains "prompt is too long" (e.g. "prompt is too
+ * long: 210000 tokens > 200000 maximum").  We match on the
+ * stable substring rather than the numbers, which vary by
+ * model.  The string reaches us through weberror() (HTTP 400
+ * body) or an SSE error event, both of which prefix it with
+ * "API error: ".
+ */
+int
+overlimiterr(char *err)
+{
+	if(err == nil)
+		return 0;
+	return strstr(err, "prompt is too long") != nil
+		|| strstr(err, "exceed the context") != nil
+		|| strstr(err, "maximum context length") != nil;
 }
 
 enum {

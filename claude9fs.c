@@ -595,19 +595,29 @@ rdctl(Session *s)
 	char *think, *text;
 	Msg *m;
 	long nmsg, nbytes;
+	int nexch;
 
 	nmsg = 0;
-	nbytes = 0;
-	for(m = s->conv->msgs; m != nil; m = m->next){
+	for(m = s->conv->msgs; m != nil; m = m->next)
 		nmsg++;
-		nbytes += strlen(m->text);
-	}
+	/*
+	 * bytes is the approximate input size sent on the next
+	 * request: every message's text plus its raw content
+	 * array (tool_use/tool_result blocks, which dominate a
+	 * long tool-using session).  exchanges is the number of
+	 * real user turns -- the unit the compact ctl command
+	 * drops.  Together they let a client see history growth
+	 * and decide when (and how hard) to compact.
+	 */
+	nbytes = convinputbytes(s->conv);
+	nexch = convnexchanges(s->conv);
 	think = thinkingtext(s->conv);
 	text = esmprint(
 		"name %s\n"
 		"model %s\n"
 		"tokens %d\n"
 		"messages %ld\n"
+		"exchanges %d\n"
 		"bytes %ld\n"
 		"autocontinue %d\n"
 		"thinking %s\n",
@@ -615,6 +625,7 @@ rdctl(Session *s)
 		s->conv->model,
 		s->conv->maxtokens,
 		nmsg,
+		nexch,
 		nbytes,
 		s->autocont,
 		think);
@@ -1047,6 +1058,29 @@ handlectl(Session *s, char *cmd, int *hangup)
 		free(s->usage.stop_reason);
 		memset(&s->usage, 0, sizeof s->usage);
 		streamclear(s, 1);
+	} else if(strncmp(cmd, "compact", 7) == 0
+	&& (cmd[7] == '\0' || cmd[7] == ' ')){
+		char *v;
+		int keep;
+		if(s->busy)
+			return "session busy";
+		v = cmd + 7;
+		while(*v == ' ') v++;
+		/*
+		 * keep = number of most recent exchanges to retain.
+		 * Default 4: enough recent context to keep working,
+		 * while shedding the bulk of an old session (each
+		 * exchange can carry tens of KB of stale tool output).
+		 * The most recent exchange is never dropped.  The
+		 * effect is visible in ctl's exchanges/bytes fields.
+		 */
+		if(*v == '\0')
+			keep = 4;
+		else
+			keep = atoi(v);
+		if(keep < 1)
+			return "compact: keep count must be at least 1";
+		convcompact(s->conv, keep);
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangup = 1;
 	} else if(strncmp(cmd, "autocontinue", 12) == 0){
@@ -1142,11 +1176,29 @@ doprompt(Req *r, Session *s, char *data)
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
 	if(!ok){
-		char errbuf[256];
+		char errbuf[512];
 		if(err != nil)
 			snprint(errbuf, sizeof errbuf, "%s", err);
 		else
 			rerrstr(errbuf, sizeof errbuf);
+		/*
+		 * An over-limit error wedges the session: the history
+		 * is now too big for the model's context window, and
+		 * every resend fails identically until it shrinks.
+		 * Say so, and name the escape hatches, instead of
+		 * leaving the user staring at a raw API string.
+		 */
+		if(overlimiterr(errbuf)){
+			char *msg;
+			msg = esmprint("%s\n"
+				"context window exceeded; this session is wedged "
+				"until history shrinks.  Drop old exchanges with "
+				"'echo compact > ctl' (optionally 'compact N' to "
+				"keep N recent exchanges) and resend, or 'echo clear "
+				"> ctl' to start fresh.", errbuf);
+			snprint(errbuf, sizeof errbuf, "%s", msg);
+			free(msg);
+		}
 		free(err);
 		free(reply);
 		s->lasterror = estrdup(errbuf);

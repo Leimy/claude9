@@ -147,7 +147,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /autocontinue [n] /clear /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /autocontinue [n] /clear /compact [n] /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -174,6 +174,18 @@ fn docmd {
 	if not if(~ $cmd /detach){
 		detach=1
 		echo 'session '$n' will persist on exit (reattach with: claudetalk -a '$n')' >[1=2]
+	}
+	if not if(~ $cmd /compact){
+		shift
+		# Show size before and after so the user sees the effect.
+		before=`{cat $sess/ctl | grep '^exchanges' | sed 's/exchanges //'}
+		if(~ $#* 0)
+			echo 'compact' > $sess/ctl
+		if not
+			echo 'compact '$1 > $sess/ctl
+		after=`{cat $sess/ctl | grep '^exchanges' | sed 's/exchanges //'}
+		bytes=`{cat $sess/ctl | grep '^bytes' | sed 's/bytes //'}
+		echo 'compacted: '$before' -> '$after' exchanges ('$bytes' input bytes)' >[1=2]
 	}
 	if not if(~ $cmd /sessions){
 		echo 'sessions:' >[1=2]
@@ -221,6 +233,7 @@ fn docmd {
 		echo '  /thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)' >[1=2]
 		echo '  /thinking adaptive [effort]  adaptive mode (fable; effort e.g. low/medium/high)' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
+		echo '  /compact [n]   drop old exchanges, keep n recent (default 4)' >[1=2]
 		echo '  /status        show session info' >[1=2]
 		echo '  /usage         show token usage' >[1=2]
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
