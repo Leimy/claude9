@@ -147,7 +147,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /autocontinue [n] /clear /compact [n] /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
