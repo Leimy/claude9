@@ -99,6 +99,33 @@ Read `prompt` back to get the last assistant reply:
 
     read_file /mnt/claudesub/dizzy-monkey/prompt   -->  (the summary)
 
+**IMPORTANT: sub-agents have tools and share your namespace.**
+The sub-agent claude9fs process has the same tools you do
+(read_file, create_file, list_directory, mk, etc.) and
+shares the same filesystem namespace.  This means sub-agents
+can read files, search code, and examine source directly.
+
+**Do NOT read file contents yourself just to paste them into
+the sub-agent's prompt.**  That wastes tokens twice -- once
+for you to read, once to send.  Instead, tell the sub-agent
+which files to read:
+
+    WRONG (wasteful):
+      contents = read_file /sys/src/9/vz64/audiovz.c
+      create_file .../prompt "Review this code:\n<contents>"
+
+    RIGHT (efficient):
+      create_file .../prompt "Review /sys/src/9/vz64/audiovz.c.
+        Read it with read_file, then give me your analysis."
+
+The sub-agent will use its own tool calls to read the file.
+This is especially important for large files -- you avoid
+doubling the token cost.  Be assertive in telling the
+sub-agent to use its tools; some models (especially Haiku)
+may hesitate or claim they cannot read files, but they can.
+Phrasing like "Use read_file to read X" or "You have tools;
+read the file directly" resolves any confusion.
+
 ### 5. Deposit the result in the acme window
 
 Write the text to `/mnt/acme/<id>/body`.  Writes to `body`
@@ -115,6 +142,16 @@ Hang up the sub-agent session:
     create_file /mnt/claudesub/dizzy-monkey/ctl "hangup"
 
 ## Notes
+
+- **Sub-agents share the namespace and have tools.**  Every
+  sub-agent session has the same read_file, create_file,
+  list_directory, mk, and read_man_page tools as the outer
+  agent, operating on the same filesystem namespace.  They
+  can read any file you can read.  Always tell sub-agents
+  to read files themselves rather than pasting file contents
+  into their prompts.  This saves tokens and context space.
+  If csearchfs is mounted at /n/csearch, sub-agents can use
+  that too.
 
 - **Two servers, many sub-agents:** The sub-agent server at
   `/mnt/claudesub` can host many sessions via `clone`.  You
