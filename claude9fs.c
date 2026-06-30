@@ -79,6 +79,21 @@ static int nextsid;
 static QLock sessionlk;
 
 /*
+ * Guards only the defskills pointer itself (read in newsession
+ * and wrsystem, read-and-replaced in doreloadskills).  Kept
+ * separate from sessionlk/Session.lk and always used as a leaf
+ * lock (never held while waiting on another lock): wrsystem is
+ * called with s->lk already held by its caller, and doreload-
+ * skills takes sessionlk then each session's lk while walking
+ * the list, so reusing either of those for defskills would put
+ * sessionlk/s->lk on both sides of two different nesting orders
+ * -- a deadlock waiting to happen.  Callers snapshot the string
+ * (estrdup) while holding this lock and use the copy afterward,
+ * rather than holding it across any other work.
+ */
+static QLock skillslk;
+
+/*
  * Read all files from a skills directory and return a malloc'd
  * string containing a "Skills" section suitable for appending
  * to the system prompt.  Each file becomes a subsection with
@@ -232,8 +247,12 @@ static Session*
 newsession(void)
 {
 	Session *s;
-	char *name;
+	char *name, *skills;
 	char buf[32];
+
+	qlock(&skillslk);
+	skills = defskills != nil ? estrdup(defskills) : nil;
+	qunlock(&skillslk);
 
 	s = emallocz(sizeof *s, 1);
 	qlock(&sessionlk);
@@ -259,12 +278,13 @@ newsession(void)
 		name = estrdup(buf);
 	}
 	s->name = name;
-	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt, defskills);
+	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt, skills);
 	s->streamrz.l = &s->streamlk;
 	s->streamdone = 1;
 	s->next = sessions;
 	sessions = s;
 	qunlock(&sessionlk);
+	free(skills);
 	return s;
 }
 
@@ -701,9 +721,67 @@ wrtokens(Session *s, char *data)
 static char*
 wrsystem(Session *s, char *data)
 {
-	free(s->conv->sysprompt);
-	s->conv->sysprompt = estrdup(data);
+	char *skills;
+
+	qlock(&skillslk);
+	skills = defskills != nil ? estrdup(defskills) : nil;
+	qunlock(&skillslk);
+	convsetprompt(s->conv, data, skills);
+	free(skills);
 	return nil;
+}
+
+/*
+ * Re-read the skills directory and apply the result to every
+ * live session (each session's own base prompt is preserved;
+ * only the skills suffix changes), then update defskills so
+ * new sessions pick it up too.  Assumes skillsdir != nil --
+ * handlectl checks that synchronously before scheduling a call
+ * here, so the ctl write gets a proper error if claude9fs was
+ * started without -K.
+ *
+ * A session with a prompt round in flight is left alone: its
+ * conv is safe to touch (claudeconverse does not hold s->lk
+ * during the round), but skipping it avoids racing a reply
+ * that's using the old skills text mid-round, and "busy" is
+ * already this codebase's convention for "don't touch this
+ * session's settings right now" (see the busy checks in
+ * fswrite).  It simply keeps the old skills text until a later
+ * reload finds it idle.
+ *
+ * Called from fswrite with no session lock held (see the
+ * Qctl/reloadskills handling below for why).
+ */
+static void
+doreloadskills(void)
+{
+	char *new;
+	Session *s;
+
+	new = readskills(skillsdir);	/* nil is fine: means no skills */
+
+	/*
+	 * Apply to every live session first (each gets its own
+	 * estrdup'd copy via convsetprompt; new itself is only
+	 * read here, never stored), then publish to defskills for
+	 * future sessions.  sessionlk/s->lk nesting here never
+	 * involves skillslk, and the skillslk critical section
+	 * below never involves sessionlk/s->lk -- see the comment
+	 * on skillslk's declaration for why that separation matters.
+	 */
+	qlock(&sessionlk);
+	for(s = sessions; s != nil; s = s->next){
+		qlock(&s->lk);
+		if(!s->busy)
+			convsetprompt(s->conv, s->conv->basesys, new);
+		qunlock(&s->lk);
+	}
+	qunlock(&sessionlk);
+
+	qlock(&skillslk);
+	free(defskills);
+	defskills = new;
+	qunlock(&skillslk);
 }
 
 static void
@@ -1043,9 +1121,17 @@ fsread(Req *r)
 /*
  * Handle a ctl command.  Called with s->lk held.
  * Returns nil on success or an error string.
+ *
+ * hangupp/reloadp are out-parameters for the two commands whose
+ * real work must happen with no session lock held: hangup acts
+ * on the whole session (including freeing it), and reloadskills
+ * acts on every session, including this one, which is already
+ * locked by our caller (fswrite) -- relocking it here would
+ * deadlock.  Both commands just flag the request and return;
+ * fswrite does the actual work after unlocking.
  */
 static char*
-handlectl(Session *s, char *cmd, int *hangup)
+handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 {
 	if(strcmp(cmd, "clear") == 0){
 		if(s->busy)
@@ -1082,7 +1168,11 @@ handlectl(Session *s, char *cmd, int *hangup)
 			return "compact: keep count must be at least 1";
 		convcompact(s->conv, keep);
 	} else if(strcmp(cmd, "hangup") == 0){
-		*hangup = 1;
+		*hangupp = 1;
+	} else if(strcmp(cmd, "reloadskills") == 0){
+		if(skillsdir == nil)
+			return "no skills directory configured (start claude9fs with -K)";
+		*reloadp = 1;
 	} else if(strncmp(cmd, "autocontinue", 12) == 0){
 		char *v;
 		int n;
@@ -1267,7 +1357,7 @@ static void
 fswrite(Req *r)
 {
 	uvlong path;
-	int type, sid, hangup, i;
+	int type, sid, hangup, reload, i;
 	Session *s;
 	char *data, *err;
 	long count;
@@ -1304,8 +1394,9 @@ fswrite(Req *r)
 
 	case Qctl:
 		hangup = 0;
+		reload = 0;
 		qlock(&s->lk);
-		err = handlectl(s, data, &hangup);
+		err = handlectl(s, data, &hangup, &reload);
 		qunlock(&s->lk);
 		free(data);
 		if(err != nil){
@@ -1314,6 +1405,8 @@ fswrite(Req *r)
 		}
 		if(hangup)
 			delsession(sid);
+		if(reload)
+			doreloadskills();
 		r->ofcall.count = r->ifcall.count;
 		respond(r, nil);
 		break;

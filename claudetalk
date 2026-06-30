@@ -147,7 +147,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -238,6 +238,7 @@ fn docmd {
 		echo '  /usage         show token usage' >[1=2]
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
 		echo '  /noautocontinue   disable auto-continue' >[1=2]
+		echo '  /reloadskills  re-read the skills directory (all sessions)' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
 		echo '  /quit          exit' >[1=2]
 	}
@@ -253,6 +254,10 @@ fn docmd {
 	if not if(~ $cmd /noautocontinue /noac){
 		echo 'noautocontinue' > $sess/ctl
 		echo 'autocontinue: 0' >[1=2]
+	}
+	if not if(~ $cmd /reloadskills){
+		echo reloadskills > $sess/ctl
+		echo 'skills reloaded' >[1=2]
 	}
 	if not {
 		echo 'unknown command: '$cmd >[1=2]

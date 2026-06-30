@@ -157,6 +157,7 @@ and returns its number.
 	hangup             destroy the session
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
+	reloadskills       re-read the skills directory (see Skills)
 
 ### Defaults
 
@@ -434,10 +435,13 @@ the file.  This lets you configure persistent instructions --
 coding conventions, project context, persona tweaks -- without
 editing C or passing a giant `-sysprompt` string.
 
-Skills are baked into the system prompt at startup, so they
-benefit from Anthropic's prompt caching: the entire skills
-block is a cache hit on every request after the first, adding
-no extra latency or cost.
+Skills are loaded at startup and benefit from Anthropic's
+prompt caching: the skills text is a cache hit on every request
+after the first, adding no extra latency or cost in the steady
+state.  Editing a skill file only costs a fresh cache write on
+the next request of each session it's applied to -- rare and
+small, since skill files change far less often than every
+request.
 
 #### Example: set up a skills directory
 
@@ -459,8 +463,14 @@ Then start claude9fs with:
 	claude9fs -K $home/lib/claude-skills
 
 The model will see these instructions as part of its system
-prompt in every session.  To change skills, edit the files and
-restart claude9fs.
+prompt in every session.  To pick up changes after editing a
+skill file, write `reloadskills` to any session's `ctl` (or
+`/reloadskills` in claudetalk) instead of restarting the
+server: every live session's prompt is updated in place (so
+even a conversation already in progress sees the change on its
+next message), and new sessions pick it up too.  A session with
+a prompt round in flight at the moment of the reload keeps its
+old skills text until a later reload finds it idle.
 
 #### What the model sees
 
@@ -481,9 +491,11 @@ like:
 	The main project lives in /usr/dave/work/myproject.
 	Always run mk after editing source to check for errors.
 
-Skills are appended after the default system prompt (or after
-a custom one if you write to the session's `system` file
-before loading skills).  Subdirectories are ignored; only
+Skills are appended after the base system prompt -- the
+default, or a custom one if you've written to the session's
+`system` file -- and stay appended even if you write to
+`system` again later or skills are reloaded afterward; each
+keeps the other intact.  Subdirectories are ignored; only
 regular files are read.
 
 ## claudetalk - rc Shell Client
@@ -521,6 +533,7 @@ file in the background while writing to `prompt`.
 	/usage         show token usage
 	/autocontinue [n]  enable auto-continue on max_tokens (default 3)
 	/noautocontinue    disable auto-continue
+	/reloadskills  re-read the skills directory (all live sessions)
 	/detach        keep session alive on exit (can reattach later)
 	/help          show command list
 	/quit          exit

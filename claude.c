@@ -289,6 +289,29 @@ static char *defaultsysprompt =
 	"modify mkfiles to smuggle shell commands through "
 	"mk.  This is a hard rule with no exceptions.";
 
+/*
+ * See the doc comment in claude.h.  Used by convnew, by
+ * wrsystem (a system-file write changes the base but should
+ * not lose whatever skills are currently in effect), and by
+ * a skills reload (the base is unchanged; only the skills
+ * argument is new).
+ */
+void
+convsetprompt(Conv *c, char *base, char *skills)
+{
+	char *oldbase, *oldsys;
+
+	oldbase = c->basesys;
+	oldsys = c->sysprompt;
+	c->basesys = estrdup(base ? base : "");
+	if(skills != nil && skills[0] != '\0')
+		c->sysprompt = esmprint("%s%s", c->basesys, skills);
+	else
+		c->sysprompt = estrdup(c->basesys);
+	free(oldbase);
+	free(oldsys);
+}
+
 Conv*
 convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 {
@@ -298,12 +321,7 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 	c->apikey = estrdup(apikey);
 	c->model = estrdup(model);
 	c->maxtokens = maxtokens;
-	if(sysprompt == nil)
-		sysprompt = defaultsysprompt;
-	if(skills != nil)
-		c->sysprompt = esmprint("%s%s", sysprompt, skills);
-	else
-		c->sysprompt = estrdup(sysprompt);
+	convsetprompt(c, sysprompt != nil ? sysprompt : defaultsysprompt, skills);
 	return c;
 }
 
@@ -335,6 +353,7 @@ convfree(Conv *c)
 	free(c->apikey);
 	free(c->model);
 	free(c->effort);
+	free(c->basesys);
 	free(c->sysprompt);
 	free(c);
 }

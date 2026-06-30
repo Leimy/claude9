@@ -38,7 +38,8 @@ struct Conv {
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
 	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
 	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
-	char *sysprompt;
+	char *basesys;	/* sysprompt before skills are appended */
+	char *sysprompt;	/* basesys + current skills: what's actually sent */
 	Msg *msgs;
 	Msg *tail;
 };
@@ -55,6 +56,15 @@ struct Usage {
 Conv*	convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills);
 void	convfree(Conv *c);
 void	convclear(Conv *c);
+/*
+ * Set a conversation's base system prompt and recompute the
+ * effective sysprompt (base + skills, skills may be nil/empty)
+ * that buildreq actually sends.  base is remembered so skills
+ * can be recombined later (a system-file write, or a skills
+ * reload) without needing to know or strip whatever skills
+ * text was appended last time.
+ */
+void	convsetprompt(Conv *c, char *base, char *skills);
 Msg*	msgnew(int role, char *text, char *rawjson);
 void	convappend(Conv *c, Msg *m);
 /*
