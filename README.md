@@ -322,11 +322,22 @@ mid-sentence.  Normally you would need to manually send a
 follow-up message to get the rest.
 
 The `autocontinue` ctl command automates this.  When enabled,
-claude9fs checks the stop reason after each response; if it is
+claude9fs checks the outcome after each response; if it is
 `max_tokens`, the fs automatically appends a `"Continue."` user
 message and sends another request, keeping the stream open so
 the reader sees seamless text.  This repeats up to *n* times or
 until the model stops on its own (e.g. `end_turn`).
+
+Auto-continue also fires in one other case: when a single
+prompt runs the tool loop all the way to its per-prompt round
+cap (20 rounds; see "Tool Use") while the model is still
+calling tools.  That conversation is left well-formed and ends
+on a tool-results turn, so a `"Continue."` lets the model pick
+up the work it had not finished, exactly as with a `max_tokens`
+cut.  A genuine API error does *not* trigger a continuation:
+resending a broken or context-exceeded conversation would only
+repeat the failure, so the loop stops and the error is reported
+in the `error` file instead.
 
 This works even when the cut lands mid tool call: the orphaned
 tool_use is answered with a `not executed` result (see the

@@ -48,7 +48,7 @@ struct Session {
 	int streamdone;
 	int streamgen;
 	int closed;	/* session destroyed; guarded by streamlk */
-	/* auto-continue on max_tokens */
+	/* auto-continue on max_tokens or tool-loop round cap */
 	int autocont;	/* max auto-continue rounds; 0 = disabled */
 	Session *next;
 };
@@ -1109,11 +1109,15 @@ handlectl(Session *s, char *cmd, int *hangup)
  * touch s->conv while claudeconverse is walking it.
  *
  * Round 0 answers the user's message; if a round was
- * guillotined by max_tokens and auto-continue is enabled,
+ * guillotined by max_tokens, or hit the tool-loop round cap
+ * while still calling tools, and auto-continue is enabled,
  * "Continue." is sent up to autocont more times.  The stream
  * stays open across continuations, so readers see seamless
- * text.  A failed round stops the loop: continuing a broken
- * round compounds the damage and hides the error.
+ * text.  A genuinely failed round stops the loop: continuing a
+ * broken round compounds the damage and hides the error.  The
+ * tool-loop-limit case is not such a failure -- the
+ * conversation is left well-formed and resumable -- so it is
+ * treated like max_tokens (see the loop below).
  *
  * Token usage accumulates in a local Usage and is published
  * to s->usage under s->lk only when the round ends, so other
@@ -1157,9 +1161,41 @@ doprompt(Req *r, Session *s, char *data)
 			free(reply);
 			ok = 1;
 		}
-		if(reply == nil || err != nil || round >= autocont)
+		if(reply == nil || round >= autocont)
 			break;
-		if(u.stop_reason == nil || strcmp(u.stop_reason, "max_tokens") != 0)
+		/*
+		 * Decide whether to auto-continue.  Two cases are
+		 * recoverable; everything else stops the loop.
+		 *
+		 * 1. max_tokens: the round was guillotined mid-output.
+		 *    claudeconverse already answered any orphaned
+		 *    tool_use with a "not executed" result, so the
+		 *    conversation is well-formed and "Continue." picks
+		 *    up where the cut fell.  err is nil here.
+		 *
+		 * 2. tool loop limit: the per-prompt round cap (20) was
+		 *    hit while the model was still calling tools.  This
+		 *    sets err to the recoverable "tool loop limit
+		 *    reached" string, but leaves the conversation
+		 *    well-formed and ending on a tool_results user turn.
+		 *    "Continue." (merged into that turn by buildreq)
+		 *    lets the model resume.  Clear err so the
+		 *    continuation round starts clean; if that round in
+		 *    turn fails for real, its error is recorded then.
+		 *
+		 * A genuine API error (err set, not the tool-loop
+		 * limit) must NOT be continued: resending a broken or
+		 * wedged conversation just repeats the failure (this is
+		 * how an earlier attempt turned one error into a loop of
+		 * "request body is not valid JSON").
+		 */
+		if(err != nil){
+			if(!toollimiterr(err))
+				break;
+			free(err);
+			err = nil;
+		}else if(u.stop_reason == nil
+		|| strcmp(u.stop_reason, "max_tokens") != 0)
 			break;
 		qlock(&s->lk);
 		convappend(s->conv, msgnew(Muser, "Continue.", nil));

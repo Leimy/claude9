@@ -1189,16 +1189,26 @@ toollist(char *path)
  * Run a command with stdout and stderr captured through a
  * pipe, optionally chdir'd to dir first.  Returns the combined
  * output (caller frees) or nil with errstr set.
+ *
+ * Uses wait() and matches on the returned pid instead of
+ * waitpid(), which reaps an arbitrary child.  With the srv
+ * loop released around prompt rounds, two sessions can run a
+ * tool (mk, man) concurrently; waitpid() would let one round
+ * reap the other's child, wedging the second runcmd.  Looping
+ * on wait() until our own pid comes back keeps each round
+ * reaping only its own child.
  */
 static char*
 runcmd(char *dir, char *cmd, char **argv)
 {
-	int pfd[2];
+	int pfd[2], cpid;
 	char *data;
+	Waitmsg *w;
 
 	if(pipe(pfd) < 0)
 		return nil;
-	switch(fork()){
+	cpid = fork();
+	switch(cpid){
 	case -1:
 		close(pfd[0]);
 		close(pfd[1]);
@@ -1219,7 +1229,13 @@ runcmd(char *dir, char *cmd, char **argv)
 	close(pfd[1]);
 	data = readfile(pfd[0]);
 	close(pfd[0]);
-	waitpid();
+	while((w = wait()) != nil){
+		if(w->pid == cpid){
+			free(w);
+			break;
+		}
+		free(w);
+	}
 	return data;
 }
 
@@ -1904,6 +1920,23 @@ overlimiterr(char *err)
 enum {
 	Maxrounds = 20,	/* tool-loop round cap per prompt */
 };
+
+/*
+ * True if err is the specific, recoverable "tool loop limit
+ * reached" condition raised when claudeconverse exhausts
+ * Maxrounds while the model is still calling tools.  Unlike a
+ * real API failure, the conversation is left well-formed
+ * (every tool_use answered by a tool_result, ending on a user
+ * turn), so it is safe to resume with another prompt.  The
+ * exact wording must match the esmprint below.
+ */
+int
+toollimiterr(char *err)
+{
+	if(err == nil)
+		return 0;
+	return strstr(err, "tool loop limit reached") != nil;
+}
 
 char*
 claudeconverse(Conv *c, Usage *usage,

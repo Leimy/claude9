@@ -125,20 +125,39 @@ parsestr(char **pp)
 				}
 				q += 5;	/* skip 'u' and 4 hex digits */
 
+				/*
+				 * Surrogates.  A high surrogate (D800-DBFF)
+				 * followed by a low surrogate (DC00-DFFF) is a
+				 * UTF-16 pair encoding an astral rune; combine
+				 * them.  A lone surrogate of either half is
+				 * malformed.
+				 *
+				 * We do NOT fail the parse on a lone surrogate:
+				 * these reach us inside stored rawjson snapshots
+				 * that we must reparse to rebuild the request,
+				 * and one bad escape would otherwise sink the
+				 * whole conversation (the reparse fails, content
+				 * is replaced by placeholder text, tool blocks
+				 * desync, and every resend is rejected as
+				 * "request body is not valid JSON").  Instead we
+				 * substitute U+FFFD, exactly as chartorune does
+				 * for malformed UTF-8 byte input, so the string
+				 * stays well-formed Unicode and the conversation
+				 * survives.  Crucially this also means a surrogate
+				 * NEVER reaches runetochar, which on Plan 9 would
+				 * happily emit raw CESU-8 surrogate bytes that the
+				 * API then rejects.
+				 */
 				if(0xD800 <= r && r <= 0xDBFF){
-					if(q[0] != '\\' || q[1] != 'u' ||
-					   parseu4(q+2, &r2) < 0 ||
-					   r2 < 0xDC00 || r2 > 0xDFFF){
-						free(s);
-						werrstr("bad surrogate pair");
-						return nil;
-					}
-					r = 0x10000 + ((r - 0xD800) << 10) + (r2 - 0xDC00);
-					q += 6;	/* skip \uXXXX of low surrogate */
+					if(q[0] == '\\' && q[1] == 'u'
+					&& parseu4(q+2, &r2) == 0
+					&& 0xDC00 <= r2 && r2 <= 0xDFFF){
+						r = 0x10000 + ((r - 0xD800) << 10) + (r2 - 0xDC00);
+						q += 6;	/* skip \uXXXX of low surrogate */
+					}else
+						r = Runeerror;	/* lone high surrogate */
 				}else if(0xDC00 <= r && r <= 0xDFFF){
-					free(s);
-					werrstr("lone low surrogate");
-					return nil;
+					r = Runeerror;	/* lone low surrogate */
 				}
 				w += runetochar(w, &r);
 				break;
@@ -593,6 +612,20 @@ fmtjstr(Fmt *f, char *s)
 			break;
 		if((uchar)*q >= Runeself){
 			q += chartorune(&r, q);
+			/*
+			 * chartorune decodes CESU-8 surrogate bytes
+			 * (e.g. ED A0 BD) back into a surrogate rune
+			 * rather than Runeerror, and runetochar/fmtrune
+			 * would then re-emit them verbatim.  The API
+			 * rejects request bodies containing surrogate
+			 * code points, so fold any surrogate to U+FFFD
+			 * here.  parsestr already prevents surrogates
+			 * from entering our strings; this is the second
+			 * line of defense for bytes that arrive by any
+			 * other path.
+			 */
+			if(0xD800 <= r && r <= 0xDFFF)
+				r = Runeerror;
 			fmtrune(f, r);
 			continue;
 		}

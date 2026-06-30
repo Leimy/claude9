@@ -89,6 +89,15 @@ long	convinputbytes(Conv *c);
  */
 int	overlimiterr(char *err);
 /*
+ * True if an error string from claudeconverse is the specific
+ * "tool loop limit reached" condition: the tool loop hit its
+ * per-prompt round cap while the model was still calling tools.
+ * The conversation is left well-formed and resumable, so this
+ * is recoverable (auto-continue can send another "Continue."),
+ * unlike a real API failure.
+ */
+int	toollimiterr(char *err);
+/*
  * Run the full tool loop: send the conversation, execute any
  * tool calls Claude makes, send the results back, repeat until
  * a non-tool stop_reason.  Appends all rounds (assistant +
