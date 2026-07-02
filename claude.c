@@ -1,6 +1,7 @@
 #include <u.h>
 #include <libc.h>
 #include <bio.h>
+#include <thread.h>
 #include "json.h"
 #include "claude.h"
 
@@ -1482,6 +1483,91 @@ exectool(ToolCall *tc)
 		tc->name ? tc->name : "");
 }
 
+/* one exectool() call running in its own proc; see runtools */
+typedef struct Toolwork Toolwork;
+struct Toolwork {
+	ToolCall *tc;
+	Channel *done;	/* elsize sizeof(ToolCall*); shared by all workers of a round */
+};
+
+static void
+toolworker(void *v)
+{
+	Toolwork *w;
+
+	w = v;
+	w->tc->result = exectool(w->tc);
+	sendp(w->done, w->tc);
+	free(w);
+}
+
+/*
+ * Run every tool call from one assistant turn and fill in each
+ * tc->result.  A turn with a single tool_use (by far the common
+ * case) calls exectool directly, with no extra procs.
+ *
+ * A turn with several tool_use blocks -- e.g. the model firing
+ * off prompts to multiple sub-agent sessions, or several
+ * independent read_file calls -- runs them concurrently, one
+ * Plan 9 process per call (proccreate: shares memory, the fd
+ * table, and the namespace with the caller, so tc->result is
+ * written directly and every tool still sees the same mounts).
+ * Without this, a slow call (a sub-agent's whole prompt round,
+ * an mk invocation) stalls every other tool_use in the same
+ * turn, even though nothing about them is actually related.
+ *
+ * Each ToolCall is touched by exactly one worker, so no locking
+ * is needed around tc->result itself.  Completion is reported
+ * over an unbuffered channel and this function drains exactly
+ * one message per worker before returning, so no worker proc
+ * outlives the call and the round's tool_result list is only
+ * built once every result is in.
+ *
+ * exectool's own concurrency hazards (e.g. runcmd's fork+wait
+ * for mk/man) are already safe under this: wait(2) only ever
+ * collects children of the calling process, and each worker is
+ * its own process, so two workers' runcmd children can never
+ * cross-reap each other -- the same reasoning that already
+ * covers two sessions running mk at once (see runcmd's comment).
+ */
+static void
+runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
+{
+	ToolCall *tc;
+	Toolwork *w;
+	Channel *done;
+	char marker[256];
+	int n;
+
+	n = 0;
+	for(tc = calls; tc != nil; tc = tc->next){
+		if(cb != nil){
+			snprint(marker, sizeof marker,
+				"\n[running %s %s]\n",
+				tc->name, tc->args[0]);
+			cb(marker, aux);
+		}
+		n++;
+	}
+	if(n == 0)
+		return;
+	if(n == 1){
+		calls->result = exectool(calls);
+		return;
+	}
+
+	done = chancreate(sizeof(ToolCall*), 0);
+	for(tc = calls; tc != nil; tc = tc->next){
+		w = emalloc(sizeof *w);
+		w->tc = tc;
+		w->done = done;
+		proccreate(toolworker, w, 32*1024);
+	}
+	while(n-- > 0)
+		recvp(done);
+	chanfree(done);
+}
+
 static char*
 mktoolresults(ToolCall *calls)
 {
@@ -2027,15 +2113,7 @@ claudeconverse(Conv *c, Usage *usage,
 			return fmtstrflush(&f);
 		}
 
-		for(tc = r->tools; tc != nil; tc = tc->next){
-			if(cb != nil){
-				snprint(marker, sizeof marker,
-					"\n[running %s %s]\n",
-					tc->name, tc->args[0]);
-				cb(marker, aux);
-			}
-			tc->result = exectool(tc);
-		}
+		runtools(r->tools, cb, aux);
 
 		resultjson = mktoolresults(r->tools);
 		convappend(c, msgnew(Muser, "", resultjson));
