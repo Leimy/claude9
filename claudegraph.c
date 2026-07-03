@@ -82,14 +82,10 @@
  */
 #include <u.h>
 #include <libc.h>
+#include "view.h"
 #include <draw.h>
 #include <event.h>
 #include <keyboard.h>
-
-typedef struct Vec3 Vec3;
-struct Vec3 {
-	double	x, y, z;
-};
 
 typedef struct Node Node;
 struct Node {
@@ -104,9 +100,7 @@ struct Node {
 	char	*label;		/* display label: "tag:name" or "name" */
 
 	/* force-directed layout state, world coordinates */
-	Vec3	pos;
-	Vec3	vel;
-	Vec3	frc;		/* scratch: force accumulator for one step */
+	Sbody	body;		/* pos, vel, frc (scratch) */
 	int	placed;		/* pos is meaningful (scratch during rebuild) */
 
 	/* per-frame projection */
@@ -127,14 +121,10 @@ static int havebusy;		/* any node busy (drives halo animation) */
 static int simwarm;		/* layout not yet settled; keep stepping */
 
 /*
- * View state: a camera orbiting the origin.  yaw/pitch in
- * degrees, zoom a plain scale factor.  vyaw/vpitch are the
- * momentum velocities (degrees per millisecond) tracked while
- * dragging and consumed with friction after release, exactly
- * like radioglobe's inertial spin.
+ * View state: a camera orbiting the origin, with inertial drag.
+ * All yaw/pitch/zoom access goes through the Orbit.
  */
-static double yaw = -35.0, pitch = 18.0, zoom = 1.0;
-static double vyaw, vpitch;
+static Orbit orb;
 static int autorotate = 1;
 static ulong pulse;		/* tick counter for the busy halo */
 
@@ -180,16 +170,11 @@ static Image *edgepal[Nshade];	/* blue-gray edges */
 /*
  * Layout tuning.  World units are abstract; Worldr world units
  * map to half the window's short side at zoom 1.
+ * Spring physics params (Worldclamp/Restlen/Kspring/Krep/Kcent/
+ * Damp/Maxv) come from springdefaults().
  */
 #define Worldr		3.0	/* view scale */
-#define Worldclamp	5.0	/* hard cap on |pos| */
 #define Pdist		9.0	/* perspective camera distance */
-#define Restlen		1.3	/* edge rest length */
-#define Kspring		0.10	/* edge spring constant */
-#define Krep		0.50	/* pairwise repulsion */
-#define Kcent		0.03	/* gravity toward the origin */
-#define Damp		0.80	/* velocity damping per step */
-#define Maxv		0.30	/* speed cap per step */
 #define Stopv		0.0015	/* below this max speed, layout is settled */
 #define Nodesz		10.0	/* node radius in pixels at zoom 1, mid depth */
 
@@ -198,12 +183,19 @@ static Image *edgepal[Nshade];	/* blue-gray edges */
 #define Fadeend		900.0
 #define Fademin		0.30
 
-/* drag/momentum tuning */
+/* drag sensitivity */
 #define Dragdeg		0.35	/* degrees of rotation per pixel dragged */
-#define Friction	0.92
-#define Vmin		0.0005
 
 static int reconnectms = 2000;
+
+/* spring embedder state */
+static Spring spring;
+static Sbody **springb;
+static int nspringb;
+static int capspringb;
+static Sedge *springe;
+static int nspringe;
+static int capspringe;
 
 void*
 emalloc(ulong n)
@@ -233,55 +225,6 @@ estrdup(char *s)
 	if(s == nil)
 		sysfatal("strdup: %r");
 	return s;
-}
-
-static Vec3
-vadd(Vec3 a, Vec3 b)
-{
-	a.x += b.x;
-	a.y += b.y;
-	a.z += b.z;
-	return a;
-}
-
-static Vec3
-vsub(Vec3 a, Vec3 b)
-{
-	a.x -= b.x;
-	a.y -= b.y;
-	a.z -= b.z;
-	return a;
-}
-
-static Vec3
-vmul(Vec3 a, double s)
-{
-	a.x *= s;
-	a.y *= s;
-	a.z *= s;
-	return a;
-}
-
-static double
-vdot(Vec3 a, Vec3 b)
-{
-	return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-/* random vector of length r, for jitter and initial placement */
-static Vec3
-rndvec(double r)
-{
-	Vec3 v;
-	double m;
-
-	do{
-		v.x = frand() - 0.5;
-		v.y = frand() - 0.5;
-		v.z = frand() - 0.5;
-		m = vdot(v, v);
-	}while(m < 1e-4);
-	return vmul(v, r/sqrt(m));
 }
 
 typedef struct Grow Grow;
@@ -438,8 +381,8 @@ rebuildnodes(void)
 		for(j = 0; j < nnode; j++){
 			o = &nodes[j];
 			if(o->srci == n->srci && strcmp(o->name, n->name) == 0){
-				n->pos = o->pos;
-				n->vel = o->vel;
+				n->body.pos = o->body.pos;
+				n->body.vel = o->body.vel;
 				n->placed = 1;
 				/*
 				 * A parent label appearing, changing, or
@@ -471,16 +414,16 @@ rebuildnodes(void)
 			n = &g.v[i];
 			if(n->placed || n->parentidx < 0 || !g.v[n->parentidx].placed)
 				continue;
-			n->pos = vadd(g.v[n->parentidx].pos, rndvec(0.6));
-			n->vel.x = n->vel.y = n->vel.z = 0;
+			n->body.pos = v3add(g.v[n->parentidx].body.pos, v3rand(0.6));
+			n->body.vel.x = n->body.vel.y = n->body.vel.z = 0;
 			n->placed = 1;
 		}
 	for(i = 0; i < g.n; i++){
 		n = &g.v[i];
 		if(n->placed)
 			continue;
-		n->pos = rndvec(1.5 + frand());
-		n->vel.x = n->vel.y = n->vel.z = 0;
+		n->body.pos = v3rand(1.5 + frand());
+		n->body.vel.x = n->body.vel.y = n->body.vel.z = 0;
 		n->placed = 1;
 	}
 
@@ -494,79 +437,36 @@ rebuildnodes(void)
 			havebusy = 1;
 	if(changed)
 		simwarm = 1;
-}
 
-/*
- * One step of the spring embedder.  Returns the largest node
- * speed this step, so the caller can tell when the layout has
- * settled and stop burning ticks on it.  O(n^2), which is
- * nothing at session-graph scale.
- */
-static double
-physstep(void)
-{
-	int i, j;
-	Node *a, *b;
-	Vec3 d;
-	double d2, dist, mag, maxv, v;
-
-	if(nnode == 0)
-		return 0.0;
-
-	for(i = 0; i < nnode; i++)
-		nodes[i].frc = vmul(nodes[i].pos, -Kcent);
-
-	/* pairwise repulsion */
-	for(i = 0; i < nnode; i++)
-		for(j = i+1; j < nnode; j++){
-			a = &nodes[i];
-			b = &nodes[j];
-			d = vsub(a->pos, b->pos);
-			d2 = vdot(d, d);
-			if(d2 < 1e-4){
-				/* coincident: shove apart in a random direction */
-				d = rndvec(0.05);
-				d2 = vdot(d, d);
-			}
-			dist = sqrt(d2);
-			mag = Krep / d2;
-			a->frc = vadd(a->frc, vmul(d, mag/dist));
-			b->frc = vsub(b->frc, vmul(d, mag/dist));
-		}
-
-	/* springs along parent-child edges */
-	for(i = 0; i < nnode; i++){
-		a = &nodes[i];
-		if(a->parentidx < 0)
-			continue;
-		b = &nodes[a->parentidx];
-		d = vsub(b->pos, a->pos);
-		dist = sqrt(vdot(d, d));
-		if(dist < 1e-3)
-			continue;
-		mag = Kspring * (dist - Restlen);
-		a->frc = vadd(a->frc, vmul(d, mag/dist));
-		b->frc = vsub(b->frc, vmul(d, mag/dist));
+	/* rebuild Spring body/edge arrays from current node set */
+	springdefaults(&spring);
+	nspringb = nnode;
+	if(nspringb > capspringb){
+		capspringb = nspringb + 32;
+		springb = erealloc(springb, capspringb*sizeof(Sbody*));
 	}
+	for(i = 0; i < nnode; i++)
+		springb[i] = &nodes[i].body;
+	spring.b = springb;
+	spring.nb = nspringb;
 
-	/* integrate with damping, a speed cap, and a world cap */
-	maxv = 0.0;
-	for(i = 0; i < nnode; i++){
-		a = &nodes[i];
-		a->vel = vmul(vadd(a->vel, a->frc), Damp);
-		v = sqrt(vdot(a->vel, a->vel));
-		if(v > Maxv){
-			a->vel = vmul(a->vel, Maxv/v);
-			v = Maxv;
-		}
-		a->pos = vadd(a->pos, a->vel);
-		d2 = vdot(a->pos, a->pos);
-		if(d2 > Worldclamp*Worldclamp)
-			a->pos = vmul(a->pos, Worldclamp/sqrt(d2));
-		if(v > maxv)
-			maxv = v;
+	nspringe = 0;
+	for(i = 0; i < nnode; i++)
+		if(nodes[i].parentidx >= 0)
+			nspringe++;
+	if(nspringe > capspringe){
+		capspringe = nspringe + 32;
+		springe = erealloc(springe, capspringe*sizeof(Sedge));
 	}
-	return maxv;
+	j = 0;
+	for(i = 0; i < nnode; i++)
+		if(nodes[i].parentidx >= 0){
+			springe[j].a = i;
+			springe[j].b = nodes[i].parentidx;
+			j++;
+		}
+	spring.e = springe;
+	spring.ne = nspringe;
 }
 
 /* height of the bottom status strip */
@@ -589,28 +489,19 @@ viewrect(void)
 
 /*
  * Compute the projection basis for the current yaw/pitch and
- * the scale/center for rectangle r.  vex/vey are the screen-
- * right/screen-up unit vectors, vez points at the viewer --
- * the same scheme as radioglobe's viewbasis(), with yaw/pitch
- * playing lon/lat.
+ * the scale/center for rectangle r.  Uses viewbasis() from
+ * libview to compute the screen-right/screen-up/toward-viewer
+ * unit vectors.
  */
 static void
 setview(Rectangle r)
 {
-	double cla, sla, clo, slo, m;
+	double m;
 
-	cla = cos(pitch * PI/180.0);
-	sla = sin(pitch * PI/180.0);
-	clo = cos(yaw * PI/180.0);
-	slo = sin(yaw * PI/180.0);
-
-	vex.x = -slo;      vex.y = clo;       vex.z = 0;
-	vey.x = -sla*clo;  vey.y = -sla*slo;  vey.z = cla;
-	vez.x = cla*clo;   vez.y = cla*slo;   vez.z = sla;
-
+	viewbasis(orb.yaw, orb.pitch, &vex, &vey, &vez);
 	vctr = Pt((r.min.x + r.max.x)/2, (r.min.y + r.max.y)/2);
 	m = Dx(r) < Dy(r) ? Dx(r) : Dy(r);
-	vscale = zoom * (m/2.0) * 0.85 / Worldr;
+	vscale = orb.zoom * (m/2.0) * 0.85 / Worldr;
 }
 
 static void
@@ -618,9 +509,9 @@ projectnode(Node *n)
 {
 	double px, py, pz, f;
 
-	px = vdot(n->pos, vex);
-	py = vdot(n->pos, vey);
-	pz = vdot(n->pos, vez);
+	px = v3dot(n->body.pos, vex);
+	py = v3dot(n->body.pos, vey);
+	pz = v3dot(n->body.pos, vez);
 
 	/* perspective: nearer (larger pz) is bigger */
 	f = Pdist / (Pdist - pz);
@@ -630,7 +521,7 @@ projectnode(Node *n)
 	n->scr.x = vctr.x + (int)(px * vscale * f);
 	n->scr.y = vctr.y - (int)(py * vscale * f);
 	n->depth = pz;
-	n->rad = (int)(Nodesz * f * zoom + 0.5);
+	n->rad = (int)(Nodesz * f * orb.zoom + 0.5);
 	if(n->rad < 3)
 		n->rad = 3;
 	if(n->rad > 60)
@@ -729,18 +620,6 @@ shadeidx(double s)
 	return i;
 }
 
-static char*
-idlefmt(long s, char *buf, int nbuf)
-{
-	if(s < 60)
-		snprint(buf, nbuf, "%lds", s);
-	else if(s < 3600)
-		snprint(buf, nbuf, "%ldm%02lds", s/60, s%60);
-	else
-		snprint(buf, nbuf, "%ldh%02ldm", s/3600, (s%3600)/60);
-	return buf;
-}
-
 static void
 setmsg(char *fmt, ...)
 {
@@ -764,7 +643,7 @@ drawstatus(long now)
 	Rectangle r;
 	Point p;
 	Node *n;
-	char buf[512], ib[32];
+	char buf[512];
 	int i, nbusy;
 
 	r = screen->r;
@@ -776,15 +655,16 @@ drawstatus(long now)
 		snprint(buf, sizeof buf, "%s", statmsg);
 	else if(selnode >= 0 && selnode < nnode){
 		n = &nodes[selnode];
-		if(n->busy)
-			snprint(buf, sizeof buf, "%s   model %s   BUSY   parent %s",
-				n->label, n->model,
-				n->parent != nil ? n->parent : "-");
-		else
-			snprint(buf, sizeof buf, "%s   model %s   idle %s   parent %s",
-				n->label, n->model,
-				idlefmt(effidle(n, now), ib, sizeof ib),
-				n->parent != nil ? n->parent : "-");
+		/*
+		 * State is BUSY/idle plus the idle/busy sphere color;
+		 * no elapsed-idle-time readout here (removed: it's
+		 * redundant with the color and its display cadence
+		 * could make the count look like it was running fast).
+		 */
+		snprint(buf, sizeof buf, "%s   model %s   %s   parent %s",
+			n->label, n->model,
+			n->busy ? "BUSY" : "idle",
+			n->parent != nil ? n->parent : "-");
 	}else{
 		nbusy = 0;
 		for(i = 0; i < nnode; i++)
@@ -1095,10 +975,7 @@ main(int argc, char *argv[])
 {
 	Event e;
 	Mouse m;
-	int i, anim, dragging, oldbuttons, hsrc, fd;
-	Point dragstart;
-	double dragyaw, dragpitch, lastyaw, lastpitch, dt, dy;
-	ulong lastmsec;
+	int i, anim, oldbuttons, hsrc, fd;
 	char *hname, *hlabel, *path;
 
 	ARGBEGIN{
@@ -1130,6 +1007,12 @@ main(int argc, char *argv[])
 
 	srand(time(0) ^ (getpid()<<8));
 
+	orbitinit(&orb, -35.0, 18.0, 1.0);
+	orb.pitchmin = -85.0;
+	orb.pitchmax =  85.0;
+	orb.zoommin  =  0.2;
+	orb.zoommax  =  8.0;
+
 	if(initdraw(nil, nil, "claudegraph") < 0)
 		sysfatal("initdraw: %r");
 	mkpalettes();
@@ -1150,14 +1033,7 @@ main(int argc, char *argv[])
 		}
 	}
 
-	dragging = 0;
 	oldbuttons = 0;
-	dragstart = ZP;
-	dragyaw = yaw;
-	dragpitch = pitch;
-	lastyaw = yaw;
-	lastpitch = pitch;
-	lastmsec = 0;
 
 	for(;;)
 		switch(event(&e)){
@@ -1173,51 +1049,52 @@ main(int argc, char *argv[])
 				break;
 			case '0':
 				lockdisplay(display);
-				yaw = -35.0;
-				pitch = 18.0;
-				zoom = 1.0;
-				vyaw = vpitch = 0.0;
+				orb.yaw = -35.0;
+				orb.pitch = 18.0;
+				orb.zoom = 1.0;
+				orb.vyaw = orb.vpitch = 0.0;
+				orbitnorm(&orb);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case '+':
 			case '=':
 				lockdisplay(display);
-				zoom *= 1.3;
-				if(zoom > 8.0) zoom = 8.0;
+				orbitzoom(&orb, 1.3);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case '-':
 				lockdisplay(display);
-				zoom /= 1.3;
-				if(zoom < 0.2) zoom = 0.2;
+				orbitzoom(&orb, 1.0/1.3);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case Kleft:
 				lockdisplay(display);
-				yaw -= 10.0;
+				orb.yaw -= 10.0;
+				orbitnorm(&orb);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case Kright:
 				lockdisplay(display);
-				yaw += 10.0;
+				orb.yaw += 10.0;
+				orbitnorm(&orb);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case Kup:
 				lockdisplay(display);
-				pitch += 10.0;
-				if(pitch > 85.0) pitch = 85.0;
+				orb.pitch += 10.0;
+				orbitnorm(&orb);
 				redraw();
 				unlockdisplay(display);
 				break;
 			case Kdown:
 				lockdisplay(display);
-				pitch -= 10.0;
-				if(pitch < -85.0) pitch = -85.0;
+				orb.pitch -= 10.0;
+				orbitnorm(&orb);
 				redraw();
 				unlockdisplay(display);
 				break;
@@ -1230,8 +1107,7 @@ main(int argc, char *argv[])
 			/* scroll wheel zoom */
 			if(m.buttons & 8){
 				lockdisplay(display);
-				zoom *= 1.15;
-				if(zoom > 8.0) zoom = 8.0;
+				orbitzoom(&orb, 1.15);
 				redraw();
 				unlockdisplay(display);
 				oldbuttons = m.buttons;
@@ -1239,8 +1115,7 @@ main(int argc, char *argv[])
 			}
 			if(m.buttons & 16){
 				lockdisplay(display);
-				zoom /= 1.15;
-				if(zoom < 0.2) zoom = 0.2;
+				orbitzoom(&orb, 1.0/1.15);
 				redraw();
 				unlockdisplay(display);
 				oldbuttons = m.buttons;
@@ -1250,40 +1125,26 @@ main(int argc, char *argv[])
 			/* button 1: drag to rotate, with momentum */
 			if(m.buttons & 1){
 				lockdisplay(display);
-				if(!dragging && !(oldbuttons & 1)){
-					dragging = 1;
-					dragstart = m.xy;
-					dragyaw = yaw;
-					dragpitch = pitch;
-					/* grabbing a spinning graph stops it dead */
-					vyaw = vpitch = 0.0;
-					lastyaw = yaw;
-					lastpitch = pitch;
-					lastmsec = m.msec;
+				if(!orb.dragging && !(oldbuttons & 1)){
+					/* button-1 press edge: start drag */
+					orbitdown(&orb, m.xy.x, m.xy.y, m.msec);
 				}
-				if(dragging){
-					yaw = dragyaw - (double)(m.xy.x - dragstart.x)*Dragdeg;
-					pitch = dragpitch + (double)(m.xy.y - dragstart.y)*Dragdeg;
-					if(pitch > 85.0) pitch = 85.0;
-					if(pitch < -85.0) pitch = -85.0;
-					while(yaw > 180.0) yaw -= 360.0;
-					while(yaw < -180.0) yaw += 360.0;
-					if(m.msec > lastmsec){
-						dt = m.msec - lastmsec;
-						dy = yaw - lastyaw;
-						while(dy > 180.0) dy -= 360.0;
-						while(dy < -180.0) dy += 360.0;
-						vyaw = dy / dt;
-						vpitch = (pitch - lastpitch) / dt;
-						lastyaw = yaw;
-						lastpitch = pitch;
-						lastmsec = m.msec;
-					}
-					redraw();
-				}
+				orbitmove(&orb, m.xy.x, m.xy.y, m.msec, Dragdeg);
+				redraw();
 				unlockdisplay(display);
-			}else
-				dragging = 0;
+			}else if(orb.dragging){
+				/*
+				 * No button 1: end any drag.  Deliberately
+				 * not an oldbuttons edge test -- the scroll
+				 * branches above break early and overwrite
+				 * oldbuttons, so releasing button 1 during
+				 * a scroll chord would lose the edge and
+				 * leave the drag stuck on.
+				 */
+				lockdisplay(display);
+				orbitup(&orb);
+				unlockdisplay(display);
+			}
 
 			/*
 			 * button 3 over a node: hangup menu.  Copy the
@@ -1325,7 +1186,7 @@ main(int argc, char *argv[])
 			}
 
 			/* hover */
-			if(m.buttons == 0 && !dragging){
+			if(m.buttons == 0 && !orb.dragging){
 				lockdisplay(display);
 				mousept = m.xy;
 				i = nodeat(mousept);
@@ -1347,27 +1208,16 @@ main(int argc, char *argv[])
 				break;
 			lockdisplay(display);
 			anim = 0;
-			if(!dragging && (vyaw != 0.0 || vpitch != 0.0)){
-				yaw += vyaw * Tickms;
-				pitch += vpitch * Tickms;
-				if(pitch > 85.0){ pitch = 85.0; vpitch = 0.0; }
-				if(pitch < -85.0){ pitch = -85.0; vpitch = 0.0; }
-				while(yaw > 180.0) yaw -= 360.0;
-				while(yaw < -180.0) yaw += 360.0;
-				vyaw *= Friction;
-				vpitch *= Friction;
-				if(fabs(vyaw) < Vmin && fabs(vpitch) < Vmin)
-					vyaw = vpitch = 0.0;
+			if(orbittick(&orb, Tickms))
 				anim = 1;
-			}
-			if(autorotate && !dragging && nnode > 0){
-				yaw += 0.12;
-				if(yaw > 180.0)
-					yaw -= 360.0;
+			if(autorotate && !orb.dragging && nnode > 0){
+				orb.yaw += 0.12;
+				if(orb.yaw > 180.0)
+					orb.yaw -= 360.0;
 				anim = 1;
 			}
 			if(simwarm){
-				if(physstep() < Stopv)
+				if(springstep(&spring) < Stopv)
 					simwarm = 0;
 				anim = 1;
 			}

@@ -8,13 +8,21 @@ TARG=claude9fs claudegraph
 
 COMMONO=claude.$O json.$O
 
+LIBVIEW=/usr/dave/work/libview/libview.a$O
+
 all:V: claude9fs claudegraph
 
 claude9fs: claude9fs.$O $COMMONO
 	$LD $LDFLAGS -o $target claude9fs.$O $COMMONO
 
-claudegraph: claudegraph.$O
-	$LD $LDFLAGS -o $target claudegraph.$O
+claudegraph: claudegraph.$O $LIBVIEW
+	$LD $LDFLAGS -o $target claudegraph.$O $LIBVIEW
+
+claudegraph.$O: claudegraph.c
+	$CC $CFLAGS -I/usr/dave/work/libview claudegraph.c
+
+$LIBVIEW:V:
+	@{cd /usr/dave/work/libview && mk}
 
 %.$O: %.c
 	$CC $CFLAGS $stem.c
