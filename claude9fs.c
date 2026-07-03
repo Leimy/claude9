@@ -581,6 +581,26 @@ convtext(Conv *c)
  * A viewer that wants a live idle age should add its own clock
  * time elapsed since it read the snapshot, which is exactly
  * what claudegraph does when fading long-idle sessions.
+ *
+ * Never returns a truly empty (zero-length) string, even when
+ * there are no live sessions at all: graphread's delivery test
+ * is "fa->graphoff < fa->graphlen", which a zero-length update
+ * fails even though it is real, meaningful data (the graph just
+ * went to zero sessions).  Without this, that transition would
+ * be silently swallowed -- graphread would fetch the empty text,
+ * stamp fa->graphgen as current, and loop straight back into
+ * rsleep(), so a blocked graphlive reader would never learn the
+ * graph emptied out and would keep showing whatever it last saw
+ * (see graphread's comment for the long version).  Padding with
+ * a bare newline keeps graphlen >= 1 so the delivery test
+ * succeeds and the response actually goes out; parsegraph() on
+ * the client side already skips blank lines, so this still
+ * parses back to zero sessions correctly.  A real fix has to
+ * work this way rather than just letting the empty response
+ * through as count 0: a 9P read returning 0 bytes is
+ * indistinguishable from EOF, and claudegraph's watchproc()
+ * treats n <= 0 as "source gone" and falls back to reconnect
+ * polling instead of rendering zero sessions.
  */
 static char*
 graphtext(void)
@@ -588,6 +608,7 @@ graphtext(void)
 	Session *s;
 	Fmt f;
 	long now;
+	char *text;
 
 	now = time(0);
 	fmtstrinit(&f);
@@ -603,7 +624,12 @@ graphtext(void)
 		qunlock(&s->lk);
 	}
 	qunlock(&sessionlk);
-	return fmtstrflush(&f);
+	text = fmtstrflush(&f);
+	if(text != nil && text[0] == '\0'){
+		free(text);
+		text = estrdup("\n");
+	}
+	return text;
 }
 
 static char*
@@ -1106,6 +1132,15 @@ streamread(Req *r, Session *s, Faux *fa)
  * passes live=1 for graphlive, live=0 for graph.  fa->grapheof
  * latches once a non-live fid has returned EOF, so a subsequent
  * read stays at EOF instead of re-fetching the same snapshot.
+ *
+ * The "is there more of the current snapshot to deliver" test
+ * below is fa->graphoff < fa->graphlen, which depends on
+ * graphtext() never handing back a zero-length string for a
+ * real update -- see graphtext's comment.  A zero-length
+ * snapshot (the graph going to zero sessions) would otherwise
+ * be indistinguishable from "nothing fetched yet", and this
+ * loop would fetch it, stamp fa->graphgen current, and go
+ * straight back to sleep without ever responding.
  */
 static void
 graphread(Req *r, Faux *fa, int live)
