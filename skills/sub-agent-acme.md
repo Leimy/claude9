@@ -83,6 +83,22 @@ Read `clone` on the **sub-agent** claude9fs mount:
 This allocates a new independent session on the second server.
 Do NOT read `/mnt/claude/clone` -- that will deadlock.
 
+**Tag it with its parent, for the graph view.**  claude9fs has
+no way to know that you (some session) just spawned this one --
+it only knows what you tell it.  Right after cloning, write your
+own session's name to the new session's `ctl` as `parent`:
+
+    create_file /mnt/claudesub/dizzy-monkey/ctl "parent my-session-name"
+
+If a live viewer (`claudegraph`, see below) or a script is
+watching, this is the only thing that makes the parent/child
+edge show up.  It costs one write and is easy to forget, so make
+it part of the same step as cloning, not an afterthought.  If
+you don't know your own session's name, it's whatever name your
+own claude9fs session directory has (visible in the `ctl` file
+of the session serving *you*, or in the greeting most clients
+print at startup).
+
 ### 3. Configure the session
 
 Set the model to something cheap for simple tasks:
@@ -303,6 +319,48 @@ know, as opposed to trusting a transcript.
 - **Already running:** If `/srv/claude` or `/srv/claudesub`
   already exist (e.g. from a detached session), claudetalk
   reuses them instead of starting new processes.
+
+## Watching the graph live: claudegraph
+
+If you tag sessions with `parent` as described in step 2, the
+`graph` file at the root of each claude9fs mount (e.g.
+`/mnt/claude/graph`, `/mnt/claudesub/graph`) lists every live
+session as one tab-separated line:
+`name  model  busy  parent  idlesecs`
+(idlesecs is 0 while busy, else seconds since the last prompt
+round started or ended, as of the moment of the read).  This is
+machine-readable and meant for tools, not for you to narrate
+back to the user verbatim.
+
+`claudegraph` (built alongside `claude9fs` from this same
+source tree) is a libdraw program that watches both mounts and
+draws the sessions as a rotating 3D force-directed graph
+(ubigraph-style): spheres connected by parent->child edges,
+busy sessions pulsing amber, long-idle sessions fading toward
+the background.  Drag rotates, scroll zooms, space toggles the
+slow auto-rotation, hovering a node shows its name/model/state,
+and button 3 over a node offers a `hangup` menu entry -- handy
+for cleaning up sub-agents someone forgot to hang up, since
+sessions live until an explicit hangup.  It does not poll: the
+`graph` file is a long-poll file (a blocking read that returns
+immediately with the current snapshot, then blocks until the
+next change), the same technique the `stream` file already
+uses for reply text, so updates appear the instant something
+changes rather than up to a second late.  If the user wants a
+live visual of sub-agent activity, tell them to run it in a
+new window rather than trying to reconstruct the graph yourself
+from repeated `ls`/`ctl` reads:
+
+    window claudegraph
+
+or, if they already have specific mounts:
+
+    claudegraph /mnt/claude /mnt/claudesub
+
+It is read-only against the filesystem (just reads `graph`
+files, blocking between changes rather than polling) and has
+no effect on sessions; it is safe to leave running for the
+whole life of a claudetalk session.
 
 ## Models (as of this writing)
 

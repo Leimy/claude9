@@ -12,6 +12,8 @@ enum {
 	Qroot,
 	Qclone,
 	Qmodels,
+	Qgraph,
+	Qgraphlive,
 	Qsess,
 	Qctl,
 	Qprompt,
@@ -33,6 +35,7 @@ typedef struct Session Session;
 struct Session {
 	int id;
 	char *name;
+	char *parent;	/* optional: name of the session that spawned this one, for graph tracking */
 	Conv *conv;
 	char *lastreply;
 	char *lasterror;
@@ -41,6 +44,7 @@ struct Session {
 	int unlinked;	/* removed from session list; guarded by sessionlk */
 	QLock lk;
 	int busy;	/* prompt round in flight; guarded by lk */
+	long lastact;	/* time(0) of last busy transition; guarded by lk */
 	/* streaming */
 	QLock streamlk;
 	Rendez streamrz;
@@ -60,8 +64,14 @@ struct Faux {
 	int streamgen;		/* -1 = not latched, >=0 = latched generation */
 	int streamopengen;	/* s->streamgen at open time */
 	int streamidle;		/* stream was idle (done) at open time */
-	Req *curreq;		/* in-progress stream read; guarded by streamlk */
-	int flushing;		/* curreq has been flushed; guarded by streamlk */
+	Req *curreq;		/* in-progress stream/graph read; guarded by streamlk/graphlk */
+	int flushing;		/* curreq has been flushed; guarded by streamlk/graphlk */
+	/* Qgraph long-poll state; see graphread */
+	char *graphbuf;		/* snapshot currently being delivered, or nil */
+	int graphlen;
+	int graphoff;
+	int graphgen;		/* -1 = never delivered; else generation graphbuf is from */
+	int grapheof;		/* Qgraph only: EOF already returned on this fid */
 };
 
 static Srv clsrv;
@@ -77,6 +87,35 @@ static char *namepath = "/mnt/names/name";
 static Session *sessions;
 static int nextsid;
 static QLock sessionlk;
+
+/*
+ * graphgen increments whenever the session graph changes in a
+ * way a viewer would care about: a session created or
+ * destroyed, or a session's busy/parent/model changes.
+ * graphread (Qgraph) blocks a reader until graphgen advances
+ * past what it last saw, instead of making clients poll on a
+ * timer.
+ *
+ * Always a leaf lock, like skillslk (see its comment): callers
+ * elsewhere may be holding sessionlk and/or a session's s->lk
+ * when they call bumpgraph, so bumpgraph must never block
+ * waiting on those.  graphread enforces the other half of that
+ * discipline itself: it always drops graphlk before calling
+ * graphtext(), which takes sessionlk and each session's s->lk,
+ * so graphlk is never held while waiting on them either.
+ */
+static QLock graphlk;
+static Rendez graphrz;
+static int graphgen;
+
+static void
+bumpgraph(void)
+{
+	qlock(&graphlk);
+	graphgen++;
+	rwakeupall(&graphrz);
+	qunlock(&graphlk);
+}
 
 /*
  * Guards only the defskills pointer itself (read in newsession
@@ -278,6 +317,7 @@ newsession(void)
 		name = estrdup(buf);
 	}
 	s->name = name;
+	s->lastact = time(0);
 	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt, skills);
 	s->streamrz.l = &s->streamlk;
 	s->streamdone = 1;
@@ -285,6 +325,7 @@ newsession(void)
 	sessions = s;
 	qunlock(&sessionlk);
 	free(skills);
+	bumpgraph();
 	return s;
 }
 
@@ -297,6 +338,7 @@ freesession(Session *s)
 	free(s->lastreply);
 	free(s->lasterror);
 	free(s->name);
+	free(s->parent);
 	free(s->usage.stop_reason);
 	free(s->stream.s);
 	free(s);
@@ -326,12 +368,14 @@ delsession(int id)
 			if(dofree){
 				/* no users left; reclaim now */
 				freesession(s);
+				bumpgraph();
 				return;
 			}
 			qlock(&s->streamlk);
 			s->closed = 1;
 			rwakeupall(&s->streamrz);
 			qunlock(&s->streamlk);
+			bumpgraph();
 			return;
 		}
 	}
@@ -442,6 +486,8 @@ static struct {
 } rootfiles[] = {
 	{ "clone",	Qclone },
 	{ "models",	Qmodels },
+	{ "graph",	Qgraph },
+	{ "graphlive",	Qgraphlive },
 };
 
 static void
@@ -513,6 +559,50 @@ convtext(Conv *c)
 	for(m = c->msgs; m != nil; m = m->next)
 		fmtprint(&f, "[%s]\n%s\n\n",
 			m->role == Muser ? "user" : "assistant", m->text);
+	return fmtstrflush(&f);
+}
+
+/*
+ * One line per live session: name, model, busy flag, parent
+ * (the name of whatever session's ctl wrote "parent <name>" to
+ * this one, or "-" if none), and idle seconds (0 while busy;
+ * otherwise seconds since the last busy transition, i.e. since
+ * the last prompt round started or ended -- a freshly created
+ * session counts from creation).  Tab-separated so a viewer can
+ * enumerate the whole session graph with a single read instead
+ * of walking the directory and opening each session's ctl file.
+ * Parent is just a label recorded by convention (see the ctl
+ * "parent" command) -- claude9fs does not itself create sessions
+ * on another session's behalf, so it cannot know the relationship
+ * except by being told.
+ *
+ * The idle field is a point-in-time value: it is NOT re-bumped
+ * as time passes (that would defeat the graphlive long-poll).
+ * A viewer that wants a live idle age should add its own clock
+ * time elapsed since it read the snapshot, which is exactly
+ * what claudegraph does when fading long-idle sessions.
+ */
+static char*
+graphtext(void)
+{
+	Session *s;
+	Fmt f;
+	long now;
+
+	now = time(0);
+	fmtstrinit(&f);
+	qlock(&sessionlk);
+	for(s = sessions; s != nil; s = s->next){
+		qlock(&s->lk);
+		fmtprint(&f, "%s\t%s\t%d\t%s\t%ld\n",
+			s->name,
+			s->conv->model,
+			s->busy,
+			s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
+			s->busy ? 0L : now - s->lastact);
+		qunlock(&s->lk);
+	}
+	qunlock(&sessionlk);
 	return fmtstrflush(&f);
 }
 
@@ -634,19 +724,23 @@ rdctl(Session *s)
 	think = thinkingtext(s->conv);
 	text = esmprint(
 		"name %s\n"
+		"parent %s\n"
 		"model %s\n"
 		"tokens %d\n"
 		"messages %ld\n"
 		"exchanges %d\n"
 		"bytes %ld\n"
+		"busy %d\n"
 		"autocontinue %d\n"
 		"thinking %s\n",
 		s->name,
+		s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
 		s->conv->model,
 		s->conv->maxtokens,
 		nmsg,
 		nexch,
 		nbytes,
+		s->busy,
 		s->autocont,
 		think);
 	free(think);
@@ -700,6 +794,7 @@ wrmodel(Session *s, char *data)
 {
 	free(s->conv->model);
 	s->conv->model = estrdup(data);
+	bumpgraph();
 	return nil;
 }
 
@@ -977,12 +1072,123 @@ streamread(Req *r, Session *s, Faux *fa)
 }
 
 /*
- * Tflush: if the flushed request is a stream read blocked in
- * streamread, mark it and wake the sleeper; it responds to the
- * old request with "interrupted".  For anything else (e.g. an
- * in-flight prompt write, which cannot be cancelled mid-API
- * call) we just respond to the flush; lib9p delays the Rflush
- * until the old request's response is sent.
+ * Two files expose the session graph, differing only in what
+ * happens once a fid has delivered the whole current snapshot:
+ *
+ *   graph      A plain, always-terminating snapshot.  Reads
+ *              hand back the current snapshot; once it is fully
+ *              delivered, the next read returns EOF (count 0).
+ *              Safe for any read-to-EOF consumer -- cat(1), a
+ *              shell $(), an agent's read_file tool -- none of
+ *              which would ever expect a read to block forever.
+ *              This is the file to poke by hand or from a script.
+ *
+ *   graphlive  A blocking long-poll for a live viewer.  The
+ *              first read returns the current snapshot; once it
+ *              is fully delivered, the next read BLOCKS until
+ *              the graph changes (a session created/destroyed,
+ *              or a busy/parent/model change -- see bumpgraph's
+ *              callers), then returns the new snapshot.  A
+ *              viewer opens this once and sits in a plain read
+ *              loop, redrawing whatever comes back, with no
+ *              polling timer.  claudegraph uses this.
+ *
+ * In both cases each fid's notion of "current" is private and
+ * independent of the requested offset, and a short read (fewer
+ * bytes than asked for) is NOT EOF: if the client's buffer is
+ * smaller than one snapshot, read again on the same fid to get
+ * the rest of the snapshot before the fid either returns EOF
+ * (graph) or blocks for the next change (graphlive).
+ *
+ * fa->graphgen/graphbuf/graphlen/graphoff are private per-fid
+ * state guarded by graphlk, set up by fsopen and released by
+ * fsdestroyfid.  graphread implements both files; the caller
+ * passes live=1 for graphlive, live=0 for graph.  fa->grapheof
+ * latches once a non-live fid has returned EOF, so a subsequent
+ * read stays at EOF instead of re-fetching the same snapshot.
+ */
+static void
+graphread(Req *r, Faux *fa, int live)
+{
+	long avail, want;
+	char *text;
+
+	qlock(&graphlk);
+	fa->curreq = r;
+	fa->flushing = 0;
+	for(;;){
+		if(fa->flushing){
+			fa->curreq = nil;
+			fa->flushing = 0;
+			qunlock(&graphlk);
+			respond(r, "interrupted");
+			return;
+		}
+		if(fa->graphbuf != nil && fa->graphoff < fa->graphlen)
+			break;	/* more of the current snapshot to deliver */
+		if(!live && fa->grapheof){
+			/* already signalled EOF on this fid; stay there */
+			fa->curreq = nil;
+			qunlock(&graphlk);
+			r->ofcall.count = 0;
+			respond(r, nil);
+			return;
+		}
+		if(fa->graphgen >= 0 && fa->graphgen == graphgen){
+			if(!live){
+				/*
+				 * Snapshot fully delivered and nothing has
+				 * changed: a plain file returns EOF rather
+				 * than blocking, so read-to-EOF consumers
+				 * terminate.  Latch it so re-reads stay at
+				 * EOF instead of re-fetching the same text.
+				 */
+				fa->grapheof = 1;
+				fa->curreq = nil;
+				qunlock(&graphlk);
+				r->ofcall.count = 0;
+				respond(r, nil);
+				return;
+			}
+			rsleep(&graphrz);	/* graphlive: wait for a change */
+			continue;
+		}
+		/*
+		 * First read ever on this fid (graphgen < 0), or the
+		 * graph changed since our last snapshot: fetch a fresh
+		 * one.  graphtext() takes sessionlk and per-session
+		 * locks, so graphlk must not be held here -- see its
+		 * declaration comment.
+		 */
+		qunlock(&graphlk);
+		text = graphtext();
+		qlock(&graphlk);
+		free(fa->graphbuf);
+		fa->graphbuf = text;
+		fa->graphlen = strlen(text);
+		fa->graphoff = 0;
+		fa->graphgen = graphgen;
+	}
+	avail = fa->graphlen - fa->graphoff;
+	want = r->ifcall.count;
+	if(want > avail)
+		want = avail;
+	memmove(r->ofcall.data, fa->graphbuf + fa->graphoff, want);
+	r->ofcall.count = want;
+	fa->graphoff += want;
+	fa->curreq = nil;
+	qunlock(&graphlk);
+	respond(r, nil);
+}
+
+/*
+ * Tflush: if the flushed request is a stream or graph read
+ * blocked in streamread/graphread, mark it and wake the
+ * sleeper; it responds to the old request with "interrupted".
+ * For anything else (e.g. an in-flight prompt write, which
+ * cannot be cancelled mid-API call) we just respond to the
+ * flush; lib9p delays the Rflush until the old request's
+ * response is sent.
  */
 static void
 fsflush(Req *r)
@@ -1007,6 +1213,16 @@ fsflush(Req *r)
 				qunlock(&s->streamlk);
 			}
 			sessput(s);
+		} else if(path == Qgraph || path == Qgraphlive){
+			fa = old->fid->aux;
+			if(fa != nil){
+				qlock(&graphlk);
+				if(fa->curreq == old){
+					fa->flushing = 1;
+					rwakeupall(&graphrz);
+				}
+				qunlock(&graphlk);
+			}
 		}
 	}
 	respond(r, nil);
@@ -1041,6 +1257,13 @@ fsopen(Req *r)
 			sessput(s);
 		}
 	}
+	/* Qgraph: forget any snapshot from a previous open of this fid */
+	free(fa->graphbuf);
+	fa->graphbuf = nil;
+	fa->graphlen = 0;
+	fa->graphoff = 0;
+	fa->graphgen = -1;
+	fa->grapheof = 0;
 	respond(r, nil);
 }
 
@@ -1077,6 +1300,13 @@ fsread(Req *r)
 	if(path == Qmodels){
 		srvrelease(&clsrv);
 		modelstext(r);
+		srvacquire(&clsrv);
+		return;
+	}
+
+	if(path == Qgraph || path == Qgraphlive){
+		srvrelease(&clsrv);
+		graphread(r, fa, path == Qgraphlive);
 		srvacquire(&clsrv);
 		return;
 	}
@@ -1167,6 +1397,22 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		if(keep < 1)
 			return "compact: keep count must be at least 1";
 		convcompact(s->conv, keep);
+	} else if(strncmp(cmd, "parent", 6) == 0
+	&& (cmd[6] == '\0' || cmd[6] == ' ')){
+		/*
+		 * Record which session (by name) spawned this one, for
+		 * a graph viewer to draw an edge.  This is purely a
+		 * label the caller volunteers -- typically right after
+		 * cloning a sub-agent session -- claude9fs has no other
+		 * way to know the relationship.  "parent -" or "parent"
+		 * with nothing after it clears the label.
+		 */
+		char *v;
+		v = cmd + 6;
+		while(*v == ' ') v++;
+		free(s->parent);
+		s->parent = (*v != '\0' && strcmp(v, "-") != 0) ? estrdup(v) : nil;
+		bumpgraph();
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangupp = 1;
 	} else if(strcmp(cmd, "reloadskills") == 0){
@@ -1231,12 +1477,14 @@ doprompt(Req *r, Session *s, char *data)
 		return;
 	}
 	s->busy = 1;
+	s->lastact = time(0);
 	free(s->lasterror);
 	s->lasterror = nil;
 	convappend(s->conv, msgnew(Muser, data, nil));
 	free(data);
 	autocont = s->autocont;
 	qunlock(&s->lk);
+	bumpgraph();
 
 	memset(&u, 0, sizeof u);
 	streamclear(s, 0);
@@ -1299,6 +1547,7 @@ doprompt(Req *r, Session *s, char *data)
 
 	qlock(&s->lk);
 	s->busy = 0;
+	bumpgraph();
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
 	if(!ok){
@@ -1451,6 +1700,7 @@ fsdestroyfid(Fid *fid)
 	if(fa != nil){
 		/* drop the reference held by a clone fid */
 		sessput(fa->clone);
+		free(fa->graphbuf);
 		free(fa);
 		fid->aux = nil;
 	}
@@ -1508,6 +1758,8 @@ threadmain(int argc, char **argv)
 		if(defskills != nil)
 			fprint(2, "loaded skills from %s\n", skillsdir);
 	}
+
+	graphrz.l = &graphlk;
 
 	memset(&clsrv, 0, sizeof clsrv);
 	clsrv.attach = fsattach;
