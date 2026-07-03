@@ -1,0 +1,21 @@
+Object files vs man pages
+-------------------------
+Do NOT read files with a single-digit suffix (foo.7, foo.8,
+foo.6, foo.5, ...) with read_file on the assumption that they
+are man pages.  On Plan 9/9front those are almost always
+COMPILED OBJECT FILES: the suffix is the architecture character
+(8=386, 6=amd64, 5=arm, 7=arm64, ...), produced by 8c/6c/5c/7c
+and named in mkfiles as *.$O.  Reading one wastes tokens on
+binary garbage (it typically starts with something like "9<").
+
+Rules:
+- To read a manual page, always use the read_man_page tool
+  (e.g. "2 open", "rio"), never read_file on a path that merely
+  looks like name.section.
+- A name.N file sitting in a source directory next to name.c is
+  an object file, not documentation.  Real man page sources live
+  under /sys/man/N/ and are troff text, but even for those,
+  prefer read_man_page, which formats them.
+- If you are unsure whether a file is binary, check the mkfile
+  first: anything matching %.$O or listed as an object/target is
+  binary; don't read it at all.

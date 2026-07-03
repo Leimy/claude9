@@ -6,9 +6,10 @@
 # the main server's namespace includes the sub-agent mount.
 # On exit (unless -d), both servers are torn down.
 #
-# usage: claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
+# usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
 #   -a name       attach to existing session (skip server startup)
 #   -d            detach on exit: leave session and servers alive
+#   -g            also pop up a claudegraph window on the session graph
 #   -M model      default model for claude9fs
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
@@ -18,14 +19,15 @@ rfork e
 
 attach=()
 detach=0
+graph=()
 model=()
 maxtokens=()
 skills=()
 namepath=()
-flagfmt='a:attach session,d,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
+flagfmt='a:attach session,d,g:graph,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
 args=''
 if(! ifs=() eval `{aux/getflags $*}){
-	echo 'usage: claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
+	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
 	exit usage
 }
 
@@ -121,6 +123,18 @@ if not {
 	}
 }
 
+if(~ $graph 1){
+	# Pop up in a fresh rio window rather than forking in place:
+	# claudegraph draws over whatever window it runs in, and this
+	# one is busy being the chat terminal.  A window created via
+	# rio(1)'s "window" gets its own, unrelated namespace group,
+	# so claudegraph mounting /mnt/claude here first would not
+	# help it anyway; claudegraph's own /srv fallback (see
+	# automount() in claudegraph.c) is what makes it work there.
+	window claudegraph $mnt $submnt &
+	echo 'claudegraph: opened in a new window' >[1=2]
+}
+
 if(~ $#attach 0){
 	n=`{cat $mnt/clone}
 	if(~ $#n 0){
@@ -147,7 +161,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -239,6 +253,7 @@ fn docmd {
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
 		echo '  /noautocontinue   disable auto-continue' >[1=2]
 		echo '  /reloadskills  re-read the skills directory (all sessions)' >[1=2]
+		echo '  /graph         open a claudegraph window on all live sessions' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
 		echo '  /quit          exit' >[1=2]
 	}
@@ -258,6 +273,10 @@ fn docmd {
 	if not if(~ $cmd /reloadskills){
 		echo reloadskills > $sess/ctl
 		echo 'skills reloaded' >[1=2]
+	}
+	if not if(~ $cmd /graph){
+		window claudegraph $mnt $submnt &
+		echo 'claudegraph: opened in a new window' >[1=2]
 	}
 	if not {
 		echo 'unknown command: '$cmd >[1=2]

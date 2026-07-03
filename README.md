@@ -138,6 +138,10 @@ and returns its number.
 	/mnt/claude/
 		clone         read to create a new session (returns session number)
 		models        read to list available models from the API
+		graph         read a one-line-per-session summary of every live
+		              session; terminates with EOF (see Session Graph)
+		graphlive     same summary, but a blocking long-poll for live
+		              viewers (see Session Graph)
 		<n>/          session directory
 			ctl       read for session info; write commands
 			prompt    write a message; read the last final reply
@@ -154,6 +158,7 @@ and returns its number.
 
 	clear              clear conversation history and usage counters
 	compact [n]        drop old exchanges, keeping the n most recent (default 4)
+	parent <name>      label this session as spawned by session <name> (see Session Graph)
 	hangup             destroy the session
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
@@ -425,6 +430,120 @@ larger than the window (for example one prompt that triggered
 many rounds of large tool output).  In that case `clear` is
 the only recovery for now.
 
+### Session Graph
+
+claude9fs tracks each session's name, model, and busy state
+automatically, but it has no built-in notion of which session
+spawned which -- sub-agent orchestration (see the sub-agent
+skill) happens entirely through ordinary tool calls from one
+session's model to another server's `clone` file, so claude9fs
+cannot see the relationship on its own.  It can only record
+what it is told:
+
+	echo 'parent mysession' > /mnt/claudesub/dizzy-monkey/ctl
+
+This labels session `dizzy-monkey` as spawned by `mysession`.
+The label is just a string; claude9fs does not validate that
+`mysession` actually exists (it may live on a different
+claude9fs process, e.g. the main server relative to a
+sub-agent server) or resolve it -- resolving names into a graph
+is a client's job.
+
+Two root-level files expose every live session's name, model,
+busy flag, and parent as one tab-separated line each:
+
+	name<TAB>model<TAB>busy<TAB>parent
+
+`parent` is `-` when unset.  The two files carry the same
+snapshot and differ only in what happens once a reader has
+drained it:
+
+`graph` is an ordinary, always-terminating file: a read returns
+the current snapshot, and once it is fully delivered the next
+read returns EOF.  This is the file to read by hand or from a
+script -- `cat`, an rc `$(...)`, or anything else that reads to
+EOF gets exactly one snapshot and stops:
+
+	cat /mnt/claude/graph        # prints the snapshot and returns
+
+`graphlive` is a **long-poll** file, so a viewer never has to
+poll on a timer.  The first read on a freshly opened fid returns
+the current snapshot immediately.  Every later read on that
+*same* fid blocks inside claude9fs until the session graph
+actually changes -- a session created or destroyed, or a
+busy/parent/model change -- and then returns the new snapshot.
+This is the same technique the `stream` file already uses for
+incremental reply text (see Streaming), just applied to a value
+that always has *some* current content instead of one that
+starts empty.  A read returning fewer bytes than requested is
+not EOF; keep reading the same fid to drain the rest of the
+current snapshot before it blocks waiting for the next change. A
+blocked read can be cancelled with a Tflush (e.g. by
+closing/interrupting the read), same as `stream`.
+
+	fd = open("/mnt/claude/graphlive", OREAD)
+	read(fd, buf, sizeof buf)   # returns immediately: current snapshot
+	read(fd, buf, sizeof buf)   # blocks until something changes, then returns
+
+The split matters because the long-poll behavior is a footgun
+for the naive reader: a plain `cat /mnt/claude/graphlive` prints
+the first snapshot and then *hangs* forever waiting for the next
+change, and so does any read-to-EOF consumer (including an
+agent's own file-reading tools).  Reach for `graph` unless you
+are writing a live viewer that wants to block for updates.
+
+`claudegraph`, built alongside claude9fs from this same source
+tree, is a small libdraw program that opens one `graphlive` fid
+per mount point and forks a proc per source that just sits in a
+blocking read loop, redrawing whenever a read returns.  It
+draws the sessions as boxes with edges from parent to child,
+highlighting busy sessions in yellow.  Hovering the pointer
+over a box shows that session's full name, model, busy state,
+and parent in a status strip along the bottom of the window
+(handy when a long name or model has been clipped to fit its
+box); with nothing hovered the strip shows a running count of
+sessions, how many are busy, and how many sources are watched:
+
+	claudegraph [-T reconnectms] [mtpt ...]
+
+With no arguments it watches `/mnt/claude` and `/mnt/claudesub`.
+There is no polling in steady state; `-T` only controls how
+long a watcher waits before retrying if a source's claude9fs
+disappears or hasn't started yet (default 2000ms) -- the one
+case a blocking read can't cover. It is read-only: it never
+writes anything, so it is safe to leave running for the life of
+a claudetalk session.  Quit with `q` or Delete.
+
+#### Launching claudetalk with a live graph window
+
+claudetalk already starts both claude9fs processes (main and
+sub-agent) for you, so there is nothing extra to launch on the
+server side.  To also get a live graph view, start claudegraph
+in its own window, pointed at the same two mounts claudetalk
+uses:
+
+	claudetalk &
+	window claudegraph
+
+or, in acme, `New` a window and run `claudegraph` in it (acme's
+win(1) plumbing runs commands started this way in their own
+window automatically).  claudegraph does not need to run before
+claudetalk, or vice versa: `-K` mounts are picked up whenever
+claudegraph next tries to open `/mnt/claude/graphlive` or
+`/mnt/claudesub/graphlive`, and reconnects on its own (see `-T`
+above) if a mount isn't there yet or goes away and comes back
+(e.g. you restarted claudetalk).  If you only care about one of
+the two servers, name it explicitly:
+
+	claudegraph /mnt/claude
+
+Because sub-agent sessions only get a `parent` edge when
+something writes `parent <name>` to their `ctl` (see above),
+sessions created directly through `claudetalk` (not via
+sub-agent tool calls) show up in the graph as parentless nodes
+-- that's expected, not a bug: claude9fs has no other way to
+know a relationship exists.
+
 ### Skills
 
 The `-K` flag points claude9fs at a directory of skill files.
@@ -613,6 +732,7 @@ can also drive them from rc without claudetalk:
 	json.h         JSON type definitions
 	claude9fs.c    9P filesystem server
 	claudetalk     rc script client
+	claudegraph.c  standalone libdraw viewer for the session graph
 
 ## Dependencies
 
