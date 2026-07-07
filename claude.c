@@ -91,6 +91,7 @@ struct ToolCall {
 	char *args[Maxargs];	/* values in Tooldef param order; args[0] is the path */
 	char *result;		/* result text after execution */
 	ToolCall *next;
+	ToolCall *bnext;	/* next call in the same hash bucket; see runtools */
 };
 
 /*
@@ -1483,10 +1484,73 @@ exectool(ToolCall *tc)
 		tc->name ? tc->name : "");
 }
 
-/* one exectool() call running in its own proc; see runtools */
+/*
+ * Number of processors, discovered the way mk(1) does ($NPROC,
+ * set by the kernel at boot) with stats(8)'s method as the
+ * fallback (one line per cpu in /dev/sysstat).  Clamped to
+ * [1,32] and cached; used to size runtools' bucket array.
+ */
+static int
+ncpu(void)
+{
+	static int n;
+	char *s, buf[512];
+	int fd, i, m;
+
+	if(n > 0)
+		return n;
+	s = getenv("NPROC");
+	if(s != nil){
+		n = atoi(s);
+		free(s);
+	}
+	if(n <= 0){
+		fd = open("/dev/sysstat", OREAD);
+		if(fd >= 0){
+			while((m = read(fd, buf, sizeof buf)) > 0)
+				for(i = 0; i < m; i++)
+					if(buf[i] == '\n')
+						n++;
+			close(fd);
+		}
+	}
+	if(n < 1)
+		n = 1;
+	if(n > 32)
+		n = 32;
+	return n;
+}
+
+/*
+ * FNV-1a over the cleanname'd path.  Same file named the same
+ * way hashes identically, so same-path tool calls land in the
+ * same bucket; trivial spelling variants (/x//y, /x/./y) are
+ * normalized away.  Bind aliases and relative-vs-absolute
+ * names of one file are not detected -- exactly the status quo
+ * before bucketing existed.
+ */
+static u32int
+pathhash(char *path)
+{
+	u32int h;
+	uchar *p;
+	char *clean;
+
+	clean = estrdup(path != nil ? path : "");
+	cleanname(clean);
+	h = 2166136261U;
+	for(p = (uchar*)clean; *p != '\0'; p++){
+		h ^= *p;
+		h *= 16777619;
+	}
+	free(clean);
+	return h;
+}
+
+/* one bucket of exectool() calls running in its own proc; see runtools */
 typedef struct Toolwork Toolwork;
 struct Toolwork {
-	ToolCall *tc;
+	ToolCall *tc;	/* head of bucket chain, linked by bnext */
 	Channel *done;	/* elsize sizeof(ToolCall*); shared by all workers of a round */
 };
 
@@ -1494,9 +1558,11 @@ static void
 toolworker(void *v)
 {
 	Toolwork *w;
+	ToolCall *tc;
 
 	w = v;
-	w->tc->result = exectool(w->tc);
+	for(tc = w->tc; tc != nil; tc = tc->bnext)
+		tc->result = exectool(tc);
 	sendp(w->done, w->tc);
 	free(w);
 }
@@ -1508,13 +1574,24 @@ toolworker(void *v)
  *
  * A turn with several tool_use blocks -- e.g. the model firing
  * off prompts to multiple sub-agent sessions, or several
- * independent read_file calls -- runs them concurrently, one
- * Plan 9 process per call (proccreate: shares memory, the fd
- * table, and the namespace with the caller, so tc->result is
- * written directly and every tool still sees the same mounts).
- * Without this, a slow call (a sub-agent's whole prompt round,
- * an mk invocation) stalls every other tool_use in the same
- * turn, even though nothing about them is actually related.
+ * independent read_file calls -- runs them concurrently, but
+ * never lets two calls that name the same path run at once.
+ * Each call's path (pathhash of args[0]) selects one of ncpu()
+ * buckets; each nonempty bucket becomes one Plan 9 process
+ * (proccreate: shares memory, the fd table, and the namespace
+ * with the caller, so tc->result is written directly and every
+ * tool still sees the same mounts) that executes its chain
+ * sequentially, in the order the model issued the calls.  Same
+ * path, same hash, same bucket: batched edits to one file apply
+ * in issue order instead of racing whole-file read-modify-write
+ * cycles, a lost-update race that could silently drop an edit
+ * or truncate the file.  Distinct paths sharing a bucket merely
+ * serialize, costing only parallelism there are no cpus for
+ * anyway; and the bucket count caps a round's fan-out at ncpu()
+ * procs where it was previously unbounded.  Without concurrency
+ * across buckets, a slow call (a sub-agent's whole prompt
+ * round, an mk invocation) would stall every other tool_use in
+ * the same turn, even though nothing about them is related.
  *
  * Each ToolCall is touched by exactly one worker, so no locking
  * is needed around tc->result itself.  Completion is reported
@@ -1533,11 +1610,11 @@ toolworker(void *v)
 static void
 runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
 {
-	ToolCall *tc;
+	ToolCall *tc, **bucket, **btail;
 	Toolwork *w;
 	Channel *done;
 	char marker[256];
-	int n;
+	int n, nb, nw, i;
 
 	n = 0;
 	for(tc = calls; tc != nil; tc = tc->next){
@@ -1556,16 +1633,37 @@ runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
 		return;
 	}
 
-	done = chancreate(sizeof(ToolCall*), 0);
+	nb = ncpu();
+	if(nb > n)
+		nb = n;
+	bucket = emallocz(nb * sizeof(ToolCall*), 1);
+	btail = emallocz(nb * sizeof(ToolCall*), 1);
 	for(tc = calls; tc != nil; tc = tc->next){
+		i = pathhash(tc->args[0]) % nb;
+		tc->bnext = nil;
+		if(btail[i] == nil)
+			bucket[i] = tc;
+		else
+			btail[i]->bnext = tc;
+		btail[i] = tc;
+	}
+
+	done = chancreate(sizeof(ToolCall*), 0);
+	nw = 0;
+	for(i = 0; i < nb; i++){
+		if(bucket[i] == nil)
+			continue;
 		w = emalloc(sizeof *w);
-		w->tc = tc;
+		w->tc = bucket[i];
 		w->done = done;
 		proccreate(toolworker, w, 32*1024);
+		nw++;
 	}
-	while(n-- > 0)
+	while(nw-- > 0)
 		recvp(done);
 	chanfree(done);
+	free(bucket);
+	free(btail);
 }
 
 static char*
@@ -2181,7 +2279,7 @@ fetchmodels(char *apikey)
 	for(i = 0; i < darr->nitem; i++){
 		id = jstr(jidx(darr, i), "id");
 		if(id != nil)
-			fmtprint(&f, "%s\n", id);
+			fmtprint(&f, "(/model %s)\n", id);
 	}
 	jsonfree(resp);
 	return fmtstrflush(&f);

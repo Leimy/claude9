@@ -1,0 +1,44 @@
+Tool calls and shared files: where parallelism is safe
+-------------------------------------------------------
+claude9fs serializes same-path tool calls within a single tool
+round: every path-carrying call (writes AND reads) is hashed by
+its cleanname'd path into one of NPROC buckets, and each bucket
+executes its calls sequentially in the order they were issued,
+while buckets run in parallel.  Batching several edits to one
+file in one round is therefore safe and applies in issue order,
+and a round's process fan-out is capped at NPROC.  Successive
+rounds in one session never overlap, so within a session,
+same-file work is safe, period.
+
+Caveats within a session:
+- Aliases defeat the hash: the same file reached via a bind, or
+  named relative in one call and absolute in another, lands in
+  different buckets and is not serialized.  Use one canonical
+  absolute path per file, always.
+- mk is bucketed by its directory argument, not by the files
+  the build reads and writes.  Don't batch an edit to a source
+  file with an mk that compiles it; edit first, mk afterward
+  (natural anyway -- you want the edit in place before judging
+  the build).
+
+Cross-session parallelism is NEVER coordinated -- permanently.
+Serialization lives inside one session's tool round.  Two
+sessions -- yours and a sub-agent's, two sub-agents on the
+claudesub server, even two sessions on the same server --
+execute their rounds concurrently with no shared queue, and no
+code fix can add one: they are independent conversations whose
+rounds the server cannot line up.  If two sessions write one
+file, it is a lost-update race: both report success, the last
+writer wins, and damage can include truncation.  When fanning
+out sub-agents, partition file ownership so each session's
+edits are disjoint, and keep shared integration files (mkfiles,
+status docs) for yourself (see sub-agent-acme, "Partition file
+ownership to avoid collisions").  That rule is discipline, not
+a stopgap awaiting code.
+
+Recovery if a shared file is clobbered anyway:
+- Probe with identity replace_string (old == new) to learn what
+  is really in the file.
+- Check the tail; truncation is the characteristic damage.
+- Be ready to rebuild the whole file from context with
+  create_file, then re-issue dependent work.
