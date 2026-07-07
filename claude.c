@@ -727,16 +727,7 @@ repairtooluse(Json *msgs)
 				jset(newmsg, "role", jstring("user"));
 				ncontent = jarray();
 				jset(newmsg, "content", ncontent);
-				/*
-				 * Insert after position i: shift everything
-				 * from i+1 onward right by one slot.
-				 */
-				jgrow(msgs);
-				memmove(msgs->items + i + 2,
-					msgs->items + i + 1,
-					(msgs->nitem - i - 1) * sizeof(Json*));
-				msgs->nitem++;
-				msgs->items[i + 1] = newmsg;
+				jinsert(msgs, i + 1, newmsg);
 			}
 			block = jobject();
 			jset(block, "type", jstring("tool_result"));
@@ -748,12 +739,7 @@ repairtooluse(Json *msgs)
 			 * content in the user message, so insert at
 			 * the front (after any already injected).
 			 */
-			jgrow(ncontent);
-			memmove(ncontent->items + ninj + 1,
-				ncontent->items + ninj,
-				(ncontent->nitem - ninj) * sizeof(Json*));
-			ncontent->items[ninj] = block;
-			ncontent->nitem++;
+			jinsert(ncontent, ninj, block);
 			ninj++;
 			repaired++;
 		}
@@ -1528,6 +1514,14 @@ ncpu(void)
  * normalized away.  Bind aliases and relative-vs-absolute
  * names of one file are not detected -- exactly the status quo
  * before bucketing existed.
+ *
+ * An empty path (e.g. the mk tool's "current directory") is
+ * mapped to "." before the copy: cleanname(2) rewrites "" to
+ * "." in place and so requires room for at least two bytes,
+ * but estrdup("") allocates only one -- a one-byte heap
+ * overflow that corrupts the malloc arena and eventually
+ * kills the whole process.  "" and "." also name the same
+ * directory, so they belong in the same bucket anyway.
  */
 static u32int
 pathhash(char *path)
@@ -1536,7 +1530,9 @@ pathhash(char *path)
 	uchar *p;
 	char *clean;
 
-	clean = estrdup(path != nil ? path : "");
+	if(path == nil || path[0] == '\0')
+		path = ".";
+	clean = estrdup(path);
 	cleanname(clean);
 	h = 2166136261U;
 	for(p = (uchar*)clean; *p != '\0'; p++){

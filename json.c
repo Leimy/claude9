@@ -255,7 +255,7 @@ parsenum(char **pp)
 	return j;
 }
 
-void
+static void
 jgrow(Json *j)
 {
 	if(j->nitem >= j->aitem){
@@ -546,6 +546,22 @@ jappend(Json *arr, Json *val)
 		sysfatal("jappend on non-array");
 	jgrow(arr);
 	arr->items[arr->nitem++] = val;
+}
+
+/*
+ * Insert val into arr at index i (0 <= i <= nitem),
+ * shifting the tail right by one slot.
+ */
+void
+jinsert(Json *arr, int i, Json *val)
+{
+	if(arr->type != Jarray || i < 0 || i > arr->nitem)
+		sysfatal("bad jinsert");
+	jgrow(arr);
+	memmove(arr->items + i + 1, arr->items + i,
+		(arr->nitem - i) * sizeof(Json*));
+	arr->items[i] = val;
+	arr->nitem++;
 }
 
 void

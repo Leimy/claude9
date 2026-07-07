@@ -40,8 +40,8 @@ Json*	jstring(char *s);
 Json*	jintval(vlong v);
 Json*	jarray(void);
 Json*	jobject(void);
-void	jgrow(Json *j);
 void	jappend(Json *arr, Json *val);
+void	jinsert(Json *arr, int i, Json *val);
 void	jset(Json *obj, char *name, Json *val);
 
 /* output */

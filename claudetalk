@@ -4,11 +4,13 @@
 # Bootstraps the full environment: starts a sub-agent claude9fs
 # (for sub-agent support), then the main claude9fs on top, so
 # the main server's namespace includes the sub-agent mount.
-# On exit (unless -d), both servers are torn down.
+# The servers persist across runs and are reused on the next
+# start (rm /srv/claude /srv/claudesub to stop them); on exit
+# the session is hung up unless -d.
 #
 # usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
 #   -a name       attach to existing session (skip server startup)
-#   -d            detach on exit: leave session and servers alive
+#   -d            detach on exit: leave the session alive
 #   -g            also pop up a claudegraph window on the session graph
 #   -M model      default model for claude9fs
 #   -t maxtokens  default max tokens for claude9fs
@@ -17,15 +19,7 @@
 
 rfork e
 
-attach=()
-detach=0
-graph=()
-model=()
-maxtokens=()
-skills=()
-namepath=()
-flagfmt='a:attach session,d,g:graph,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
-args=''
+flagfmt='a:attach session,d:detach,g:graph,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
 if(! ifs=() eval `{aux/getflags $*}){
 	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
 	exit usage
@@ -192,25 +186,29 @@ fn docmd {
 	if not if(~ $cmd /compact){
 		shift
 		# Show size before and after so the user sees the effect.
-		before=`{cat $sess/ctl | grep '^exchanges' | sed 's/exchanges //'}
+		before=`{awk '/^exchanges/{print $2}' $sess/ctl}
 		if(~ $#* 0)
 			echo 'compact' > $sess/ctl
 		if not
 			echo 'compact '$1 > $sess/ctl
-		after=`{cat $sess/ctl | grep '^exchanges' | sed 's/exchanges //'}
-		bytes=`{cat $sess/ctl | grep '^bytes' | sed 's/bytes //'}
+		after=`{awk '/^exchanges/{print $2}' $sess/ctl}
+		bytes=`{awk '/^bytes/{print $2}' $sess/ctl}
 		echo 'compacted: '$before' -> '$after' exchanges ('$bytes' input bytes)' >[1=2]
 	}
 	if not if(~ $cmd /sessions){
+		# Sessions are the directories under $mnt; the root
+		# also holds plain files (clone, models, graph, ...).
 		echo 'sessions:' >[1=2]
-		for(sid in `{ls $mnt | grep -v '^clone$' | grep -v '^models$'}){
+		for(sid in `{ls -p $mnt}){
 			d=$mnt/$sid
-			smod=`{cat $d/model}
-			smsgs=`{cat $d/ctl | grep '^messages' | sed 's/messages //'}
-			if(~ $sid $n)
-				echo '  '$sid' '$smod' ('$smsgs' msgs) *' >[1=2]
-			if not
-				echo '  '$sid' '$smod' ('$smsgs' msgs)' >[1=2]
+			if(test -d $d){
+				smod=`{cat $d/model}
+				smsgs=`{awk '/^messages/{print $2}' $d/ctl}
+				if(~ $sid $n)
+					echo '  '$sid' '$smod' ('$smsgs' msgs) *' >[1=2]
+				if not
+					echo '  '$sid' '$smod' ('$smsgs' msgs)' >[1=2]
+			}
 		}
 	}
 	if not if(~ $cmd /models){
@@ -263,7 +261,7 @@ fn docmd {
 			echo 'autocontinue' > $sess/ctl
 		if not
 			echo 'autocontinue '$1 > $sess/ctl
-		ac=`{cat $sess/ctl | grep '^autocontinue' | sed 's/autocontinue //'}
+		ac=`{awk '/^autocontinue/{print $2}' $sess/ctl}
 		echo 'autocontinue: '$ac >[1=2]
 	}
 	if not if(~ $cmd /noautocontinue /noac){

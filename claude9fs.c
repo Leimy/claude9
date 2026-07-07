@@ -59,7 +59,8 @@ struct Session {
 
 typedef struct Faux Faux;
 struct Faux {
-	Session *clone;
+	Session *clone;		/* Qclone: session allocated on first read */
+	/* Qstream read cursor; see streamread */
 	int streamoff;
 	int streamgen;		/* -1 = not latched, >=0 = latched generation */
 	int streamopengen;	/* s->streamgen at open time */
@@ -293,15 +294,18 @@ newsession(void)
 	skills = defskills != nil ? estrdup(defskills) : nil;
 	qunlock(&skillslk);
 
+	/*
+	 * Try namefs for a goofy name; on collision or failure,
+	 * fall back to the integer id.  Read it before taking
+	 * sessionlk: genname blocks on file I/O, and a hung name
+	 * server must not wedge the whole fs.
+	 */
+	name = genname();
+
 	s = emallocz(sizeof *s, 1);
 	qlock(&sessionlk);
 	s->id = nextsid++;
 	s->ref = 1;
-	/*
-	 * Try namefs for a goofy name; on collision or
-	 * failure, fall back to the integer id.
-	 */
-	name = genname();
 	if(name != nil){
 		Session *dup;
 		for(dup = sessions; dup != nil; dup = dup->next)
@@ -1582,6 +1586,7 @@ doprompt(Req *r, Session *s, char *data)
 
 	qlock(&s->lk);
 	s->busy = 0;
+	s->lastact = time(0);
 	bumpgraph();
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
