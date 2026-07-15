@@ -8,20 +8,23 @@
 # start (rm /srv/claude /srv/claudesub to stop them); on exit
 # the session is hung up unless -d.
 #
-# usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]
+# usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath]
 #   -a name       attach to existing session (skip server startup)
 #   -d            detach on exit: leave the session alive
 #   -g            also pop up a claudegraph window on the session graph
 #   -M model      default model for claude9fs
+#   -P provider   default provider for claude9fs (anthropic or openai;
+#                 needs the matching API key in the environment:
+#                 $ANTHROPIC_API_KEY or $OPENAI_API_KEY)
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
 
 rfork e
 
-flagfmt='a:attach session,d:detach,g:graph,M:model name,t:maxtokens n,K:skills dir,n:namepath path'
+flagfmt='a:attach session,d:detach,g:graph,M:model name,P:provider name,t:maxtokens n,K:skills dir,n:namepath path'
 if(! ifs=() eval `{aux/getflags $*}){
-	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
+	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
 	exit usage
 }
 
@@ -42,6 +45,8 @@ if(~ $#skills 0)
 	skills=$home/lib/claude9/skills
 if(! ~ $#model 0)
 	fsflags=($fsflags -M $model)
+if(! ~ $#provider 0)
+	fsflags=($fsflags -P $provider)
 if(! ~ $#maxtokens 0)
 	fsflags=($fsflags -t $maxtokens)
 if(! ~ $#skills 0)
@@ -155,7 +160,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -219,6 +224,20 @@ fn docmd {
 		shift
 		setget $sess/model model $*
 	}
+	if not if(~ $cmd /provider){
+		shift
+		setget $sess/provider provider $*
+		if(! ~ $#* 0){
+			# The model name does not follow the provider;
+			# an anthropic model sent to openai (or vice
+			# versa) fails every request.  Remind the user.
+			echo 'model is '^`{cat $sess/model}^' - you probably want /model (see /models)' >[1=2]
+		}
+	}
+	if not if(~ $cmd /baseurl){
+		shift
+		setget $sess/baseurl baseurl $*
+	}
 	if not if(~ $cmd /tokens){
 		shift
 		setget $sess/tokens tokens $*
@@ -239,6 +258,12 @@ fn docmd {
 		echo '  /models        list available models' >[1=2]
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
+		echo '  /provider      show current provider' >[1=2]
+		echo '  /provider <p>  switch provider: anthropic or openai (needs its API key;' >[1=2]
+		echo '                 switch /model too - model names are per-provider)' >[1=2]
+		echo '  /baseurl       show endpoint URL override' >[1=2]
+		echo '  /baseurl <url> point an openai-compatible server (llama.cpp, vllm, ...)' >[1=2]
+		echo '  /baseurl -     clear the override (back to provider default)' >[1=2]
 		echo '  /tokens        show max output tokens' >[1=2]
 		echo '  /tokens <n>    set max output tokens' >[1=2]
 		echo '  /thinking      show extended thinking setting' >[1=2]
@@ -300,7 +325,18 @@ fn sigint {
 while(){
 	curmodel=`{cat $sess/model}
 	curtokens=`{cat $sess/tokens}
-	prompt=$curmodel/$curtokens'> '
+	curprov=`{cat $sess/provider >[2]/dev/null}
+	# Old servers have no provider file; treat that as the
+	# default (an empty list would also poison the prompt
+	# concatenation below - rc lists absorb adjacent words).
+	if(~ $#curprov 0)
+		curprov=anthropic
+	# Show the provider in the prompt only when it is not the
+	# house default; dial-string style, provider!model/tokens.
+	if(~ $curprov anthropic)
+		prompt=$curmodel/$curtokens'> '
+	if not
+		prompt=$curprov'!'$curmodel/$curtokens'> '
 	echo -n $prompt >[1=2]
 
 	cat > $msgfile
@@ -335,7 +371,19 @@ while(){
 			# waiting for a round that will never come.
 			# Kill it so wait does not hang; the resulting
 			# Tflush is handled cleanly by claude9fs.
-			echo kill > /proc/$cpid/note >[2]/dev/null
+			# Order matters: rc opens the redirections
+			# left to right, and note may already be
+			# gone (the cat process can exit on its own,
+			# e.g. via the Tflush this triggers, before
+			# we get here) -- an open failure on the
+			# still-pending ">" is reported to whatever
+			# fd2 is at that point in the parse.  Put the
+			# >[2]/dev/null FIRST so fd2 is already
+			# silenced when the /proc/$cpid/note open is
+			# attempted, instead of leaking "can't
+			# create: .../note: file does not exist" to
+			# the real terminal despite the redirection.
+			echo kill >[2]/dev/null > /proc/$cpid/note
 			wait $cpid
 			echo 'error:' >[1=2]
 			cat $sess/error >[1=2]

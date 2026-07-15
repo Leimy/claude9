@@ -406,7 +406,7 @@ tbuildreq(void)
 
 	c = convnew("key", "test-model", 1000, "sys", nil);
 	convappend(c, msgnew(Muser, "hello", nil));
-	req = buildreq(c);
+	req = anthropicbuildreq(c);
 	okstr(jstr(req, "model"), "test-model", "buildreq model");
 	msgs = jget(req, "messages");
 	ok(msgs != nil && msgs->nitem == 1, "one message");
@@ -417,7 +417,7 @@ tbuildreq(void)
 
 	/* consecutive same-role messages merge into one */
 	convappend(c, msgnew(Muser, "again", nil));
-	req = buildreq(c);
+	req = anthropicbuildreq(c);
 	msgs = jget(req, "messages");
 	ok(msgs != nil && msgs->nitem == 1, "same-role messages merge");
 	content = jget(jidx(msgs, 0), "content");
@@ -427,7 +427,7 @@ tbuildreq(void)
 	/* blank text becomes a placeholder, never an empty block */
 	convclear(c);
 	convappend(c, msgnew(Muser, "  \n", nil));
-	req = buildreq(c);
+	req = anthropicbuildreq(c);
 	content = jget(jidx(jget(req, "messages"), 0), "content");
 	okstr(jstr(jidx(content, 0), "text"), "(no text)", "blank placeholder");
 	jsonfree(req);
@@ -438,7 +438,7 @@ tbuildreq(void)
 	convappend(c, msgnew(Massistant, "ans",
 		"[{\"type\":\"text\",\"text\":\" \"},"
 		"{\"type\":\"text\",\"text\":\"ans\"}]"));
-	req = buildreq(c);
+	req = anthropicbuildreq(c);
 	msgs = jget(req, "messages");
 	ok(msgs != nil && msgs->nitem == 2, "user + assistant messages");
 	content = jget(jidx(msgs, 1), "content");
@@ -639,6 +639,710 @@ ttoolman(void)
 	free(res);
 }
 
+/* --- openai.c: request assembly --- */
+
+static void
+topenaibuildreq(void)
+{
+	Conv *c;
+	Json *req, *msgs, *m, *tcs, *tc, *fn, *tools, *t, *fn2, *params;
+	Json *sopts, *parsed, *iu;
+	char *args;
+	int prov;
+
+	/* verify providerlookup recognises "openai" */
+	prov = providerlookup("openai");
+	ok(prov >= 0, "openai: providerlookup >= 0");
+	if(prov < 0)
+		return;
+
+	/* basic conv with a system prompt */
+	c = convnew("key", "gpt-4o", 2048, "be terse", nil);
+	c->prov = prov;
+
+	/* plain user message */
+	convappend(c, msgnew(Muser, "hello", nil));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: buildreq returns non-nil");
+	if(req == nil){
+		convfree(c);
+		return;
+	}
+
+	/* model and output-token cap (modern field name by default) */
+	okstr(jstr(req, "model"), "gpt-4o", "openai: model field");
+	ok(jget(req, "max_completion_tokens") != nil,
+		"openai: max_completion_tokens present");
+	ok(jint(req, "max_completion_tokens") == 2048,
+		"openai: max_completion_tokens value");
+	ok(jget(req, "max_tokens") == nil,
+		"openai: legacy max_tokens absent by default");
+
+	/* stream_options with include_usage=true */
+	sopts = jget(req, "stream_options");
+	ok(sopts != nil, "openai: stream_options present");
+	if(sopts != nil){
+		/*
+		 * include_usage is a JSON bool; jint() only reads
+		 * Jint/Jreal (a bool is not a number), so inspect
+		 * the node directly.
+		 */
+		iu = jget(sopts, "include_usage");
+		ok(iu != nil, "openai: include_usage present");
+		ok(iu != nil && iu->type == Jbool && iu->ival == 1,
+			"openai: include_usage true");
+	}
+
+	/* reasoning_effort absent when thinkmode == Thinkoff */
+	ok(c->thinkmode == Thinkoff, "openai: default thinkmode is Thinkoff");
+	ok(jget(req, "reasoning_effort") == nil, "openai: reasoning_effort absent when Thinkoff");
+
+	/* system message is messages[0] */
+	msgs = jget(req, "messages");
+	ok(msgs != nil && msgs->nitem >= 2, "openai: messages array has >= 2 entries");
+	if(msgs == nil || msgs->nitem < 2){
+		jsonfree(req);
+		convfree(c);
+		return;
+	}
+	m = jidx(msgs, 0);
+	okstr(jstr(m, "role"), "system", "openai: messages[0] role is system");
+	okstr(jstr(m, "content"), "be terse", "openai: messages[0] content is sysprompt");
+
+	/* plain user message */
+	m = jidx(msgs, 1);
+	okstr(jstr(m, "role"), "user", "openai: user message role");
+	okstr(jstr(m, "content"), "hello", "openai: user message content");
+
+	jsonfree(req);
+
+	/* blank user text becomes placeholder */
+	convclear(c);
+	convappend(c, msgnew(Muser, "  ", nil));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: buildreq blank user non-nil");
+	if(req != nil){
+		msgs = jget(req, "messages");
+		/* find the user message (skip system if present) */
+		m = nil;
+		if(msgs != nil){
+			int i;
+			for(i = 0; i < msgs->nitem; i++){
+				Json *mm;
+				char *r;
+				mm = jidx(msgs, i);
+				r = jstr(mm, "role");
+				if(r != nil && strcmp(r, "user") == 0){
+					m = mm;
+					break;
+				}
+			}
+		}
+		ok(m != nil, "openai: blank user: found user message");
+		if(m != nil)
+			okstr(jstr(m, "content"), "(no text)", "openai: blank user placeholder");
+		jsonfree(req);
+	}
+
+	/* assistant rawjson: one text block + one tool_use block */
+	convclear(c);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "ignored",
+		"[{\"type\":\"text\",\"text\":\"Sure.\"},"
+		"{\"type\":\"tool_use\",\"id\":\"call_abc\",\"name\":\"read_file\","
+		"\"input\":{\"path\":\"/etc/passwd\"}}]"));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: assistant rawjson buildreq non-nil");
+	if(req != nil){
+		msgs = jget(req, "messages");
+		/* find the assistant message */
+		m = nil;
+		if(msgs != nil){
+			int i;
+			for(i = 0; i < msgs->nitem; i++){
+				Json *mm;
+				char *r;
+				mm = jidx(msgs, i);
+				r = jstr(mm, "role");
+				if(r != nil && strcmp(r, "assistant") == 0){
+					m = mm;
+					break;
+				}
+			}
+		}
+		ok(m != nil, "openai: assistant message present");
+		if(m != nil){
+			/* content is the concatenated text */
+			okstr(jstr(m, "content"), "Sure.", "openai: assistant content string");
+			/* tool_calls array */
+			tcs = jget(m, "tool_calls");
+			ok(tcs != nil && tcs->nitem == 1, "openai: tool_calls has 1 entry");
+			if(tcs != nil && tcs->nitem == 1){
+				tc = jidx(tcs, 0);
+				okstr(jstr(tc, "type"), "function", "openai: tool_call type=function");
+				okstr(jstr(tc, "id"), "call_abc", "openai: tool_call id");
+				fn = jget(tc, "function");
+				ok(fn != nil, "openai: tool_call has function");
+				if(fn != nil){
+					okstr(jstr(fn, "name"), "read_file", "openai: function name");
+					/* arguments must be a string */
+					args = jstr(fn, "arguments");
+					ok(args != nil, "openai: arguments is a string");
+					if(args != nil){
+						/* the string must itself parse to an object
+						 * containing the original input field */
+						parsed = jsonparse(args);
+						ok(parsed != nil, "openai: arguments string parses as JSON");
+						if(parsed != nil){
+							ok(parsed->type == Jobject, "openai: arguments parses to object");
+							okstr(jstr(parsed, "path"), "/etc/passwd",
+								"openai: arguments contains path field");
+							jsonfree(parsed);
+						}
+					}
+				}
+			}
+		}
+		jsonfree(req);
+	}
+
+	/* tool_result user rawjson -> role "tool" messages */
+	convclear(c);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "",
+		"[{\"type\":\"tool_use\",\"id\":\"call_xyz\",\"name\":\"read_file\","
+		"\"input\":{\"path\":\"/tmp/f\"}}]"));
+	convappend(c, msgnew(Muser, "",
+		"[{\"type\":\"tool_result\",\"tool_use_id\":\"call_xyz\","
+		"\"content\":\"file contents here\"}]"));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: tool_result buildreq non-nil");
+	if(req != nil){
+		int found;
+		msgs = jget(req, "messages");
+		found = 0;
+		if(msgs != nil){
+			int i;
+			for(i = 0; i < msgs->nitem; i++){
+				Json *mm;
+				char *r;
+				mm = jidx(msgs, i);
+				r = jstr(mm, "role");
+				if(r != nil && strcmp(r, "tool") == 0){
+					found = 1;
+					okstr(jstr(mm, "tool_call_id"), "call_xyz",
+						"openai: tool message tool_call_id");
+					okstr(jstr(mm, "content"), "file contents here",
+						"openai: tool message content");
+					break;
+				}
+			}
+		}
+		ok(found, "openai: tool_result produces role=tool message");
+		jsonfree(req);
+	}
+
+	/* tools array shape and count */
+	convclear(c);
+	convappend(c, msgnew(Muser, "hi", nil));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: tools check buildreq non-nil");
+	if(req != nil){
+		tools = jget(req, "tools");
+		ok(tools != nil, "openai: tools array present");
+		ok(tools != nil && tools->nitem == 7, "openai: tools array has 7 entries");
+		if(tools != nil && tools->nitem > 0){
+			t = jidx(tools, 0);
+			okstr(jstr(t, "type"), "function", "openai: tools[0].type=function");
+			fn2 = jget(t, "function");
+			ok(fn2 != nil, "openai: tools[0].function present");
+			if(fn2 != nil){
+				okstr(jstr(fn2, "name"), "create_file",
+					"openai: tools[0].function.name=create_file");
+				params = jget(fn2, "parameters");
+				ok(params != nil, "openai: tools[0].function.parameters present");
+				ok(params != nil && params->type == Jobject,
+					"openai: tools[0] parameters is object");
+			}
+		}
+		jsonfree(req);
+	}
+
+	/* reasoning_effort present only in Thinkadaptive mode */
+	convclear(c);
+	convappend(c, msgnew(Muser, "hi", nil));
+	c->thinkmode = Thinkadaptive;
+	c->effort = estrdup("high");
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: thinkadaptive buildreq non-nil");
+	if(req != nil){
+		ok(jget(req, "reasoning_effort") != nil,
+			"openai: reasoning_effort present in Thinkadaptive");
+		okstr(jstr(req, "reasoning_effort"), "high",
+			"openai: reasoning_effort value");
+		jsonfree(req);
+	}
+
+	/* back to Thinkoff -> reasoning_effort absent */
+	c->thinkmode = Thinkoff;
+	convclear(c);
+	convappend(c, msgnew(Muser, "hi", nil));
+	req = openaibuildreq(c);
+	ok(req != nil, "openai: thinkoff buildreq non-nil");
+	if(req != nil){
+		ok(jget(req, "reasoning_effort") == nil,
+			"openai: reasoning_effort absent after Thinkoff");
+		jsonfree(req);
+	}
+
+	convfree(c);
+}
+
+/* --- openai.c: token-field quirk detection --- */
+
+static void
+topenaiquirk(void)
+{
+	Conv *c;
+	Json *req;
+
+	c = convnew("key", "gpt-5", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	convappend(c, msgnew(Muser, "hi", nil));
+
+	/* non-matches: no flip, no retry */
+	ok(!openaiquirk(c, nil), "quirk: nil error ignored");
+	ok(!openaiquirk(c, "API error: overloaded"), "quirk: unrelated error ignored");
+	ok(!openaiquirk(c, "API error: max_completion_tokens is too large"),
+		"quirk: value complaint ignored");
+	ok(c->oldmaxtok == 0, "quirk: flag untouched by non-matches");
+
+	/* old compat server rejecting the modern field name */
+	ok(openaiquirk(c,
+		"API error: Unrecognized request argument supplied: max_completion_tokens"),
+		"quirk: unrecognized max_completion_tokens flips");
+	ok(c->oldmaxtok == 1, "quirk: oldmaxtok set");
+	req = openaibuildreq(c);
+	ok(jget(req, "max_tokens") != nil, "quirk: legacy max_tokens after flip");
+	ok(jget(req, "max_completion_tokens") == nil,
+		"quirk: modern field absent after flip");
+	jsonfree(req);
+
+	/* real OpenAI telling us to use max_completion_tokens flips back */
+	ok(openaiquirk(c,
+		"API error: Unsupported parameter: 'max_tokens' is not supported "
+		"with this model. Use 'max_completion_tokens' instead."),
+		"quirk: openai unsupported-parameter error flips back");
+	ok(c->oldmaxtok == 0, "quirk: oldmaxtok cleared");
+	req = openaibuildreq(c);
+	ok(jget(req, "max_completion_tokens") != nil,
+		"quirk: modern field restored after flip back");
+	jsonfree(req);
+
+	convfree(c);
+}
+
+/*
+ * --- openai.c: reasoning_effort + tools quirk ladder,
+ * Thinkadaptive start: effort value -> omit -> explicit "none"
+ * -> dead.  The same error wording drives every rung (the
+ * server blames reasoning_effort regardless of what we sent).
+ */
+static void
+topenaiquirkreasoning(void)
+{
+	Conv *c;
+	Json *req;
+	char *liveerr;
+
+	liveerr =
+		"API error: Function tools with reasoning_effort are not "
+		"supported for gpt-5.6-sol in /v1/chat/completions. To use "
+		"function tools, do not set reasoning_effort.";
+
+	c = convnew("key", "gpt-5.6-sol", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	convappend(c, msgnew(Muser, "hi", nil));
+	c->thinkmode = Thinkadaptive;
+	c->effort = estrdup("medium");
+
+	/* reasoning_effort present before any quirk fires */
+	req = openaibuildreq(c);
+	okstr(jstr(req, "reasoning_effort"), "medium",
+		"quirk reasoning: effort value present before quirk");
+	jsonfree(req);
+
+	/* non-matches: no state change, no retry */
+	ok(!openaiquirk(c, nil), "quirk reasoning: nil error ignored");
+	ok(!openaiquirk(c, "API error: overloaded"),
+		"quirk reasoning: unrelated error ignored");
+	ok(c->reasonquirk == Reffort,
+		"quirk reasoning: state untouched by non-matches");
+
+	/* rung 1: effort value rejected -> omit the field, retry */
+	ok(openaiquirk(c, liveerr),
+		"quirk reasoning: first error requests retry");
+	ok(c->reasonquirk == Romit, "quirk reasoning: state Romit");
+	req = openaibuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil,
+		"quirk reasoning: field omitted in Romit");
+	/* tools must still be present -- that's the whole point */
+	ok(jget(req, "tools") != nil, "quirk reasoning: tools still present");
+	jsonfree(req);
+
+	/*
+	 * rung 2: absence also rejected (server default reasoning is
+	 * on) -> send explicit "none", retry.
+	 */
+	ok(openaiquirk(c, liveerr),
+		"quirk reasoning: second error requests retry");
+	ok(c->reasonquirk == Rnone, "quirk reasoning: state Rnone");
+	req = openaibuildreq(c);
+	okstr(jstr(req, "reasoning_effort"), "none",
+		"quirk reasoning: explicit none in Rnone");
+	ok(jget(req, "tools") != nil,
+		"quirk reasoning: tools still present in Rnone");
+	jsonfree(req);
+
+	/* rung 3: even "none" rejected -> dead, no retry, field gone */
+	ok(!openaiquirk(c, liveerr),
+		"quirk reasoning: third error gives up (no retry)");
+	ok(c->reasonquirk == Rdead, "quirk reasoning: state Rdead");
+	req = openaibuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil,
+		"quirk reasoning: field suppressed in Rdead");
+	jsonfree(req);
+
+	/* terminal: further identical errors never re-fire */
+	ok(!openaiquirk(c, liveerr),
+		"quirk reasoning: Rdead is terminal");
+	ok(c->reasonquirk == Rdead, "quirk reasoning: state stays Rdead");
+
+	convfree(c);
+}
+
+/*
+ * --- openai.c: the quirk ladder from a Thinkoff start (the
+ * live /dev/snarf case): a fresh session never sent
+ * reasoning_effort at all, yet the server rejected
+ * tools+reasoning -- proof that the server applies a default
+ * reasoning effort when the field is absent.  Omitting the
+ * field is a no-op there, so the quirk must skip straight to
+ * sending an explicit "none" (and must NOT resend a
+ * byte-identical body, the original wheel-spinning bug).
+ */
+static void
+topenaiquirkreasoningoff(void)
+{
+	Conv *c;
+	Json *req;
+	char *liveerr;
+
+	liveerr =
+		"API error: Function tools with reasoning_effort are not "
+		"supported for gpt-5.6-sol in /v1/chat/completions. To use "
+		"function tools, do not set reasoning_effort.";
+
+	c = convnew("key", "gpt-5.6-sol", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	convappend(c, msgnew(Muser, "hi", nil));
+
+	ok(c->thinkmode == Thinkoff, "quirk reasoning off: starts Thinkoff");
+	req = openaibuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil,
+		"quirk reasoning off: field absent before quirk");
+	jsonfree(req);
+
+	/*
+	 * The field was never sent, so the only useful move is the
+	 * explicit "none" override: retry with a request that
+	 * actually differs from the one that failed.
+	 */
+	ok(openaiquirk(c, liveerr),
+		"quirk reasoning off: retry requested straight to none");
+	ok(c->reasonquirk == Rnone, "quirk reasoning off: state Rnone");
+	req = openaibuildreq(c);
+	okstr(jstr(req, "reasoning_effort"), "none",
+		"quirk reasoning off: explicit none sent");
+	ok(jget(req, "tools") != nil,
+		"quirk reasoning off: tools still present");
+	jsonfree(req);
+
+	/* if "none" is rejected too, give up rather than loop */
+	ok(!openaiquirk(c, liveerr),
+		"quirk reasoning off: second error gives up");
+	ok(c->reasonquirk == Rdead, "quirk reasoning off: state Rdead");
+	req = openaibuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil,
+		"quirk reasoning off: field suppressed in Rdead");
+	jsonfree(req);
+
+	convfree(c);
+}
+
+/* write a string to a file for use as a canned SSE transcript */
+static char*
+writetmpsse(char *content)
+{
+	char *path;
+	int fd;
+
+	path = esmprint("/tmp/claudetest.sse.%d", getpid());
+	fd = create(path, OWRITE, 0666);
+	if(fd < 0){
+		free(path);
+		return nil;
+	}
+	write(fd, content, strlen(content));
+	close(fd);
+	return path;
+}
+
+/* --- openai.c: stream parsing with tool calls --- */
+
+static void
+topenaistream(void)
+{
+	char *path, *sse;
+	Biobuf *bp;
+	Usage u;
+	Reply *r;
+	Json *rawj, *blocks, *blk;
+	ToolCall *tc;
+	int ntc;
+
+	sse =
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Let me \"},\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{\"content\":\"look.\"},\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\","
+		"\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]},"
+		"\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,"
+		"\"function\":{\"arguments\":\"th\\\": \\\"/tmp/x\\\"}\"}}]},"
+		"\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n"
+		"\n"
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,"
+		"\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n"
+		"\n"
+		"data: [DONE]\n";
+
+	path = writetmpsse(sse);
+	ok(path != nil, "openai stream: created temp file");
+	if(path == nil)
+		return;
+
+	bp = Bopen(path, OREAD);
+	ok(bp != nil, "openai stream: Bopen temp file");
+	if(bp == nil){
+		remove(path);
+		free(path);
+		return;
+	}
+
+	memset(&u, 0, sizeof u);
+	r = openaireadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+
+	ok(r != nil, "openai stream: readstream returns non-nil");
+	if(r == nil)
+		return;
+
+	/* text accumulation */
+	okstr(r->text, "Let me look.", "openai stream: text accumulated");
+
+	/* stop reason normalization: tool_calls -> tool_use */
+	okstr(u.stop_reason, "tool_use", "openai stream: stop_reason tool_use");
+
+	/* stopped == 0 when finish_reason was tool_calls */
+	ok(r->stopped == 0, "openai stream: stopped==0 for tool_calls");
+
+	/* usage mapping */
+	ok(u.input_tokens == 10, "openai stream: input_tokens");
+	ok(u.output_tokens == 5, "openai stream: output_tokens");
+	ok(u.cache_read_input_tokens == 3, "openai stream: cache_read_input_tokens");
+
+	/* tool call list */
+	tc = r->tools;
+	ok(tc != nil, "openai stream: tools list non-nil");
+	if(tc != nil){
+		okstr(tc->id, "call_1", "openai stream: tc->id");
+		okstr(tc->name, "read_file", "openai stream: tc->name");
+		okstr(tc->args[0], "/tmp/x", "openai stream: tc->args[0]");
+		ok(tc->next == nil, "openai stream: exactly one tool call");
+	}
+
+	/* rawjson: parse and inspect blocks */
+	ok(r->rawjson != nil, "openai stream: rawjson non-nil");
+	if(r->rawjson != nil){
+		rawj = jsonparse(r->rawjson);
+		ok(rawj != nil, "openai stream: rawjson parses");
+		if(rawj != nil){
+			ok(rawj->type == Jarray, "openai stream: rawjson is array");
+			/* find text block */
+			blocks = rawj;
+			ntc = 0;
+			{
+				int i;
+				int gottxt;
+				int gottc;
+				gottxt = 0;
+				gottc = 0;
+				for(i = 0; i < blocks->nitem; i++){
+					char *btype;
+					blk = jidx(blocks, i);
+					btype = jstr(blk, "type");
+					if(btype != nil && strcmp(btype, "text") == 0){
+						gottxt = 1;
+						okstr(jstr(blk, "text"), "Let me look.",
+							"openai stream: rawjson text block text");
+					}
+					if(btype != nil && strcmp(btype, "tool_use") == 0){
+						gottc = 1;
+						ntc++;
+						okstr(jstr(blk, "id"), "call_1",
+							"openai stream: rawjson tool_use id");
+						okstr(jstr(blk, "name"), "read_file",
+							"openai stream: rawjson tool_use name");
+						ok(jget(blk, "input") != nil,
+							"openai stream: rawjson tool_use input present");
+					}
+				}
+				ok(gottxt, "openai stream: rawjson has text block");
+				ok(gottc, "openai stream: rawjson has tool_use block");
+				ok(ntc == 1, "openai stream: rawjson has exactly one tool_use");
+			}
+			jsonfree(rawj);
+		}
+	}
+
+	replyfree(r);
+}
+
+/* --- openai.c: text-only stream and truncated stream --- */
+
+static void
+topenaistream2(void)
+{
+	char *path, *path2, *sse, *sse2;
+	Biobuf *bp;
+	Usage u;
+	Reply *r;
+	Json *rawj, *blocks, *blk;
+	int gottxt, i;
+
+	/* text-only transcript ending with finish_reason "stop" */
+	sse =
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n"
+		"\n"
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"
+		"\n"
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,"
+		"\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n"
+		"\n"
+		"data: [DONE]\n";
+
+	path = writetmpsse(sse);
+	ok(path != nil, "openai stream2: created text-only temp file");
+	if(path == nil)
+		goto trunc;
+
+	bp = Bopen(path, OREAD);
+	ok(bp != nil, "openai stream2: Bopen text-only file");
+	if(bp == nil){
+		remove(path);
+		free(path);
+		goto trunc;
+	}
+
+	memset(&u, 0, sizeof u);
+	r = openaireadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+
+	ok(r != nil, "openai stream2: text-only returns non-nil");
+	if(r != nil){
+		/* text */
+		okstr(r->text, "Hello world", "openai stream2: text-only text");
+
+		/* stop_reason: "stop" -> "end_turn" */
+		okstr(u.stop_reason, "end_turn", "openai stream2: stop_reason end_turn");
+
+		/* stopped == 1 for stop finish_reason */
+		ok(r->stopped == 1, "openai stream2: stopped==1 for stop");
+
+		/* no tool calls */
+		ok(r->tools == nil, "openai stream2: no tool calls");
+
+		/* rawjson has exactly one text block */
+		ok(r->rawjson != nil, "openai stream2: rawjson non-nil");
+		if(r->rawjson != nil){
+			rawj = jsonparse(r->rawjson);
+			ok(rawj != nil, "openai stream2: rawjson parses");
+			if(rawj != nil){
+				ok(rawj->type == Jarray, "openai stream2: rawjson is array");
+				blocks = rawj;
+				gottxt = 0;
+				ok(blocks->nitem == 1, "openai stream2: rawjson has exactly 1 block");
+				for(i = 0; i < blocks->nitem; i++){
+					char *btype;
+					blk = jidx(blocks, i);
+					btype = jstr(blk, "type");
+					if(btype != nil && strcmp(btype, "text") == 0)
+						gottxt = 1;
+				}
+				ok(gottxt, "openai stream2: rawjson block is text type");
+				jsonfree(rawj);
+			}
+		}
+		replyfree(r);
+	}
+
+trunc:
+	/* truncated transcript (no [DONE]) -> nil return */
+	sse2 =
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Partial\"},\"finish_reason\":null}]}\n"
+		"\n";
+
+	path2 = esmprint("/tmp/claudetest.sse2.%d", getpid());
+	{
+		int fd;
+		fd = create(path2, OWRITE, 0666);
+		ok(fd >= 0, "openai stream2: created truncated temp file");
+		if(fd >= 0){
+			write(fd, sse2, strlen(sse2));
+			close(fd);
+		} else {
+			free(path2);
+			return;
+		}
+	}
+
+	bp = Bopen(path2, OREAD);
+	ok(bp != nil, "openai stream2: Bopen truncated file");
+	if(bp != nil){
+		Usage u2;
+		Reply *r2;
+		memset(&u2, 0, sizeof u2);
+		r2 = openaireadstream(nil, bp, &u2, nil, nil);
+		Bterm(bp);
+		ok(r2 == nil, "openai stream2: truncated stream returns nil");
+		if(r2 != nil)
+			replyfree(r2);
+	}
+	remove(path2);
+	free(path2);
+}
+
 void
 threadmain(int argc, char **argv)
 {
@@ -660,6 +1364,12 @@ threadmain(int argc, char **argv)
 	treplace();
 	tmkparents();
 	ttoolman();
+	topenaibuildreq();
+	topenaiquirk();
+	topenaiquirkreasoning();
+	topenaiquirkreasoningoff();
+	topenaistream();
+	topenaistream2();
 
 	if(nfail > 0){
 		fprint(2, "%d of %d tests FAILED\n", nfail, nrun);

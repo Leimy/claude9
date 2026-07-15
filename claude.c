@@ -4,10 +4,9 @@
 #include <thread.h>
 #include "json.h"
 #include "claude.h"
+#include "claudeimpl.h"
 
-static char *apiurl = "https://api.anthropic.com/v1/messages";
-static char *modelsurl = "https://api.anthropic.com/v1/models?limit=100";
-static char *apiversion = "2023-06-01";
+static char *apiversion = "2023-06-01";	/* anthropic-version header */
 
 /*
  * emalloc wrappers: succeed or sysfatal.
@@ -70,66 +69,86 @@ esmprint(char *fmt, ...)
 	return p;
 }
 
-enum {
-	Acreate,	/* tool types */
-	Areplace,
-	Aread,
-	Alist,
-	Adelete,
-	Amanpage,
-	Amk,
-
-	Maxargs = 3,	/* max parameters per tool */
-};
-
-/* tool call from Claude */
-typedef struct ToolCall ToolCall;
-struct ToolCall {
-	char *id;		/* tool_use_id */
-	char *name;		/* tool name for display */
-	int type;		/* Acreate, ...; -1 = unknown tool */
-	char *args[Maxargs];	/* values in Tooldef param order; args[0] is the path */
-	char *result;		/* result text after execution */
-	ToolCall *next;
-	ToolCall *bnext;	/* next call in the same hash bucket; see runtools */
-};
-
 /*
- * Reply assembled from a single API round: text, tool_use
- * blocks, and a raw JSON snapshot of the assistant's content
- * array suitable for appending back into a follow-up request.
+ * ToolCall, Tooldef, Reply, and Provider are defined in
+ * claudeimpl.h, shared with the provider implementations
+ * (openai.c); the openai* entry points are declared there
+ * too.
  */
-typedef struct Reply Reply;
-struct Reply {
-	char *text;		/* concatenated text blocks */
-	char *rawjson;		/* raw JSON content array string */
-	ToolCall *tools;	/* linked list of tool calls */
-	int stopped;		/* 1 unless stop_reason was tool_use */
+static int anthropicheaders(int, char*);
+static Json* anthropicbuildreq(Conv*);
+static Reply* anthropicreadstream(Conv*, Biobuf*, Usage*,
+	void (*)(char*, void*), void*);
+
+static Provider providers[] = {
+	{ "anthropic",
+	  "https://api.anthropic.com/v1/messages",
+	  "https://api.anthropic.com/v1/models?limit=100",
+	  anthropicheaders,
+	  anthropicbuildreq,
+	  anthropicreadstream,
+	  nil },
+	{ "openai",
+	  "https://api.openai.com/v1/chat/completions",
+	  "https://api.openai.com/v1/models",
+	  openaiheaders,
+	  openaibuildreq,
+	  openaireadstream,
+	  openaiquirk },
 };
 
+int
+providerlookup(char *name)
+{
+	int i;
+
+	if(name == nil)
+		return -1;
+	for(i = 0; i < nelem(providers); i++)
+		if(strcmp(name, providers[i].name) == 0)
+			return i;
+	return -1;
+}
+
+char*
+providername(int prov)
+{
+	if(prov < 0 || prov >= nelem(providers))
+		return "unknown";
+	return providers[prov].name;
+}
+
+int
+providercount(void)
+{
+	return nelem(providers);
+}
+
 /*
- * Single source of truth for the tools we expose to Claude.
+ * Resolve a conversation's provider index to the vtable,
+ * falling back to the first (anthropic) entry if the index is
+ * somehow out of range -- a wrong-but-working request beats a
+ * nil dereference.
+ */
+static Provider*
+provof(Conv *c)
+{
+	if(c->prov < 0 || c->prov >= nelem(providers))
+		return &providers[0];
+	return &providers[c->prov];
+}
+
+/*
+ * Single source of truth for the tools we expose to the model.
  *
  * Each tool takes up to Maxargs string parameters, all
  * required; params[0] is always the path.  The same table
- * drives the JSON schema (mktools) and argument extraction
- * (parseinput); ToolCall.args holds the values in params
- * order.  findtool() maps API names to the Acreate/... enum.
+ * drives the JSON schema (toolschema/mktools) and argument
+ * extraction (parseinput); ToolCall.args holds the values in
+ * params order.  findtool() maps API names to the Acreate/...
+ * enum.  Providers outside this file reach the table through
+ * tooldef(i) (see claudeimpl.h for why it is not extern data).
  */
-typedef struct Toolparam Toolparam;
-struct Toolparam {
-	char *name;
-	char *desc;
-};
-
-typedef struct Tooldef Tooldef;
-struct Tooldef {
-	int type;
-	char *name;
-	char *desc;
-	Toolparam params[Maxargs];	/* nil name terminates */
-};
-
 static Tooldef tools[] = {
 	{ Acreate, "create_file",
 		"Create or overwrite a file with the given contents. "
@@ -190,7 +209,15 @@ static Tooldef tools[] = {
 		 { "targets", "Space-separated mk targets/args, or empty for the default target" }}},
 };
 
-static Tooldef*
+Tooldef*
+tooldef(int i)
+{
+	if(i < 0 || i >= nelem(tools))
+		return nil;
+	return &tools[i];
+}
+
+Tooldef*
 findtool(char *name)
 {
 	int i;
@@ -208,7 +235,7 @@ findtool(char *name)
  * in Tooldef param order.  Missing parameters (and all
  * parameters of an unknown tool, td == nil) become "".
  */
-static void
+void
 parseinput(ToolCall *tc, Tooldef *td, Json *input)
 {
 	char *s;
@@ -320,6 +347,7 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
 	Conv *c;
 
 	c = emallocz(sizeof *c, 1);
+	c->prov = providerlookup("anthropic");
 	c->apikey = estrdup(apikey);
 	c->model = estrdup(model);
 	c->maxtokens = maxtokens;
@@ -354,6 +382,7 @@ convfree(Conv *c)
 	convclear(c);
 	free(c->apikey);
 	free(c->model);
+	free(c->baseurl);
 	free(c->effort);
 	free(c->basesys);
 	free(c->sysprompt);
@@ -367,7 +396,7 @@ msgnew(int role, char *text, char *rawjson)
 
 	m = emallocz(sizeof *m, 1);
 	m->role = role;
-	m->text = estrdup(text);
+	m->text = estrdup(text != nil ? text : "");
 	if(rawjson != nil)
 		m->rawjson = estrdup(rawjson);
 	return m;
@@ -480,14 +509,40 @@ convcompact(Conv *c, int keep)
 }
 
 /*
- * Build tool definitions JSON.
+ * JSON schema object for one tool's parameters: the payload
+ * both providers advertise, under different wrappers
+ * (anthropic input_schema, openai function.parameters).
+ */
+Json*
+toolschema(Tooldef *td)
+{
+	Json *input, *props, *p, *req;
+	Toolparam *tp;
+
+	input = jobject();
+	jset(input, "type", jstring("object"));
+	props = jobject();
+	req = jarray();
+	for(tp = td->params; tp < td->params + Maxargs && tp->name != nil; tp++){
+		p = jobject();
+		jset(p, "type", jstring("string"));
+		jset(p, "description", jstring(tp->desc));
+		jset(props, tp->name, p);
+		jappend(req, jstring(tp->name));
+	}
+	jset(input, "properties", props);
+	jset(input, "required", req);
+	return input;
+}
+
+/*
+ * Build tool definitions JSON, anthropic shape.
  */
 static Json*
 mktools(void)
 {
-	Json *arr, *t, *input, *props, *p, *req, *cc;
+	Json *arr, *t, *cc;
 	Tooldef *td;
-	Toolparam *tp;
 	int i;
 
 	arr = jarray();
@@ -497,23 +552,7 @@ mktools(void)
 		t = jobject();
 		jset(t, "name", jstring(td->name));
 		jset(t, "description", jstring(td->desc));
-
-		input = jobject();
-		jset(input, "type", jstring("object"));
-
-		props = jobject();
-		req = jarray();
-		for(tp = td->params; tp < td->params + Maxargs && tp->name != nil; tp++){
-			p = jobject();
-			jset(p, "type", jstring("string"));
-			jset(p, "description", jstring(tp->desc));
-			jset(props, tp->name, p);
-			jappend(req, jstring(tp->name));
-		}
-
-		jset(input, "properties", props);
-		jset(input, "required", req);
-		jset(t, "input_schema", input);
+		jset(t, "input_schema", toolschema(td));
 
 		/* mark the last tool with cache_control for prompt caching */
 		if(i == nelem(tools) - 1){
@@ -534,7 +573,7 @@ mktools(void)
  * non-whitespace text"), so both cases must be treated
  * identically everywhere a text block is emitted.
  */
-static int
+int
 blankstr(char *s)
 {
 	if(s == nil)
@@ -845,7 +884,7 @@ repairtoolresults(Json *msgs)
 }
 
 static Json*
-buildreq(Conv *c)
+anthropicbuildreq(Conv *c)
 {
 	Json *req, *msgs, *msg, *content, *block, *sys, *cc;
 	Msg *m;
@@ -1055,14 +1094,25 @@ weberror(char *webdir)
 	free(ebody);
 }
 
+/* Anthropic auth: api key plus a pinned API version. */
+static int
+anthropicheaders(int fd, char *apikey)
+{
+	if(fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0)
+		return -1;
+	return 0;
+}
+
 /*
- * Perform an HTTP request to the Anthropic API through webfs.
- * postbody nil means GET.  On success returns an open fd for
- * the response body and stores the connection fd in *clonefdp
- * (caller closes both); on error returns -1 with errstr set.
+ * Perform an HTTP request to an API through webfs; the
+ * provider supplies the auth headers.  postbody nil means GET.
+ * On success returns an open fd for the response body and
+ * stores the connection fd in *clonefdp (caller closes both);
+ * on error returns -1 with errstr set.
  */
 static int
-webhttp(char *apikey, char *url, char *postbody, int stream, int *clonefdp)
+webhttp(Provider *p, char *apikey, char *url, char *postbody, int stream, int *clonefdp)
 {
 	int clonefd, fd, n;
 	char buf[256], *webdir, *path;
@@ -1090,8 +1140,7 @@ webhttp(char *apikey, char *url, char *postbody, int stream, int *clonefdp)
 	|| fprint(fd, "request %s\n", postbody ? "POST" : "GET") < 0
 	|| (postbody && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
 	|| (stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
-	|| fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0){
+	|| p->headers(fd, apikey) < 0){
 		close(fd);
 		goto err;
 	}
@@ -1127,7 +1176,7 @@ err:
 	return -1;
 }
 
-static void
+void
 toolfree(ToolCall *t)
 {
 	ToolCall *next;
@@ -1145,7 +1194,7 @@ toolfree(ToolCall *t)
 	}
 }
 
-static void
+void
 replyfree(Reply *r)
 {
 	if(r == nil)
@@ -2015,40 +2064,21 @@ ssehandle(char *json, Sblock *blocks, int *nblocksp,
 	return rc;
 }
 
+/*
+ * Anthropic: consume a streamed SSE response and reassemble
+ * the assistant turn into a Reply.
+ */
 static Reply*
-sendonce(Conv *c, Usage *usage,
+anthropicreadstream(Conv *c, Biobuf *bp, Usage *usage,
 	void (*cb)(char*, void*), void *aux)
 {
-	Json *req;
-	char *body, *stopreason, *line;
-	Biobuf *bp;
-	int fd, clonefd, rc, done, err;
+	char *stopreason, *line, *p;
+	int rc, done, err;
 	Sblock blocks[Maxblocks];
 	int nblocks;
 	Reply *r;
 
-	req = buildreq(c);
-	jset(req, "stream", jbool(1));
-	body = jsonstr(req);
-	jsonfree(req);
-	if(body == nil){
-		werrstr("failed to serialize request");
-		return nil;
-	}
-
-	fd = webhttp(c->apikey, apiurl, body, 1, &clonefd);
-	free(body);
-	if(fd < 0)
-		return nil;
-
-	bp = Bfdopen(fd, OREAD);
-	if(bp == nil){
-		close(fd);
-		close(clonefd);
-		werrstr("Bfdopen: %r");
-		return nil;
-	}
-
+	USED(c);
 	memset(blocks, 0, sizeof blocks);
 	nblocks = 0;
 	stopreason = nil;
@@ -2060,7 +2090,6 @@ sendonce(Conv *c, Usage *usage,
 			free(line);
 			continue;
 		}
-		char *p;
 		p = line + 5;
 		while(*p == ' ') p++;
 		if(*p == '\0'){ free(line); continue; }
@@ -2070,10 +2099,6 @@ sendonce(Conv *c, Usage *usage,
 		if(rc < 0){ err = 1; break; }
 		if(rc > 0) done = 1;
 	}
-
-	Bterm(bp);
-	close(fd);
-	close(clonefd);
 
 	/*
 	 * The SSE stream must end with a message_stop event.  If it
@@ -2101,6 +2126,107 @@ sendonce(Conv *c, Usage *usage,
 	freeblocks(blocks, nblocks);
 	free(stopreason);
 	return r;
+}
+
+/*
+ * One request/response round through the conversation's
+ * provider: build the request, POST it, hand the streamed
+ * body to the provider's reader.
+ */
+static Reply*
+sendonce1(Conv *c, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Json *req;
+	char *body;
+	Biobuf *bp;
+	int fd, clonefd;
+	Reply *r;
+	Provider *p;
+
+	p = provof(c);
+	req = p->buildreq(c);
+	if(req == nil)
+		return nil;	/* errstr set by buildreq */
+	jset(req, "stream", jbool(1));
+	body = jsonstr(req);
+	jsonfree(req);
+	if(body == nil){
+		werrstr("failed to serialize request");
+		return nil;
+	}
+
+	fd = webhttp(p, c->apikey,
+		c->baseurl != nil && c->baseurl[0] != '\0' ? c->baseurl : p->apiurl,
+		body, 1, &clonefd);
+	free(body);
+	if(fd < 0)
+		return nil;
+
+	bp = Bfdopen(fd, OREAD);
+	if(bp == nil){
+		close(fd);
+		close(clonefd);
+		werrstr("Bfdopen: %r");
+		return nil;
+	}
+
+	r = p->readstream(c, bp, usage, cb, aux);
+	Bterm(bp);
+	close(fd);
+	close(clonefd);
+	return r;
+}
+
+enum {
+	Maxquirks = 3,	/* quirk-driven retries per round; see sendonce */
+};
+
+/*
+ * sendonce1 plus quirk-driven retries: if the round fails and
+ * the provider's quirk hook recognizes the error as a fixable
+ * request-shape complaint (e.g. an openai-compatible server
+ * wanting the legacy max_tokens field name instead of
+ * max_completion_tokens), it adjusts the Conv's quirk flags
+ * and the request is rebuilt and resent.  The adjustments
+ * stick on the Conv, so later rounds get the right shape on
+ * their first try.
+ *
+ * Up to Maxquirks retries per round, because one complaint can
+ * take several adjustments to pin down: the reasoning_effort
+ * quirk ladder (see openaiquirk) may need to try omitting the
+ * field and then sending an explicit "none" before the server
+ * is satisfied, and forcing each rung onto a separate user
+ * prompt would surface errors the next request was already
+ * going to fix.  The cap keeps a misbehaving hook (or a server
+ * whose errors toggle a flag back and forth) from retrying
+ * forever; well-behaved quirk state machines are monotonic and
+ * stop asking on their own.
+ */
+static Reply*
+sendonce(Conv *c, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	Reply *r;
+	Provider *p;
+	char errbuf[ERRMAX];
+	int try;
+
+	p = provof(c);
+	for(try = 0;; try++){
+		r = sendonce1(c, usage, cb, aux);
+		if(r != nil)
+			return r;
+		if(p->quirk == nil || try >= Maxquirks)
+			return nil;
+		rerrstr(errbuf, sizeof errbuf);
+		if(!p->quirk(c, errbuf)){
+			werrstr("%s", errbuf);	/* quirk may have clobbered errstr */
+			return nil;
+		}
+		fprint(2, "claude: %s: retrying after request-shape error: %s\n",
+			p->name, errbuf);
+	}
 }
 
 /*
@@ -2241,14 +2367,20 @@ claudeconverse(Conv *c, Usage *usage,
  * Returns nil with errstr set on failure.
  */
 char*
-fetchmodels(char *apikey)
+fetchmodels(int prov, char *apikey)
 {
 	int fd, clonefd, i;
 	char *data, *id, *msg;
 	Json *resp, *darr;
 	Fmt f;
+	Provider *p;
 
-	fd = webhttp(apikey, modelsurl, nil, 0, &clonefd);
+	if(prov < 0 || prov >= nelem(providers)){
+		werrstr("unknown provider %d", prov);
+		return nil;
+	}
+	p = &providers[prov];
+	fd = webhttp(p, apikey, p->modelsurl, nil, 0, &clonefd);
 	if(fd < 0)
 		return nil;
 	data = readfile(fd);
