@@ -1,6 +1,7 @@
 # Multi-provider support: Anthropic + OpenAI-compatible APIs
 
-Status: steps 1-8 DONE.  ./tests passes (199+ tests; three
+Status: implementation and README documentation are complete for the
+current provider interface.  ./tests previously passed (199+ tests; three
 test bugs found and fixed on the first runs: a msgnew(nil)
 crash, a jint-on-Jbool assertion, and a canned SSE transcript
 missing a closing brace).  Also done since: per-provider
@@ -33,11 +34,12 @@ are load-bearing for this program; reasoning_effort is a
 nice-to-have).  Regression tests: topenaiquirkreasoning
 (Thinkadaptive start, full ladder) and
 topenaiquirkreasoningoff (Thinkoff start, the live case,
-skips straight to "none").  NOT yet done: live confirmation
-that "none" satisfies the gpt-5.6-sol endpoint, more live
-testing (tool rounds against real OpenAI, a compat server),
-step 9 docs (README), and the gaps below.
-Last updated: after the reasoning_effort quirk-ladder fix.
+skips straight to "none").  README now documents providers,
+keys, provider/baseurl files, and claudetalk controls.  Still not
+done: live confirmation that "none" satisfies the gpt-5.6-sol
+endpoint, more live testing (tool rounds against real OpenAI and
+a compat server), and the gaps below.
+Last updated: after README reconciliation and review remediation.
 
 ## The reasoning_effort saga: server-side default reasoning
 
@@ -441,23 +443,22 @@ Session files to use it:
   openai-compatible endpoint.  The SSE parser follows the spec;
   reality may differ in small ways (e.g. servers that omit
   usage, or send roles in deltas).
-- The reasoning_effort quirk ladder (Conv.reasonquirk) is
-  monotonic and never resets within a conversation: a session
-  that climbed to Rnone or Rdead on one model keeps that
-  state after switching mid-session to a model that would
-  have accepted the plain effort value.  Low priority: the
-  ladder only advances on actual server rejections, a wrong
-  rung costs at most degraded (not broken) behavior, and a
-  fresh session starts back at Reffort.  Also, whether an
+- RESOLVED: request-shape quirks are reset when provider, model,
+  or base URL changes, so learned state does not leak to a new
+  endpoint configuration.  Whether an
   explicit "none" is accepted by OLDER compat servers that
   predate the value is untested; if one rejects it with
   matching wording the ladder falls through to Rdead and
   surfaces the error, which is the intended worst case.
-- No repair passes on the openai buildreq path (anthropic has
-  repairtooluse/repairtoolresults).  claudeconverse maintains
-  the invariant in normal operation; a corrupt/interrupted
-  history could still wedge an openai session.  Consider
-  running neutral-form repairs before translation.
+- RESOLVED: the message-building loop that used to live inline
+  in anthropicbuildreq (parse rawjson, strip blank text blocks,
+  merge consecutive same-role messages, repair orphaned
+  tool_use/tool_result) is now its own function,
+  neutralmessages() in claude.c.  openaibuildreq calls it too
+  and translates each repaired {role, content} entry to the
+  OpenAI shape, instead of walking c->msgs directly.  A
+  corrupt/interrupted history now recovers on the OpenAI path
+  the same way it already did on Anthropic's.
 - The root models file ignores per-session baseurl (it has no
   session); models from a local llama.cpp server are not
   listed.  Low priority: such servers usually serve exactly
@@ -469,8 +470,8 @@ Session files to use it:
   form), but replaying anthropic thinking blocks to openai is
   handled by dropping them -- long histories with heavy
   thinking may lose context.
-- README/man-style docs (step 9) still to write once the dust
-  settles.
+- RESOLVED: README documents provider setup, selection, endpoint
+  overrides, session files, and claudetalk controls.
 
 ## Work plan (rough order)
 
@@ -479,31 +480,20 @@ Session files to use it:
    behind it; anthropic provider = current code refactored.
    No behavior change.  claude9fs and tests both build clean;
    ./tests not yet run (needs a human to execute it).
-2. Define neutral content-block form; make blocks2reply emit
-   it and anthropic buildreq consume it.  Still no behavior
-   change -- it IS essentially the current format, formalized.
-   (medium)
-3. Write openaibuildreq(): neutral messages -> chat completions
-   JSON.  Includes tools wrapper, tool_result -> role:"tool"
-   splitting, system message, max_tokens quirk.  (medium)
-4. Write openaireadstream(): SSE chunk accumulation ->
-   Reply with neutral rawjson.  Handle [DONE], per-index
-   tool_call assembly, usage mapping, finish_reason
-   normalization.  (the big one)
-5. Repair/invariant pass for OpenAI ordering (every tool_call
-   answered by a tool message immediately after).  May fall
-   out of the neutral-form repair for free -- verify.
-6. claude9fs: provider/baseurl files, key selection, thinking
-   validation.  (small)
-7. fetchmodels via provider vtable.  (tiny)
-8. tests.c: add cases for openai buildreq shape and stream
-   parsing (feed canned SSE transcripts).  Existing test
-   harness location: tests.c in this dir.
-9. Docs: README.md, skills (sub-agent-acme model list section
-   mentions Anthropic model names).
-
-Estimated total: ~week of careful work; steps 1-2 are safe
-refactors that can land independently and first.
+2. DONE -- Neutral content-block form emitted and consumed by both
+   provider paths.
+3. DONE -- openaibuildreq translates neutral messages to Chat
+   Completions JSON.
+4. DONE -- openaireadstream handles text, tool calls, usage, [DONE],
+   and stop-reason normalization.
+5. DONE -- Shared neutral repair enforces tool-call/result ordering
+   before either provider translation.
+6. DONE -- provider/baseurl session files, key selection, and thinking
+   mappings.
+7. DONE -- per-provider model listing for configured default endpoints.
+8. DONE -- request, stream, quirk, and neutral-history tests.
+9. DONE -- README provider setup and controls.  Deployed skill model
+   lists remain operational configuration rather than provider docs.
 
 ## Open questions
 

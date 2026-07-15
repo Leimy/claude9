@@ -304,7 +304,9 @@ Json*
 openaibuildreq(Conv *c)
 {
 	Json *req, *msgs, *msg, *content, *streamopts;
-	Msg *m;
+	Json *neutral, *nmsg;
+	char *role;
+	int i;
 
 	req = jobject();
 	jset(req, "model", jstring(c->model));
@@ -338,8 +340,8 @@ openaibuildreq(Conv *c)
 		jset(req, "reasoning_effort", jstring(c->effort));
 
 	/*
-	 * Build the messages array.  System prompt is first if set.
-	 * Then walk the neutral conversation, converting each Msg.
+	 * Build the messages array.  System prompt is first if set,
+	 * then the translated neutral history (see below).
 	 */
 	msgs = jarray();
 
@@ -350,67 +352,26 @@ openaibuildreq(Conv *c)
 		jappend(msgs, msg);
 	}
 
-	for(m = c->msgs; m != nil; m = m->next){
-		if(m->rawjson == nil){
-			/* plain text message */
-			if(m->role == Muser){
-				char *text;
-
-				text = (blankstr(m->text)) ? "(no text)" : m->text;
-				msg = jobject();
-				jset(msg, "role", jstring("user"));
-				jset(msg, "content", jstring(text));
-				jappend(msgs, msg);
-			} else {
-				/* Massistant plain text */
-				msg = jobject();
-				jset(msg, "role", jstring("assistant"));
-				jset(msg, "content",
-					jstring(m->text ? m->text : ""));
-				jappend(msgs, msg);
-			}
-			continue;
-		}
-
-		/* rawjson: neutral content array */
-		content = jsonparse(m->rawjson);
-		if(content == nil){
-			/*
-			 * Parse failure: fall back to plain text.
-			 * This can only happen with a corrupt snapshot;
-			 * the tool protocol may be broken, but we do
-			 * the best we can rather than refusing to send.
-			 */
-			fprint(2, "openai: stored message failed to reparse: %r\n");
-			if(m->role == Massistant){
-				msg = jobject();
-				jset(msg, "role", jstring("assistant"));
-				jset(msg, "content",
-					jstring(m->text ? m->text : ""));
-				jappend(msgs, msg);
-			} else {
-				char *text;
-
-				text = (blankstr(m->text)) ? "(no text)" : m->text;
-				msg = jobject();
-				jset(msg, "role", jstring("user"));
-				jset(msg, "content", jstring(text));
-				jappend(msgs, msg);
-			}
-			continue;
-		}
-
-		if(m->role == Massistant){
+	/*
+	 * Build from the shared neutral history (see
+	 * neutralmessages in claude.c): every message is already
+	 * repaired and normalized into a {role, content} entry
+	 * with content a non-empty Jarray of blocks, so a corrupt
+	 * or interrupted history recovers on this path too, not
+	 * only Anthropic's (CODE-REVIEW.md finding #5).  Each
+	 * entry is then translated to the OpenAI shape.
+	 */
+	neutral = neutralmessages(c);
+	for(i = 0; i < neutral->nitem; i++){
+		nmsg = neutral->items[i];
+		role = jstr(nmsg, "role");
+		content = jget(nmsg, "content");
+		if(role != nil && strcmp(role, "assistant") == 0)
 			appendassistantmsg(msgs, content);
-		} else {
-			/*
-			 * Muser with rawjson: tool results (and possibly
-			 * text blocks) from the previous tool round.
-			 */
+		else
 			appendtoolresultmsgs(msgs, content);
-		}
-		jsonfree(content);
 	}
+	jsonfree(neutral);
 
 	jset(req, "messages", msgs);
 	jset(req, "tools", mkopenatools());

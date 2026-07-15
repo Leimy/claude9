@@ -531,6 +531,55 @@ terrs(void)
 	ok(!toollimiterr(nil), "toollimiterr nil");
 }
 
+/* --- claude.c: bounded model-facing file reads --- */
+
+static void
+treadlimit(void)
+{
+	char *path, *buf, *res;
+	int fd;
+
+	path = esmprint("/tmp/claudetest.read.%d", getpid());
+	buf = emalloc(Toolreadmax + 2);
+	memset(buf, 'x', Toolreadmax + 1);
+	buf[Toolreadmax + 1] = '\0';
+
+	fd = create(path, OWRITE, 0666);
+	ok(fd >= 0, "read limit: create temp file");
+	if(fd >= 0){
+		write(fd, buf, Toolreadmax - 1);
+		close(fd);
+		res = toolread(path);
+		ok(res != nil && strlen(res) == Toolreadmax - 1,
+			"read limit: below cap is not marked truncated");
+		free(res);
+	}
+
+	fd = create(path, OWRITE, 0666);
+	if(fd >= 0){
+		write(fd, buf, Toolreadmax);
+		close(fd);
+		res = toolread(path);
+		ok(res != nil && strncmp(res, "warning:", 8) == 0,
+			"read limit: exact cap is conservatively marked");
+		free(res);
+	}
+
+	fd = create(path, OWRITE, 0666);
+	if(fd >= 0){
+		write(fd, buf, Toolreadmax + 1);
+		close(fd);
+		res = toolread(path);
+		ok(res != nil && strncmp(res, "warning:", 8) == 0,
+			"read limit: over cap is marked truncated");
+		free(res);
+	}
+
+	remove(path);
+	free(buf);
+	free(path);
+}
+
 /* --- claude.c: replace_string tool --- */
 
 static void
@@ -549,12 +598,25 @@ treplace(void)
 	fprint(fd, "hello world hello");
 	close(fd);
 
+	{
+		Dir d;
+		nulldir(&d);
+		d.mode = 0751;
+		dirwstat(path, &d);
+	}
 	res = toolreplace(path, "world", "there");
 	ok(strncmp(res, "error", 5) != 0, "replace succeeds");
 	free(res);
 	res = toolread(path);
 	okstr(res, "hello there hello", "replace result");
 	free(res);
+	{
+		Dir *d;
+		d = dirstat(path);
+		ok(d != nil && (d->mode & 0777) == 0751,
+			"replace preserves file mode");
+		free(d);
+	}
 
 	res = toolreplace(path, "hello", "x");
 	ok(strncmp(res, "error", 5) == 0, "ambiguous match rejected");
@@ -1361,6 +1423,7 @@ threadmain(int argc, char **argv)
 	tpathhash();
 	tsbuf();
 	terrs();
+	treadlimit();
 	treplace();
 	tmkparents();
 	ttoolman();

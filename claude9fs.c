@@ -228,6 +228,42 @@ static void freesession(Session*);
 static char* provkey(int);
 
 /*
+ * Strict decimal parser for control-file numeric settings
+ * (token counts, thinking budgets, compaction/autocontinue
+ * counts).  Unlike atoi, which accepts a bare numeric prefix
+ * and silently ignores trailing garbage (so "1024garbage" or
+ * "" both "succeed" as some number), this requires the whole
+ * trimmed input to be a valid, in-range decimal integer and
+ * fails otherwise, so a mistyped or truncated control write is
+ * refused instead of silently doing something unintended (see
+ * CODE-REVIEW.md finding #7).  Returns 1 and *np set on
+ * success, 0 (leaving *np unspecified) on any parse failure.
+ */
+int
+strictint(char *s, int *np)
+{
+	char *end;
+	vlong n;
+
+	if(s == nil)
+		return 0;
+	while(*s == ' ' || *s == '\t')
+		s++;
+	if(*s == '\0')
+		return 0;
+	/* vlong (64-bit), not long, so the int-range check below is meaningful */
+	n = strtoll(s, &end, 10);
+	while(*end == ' ' || *end == '\t')
+		end++;
+	if(*end != '\0' || end == s)
+		return 0;
+	if(n < -2147483647LL || n > 2147483647LL)
+		return 0;
+	*np = (int)n;
+	return 1;
+}
+
+/*
  * Session lifetime: sessions live on the global list until a
  * hangup unlinks them (s->unlinked).  Any code that uses a
  * session outside sessionlk must hold a reference taken by
@@ -749,6 +785,12 @@ wrthinking(Session *s, char *data)
 		p = data + 8;
 		while(*p == ' ' || *p == '\t')
 			p++;
+		if(*p != '\0'){
+			char *q;
+			for(q = p; *q != '\0'; q++)
+				if(*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+					return "adaptive effort must be one word";
+		}
 		c->thinkmode = Thinkadaptive;
 		c->thinking = 0;
 		free(c->effort);
@@ -756,7 +798,8 @@ wrthinking(Session *s, char *data)
 		return nil;
 	}
 	if(data[0] >= '0' && data[0] <= '9'){
-		n = atoi(data);
+		if(!strictint(data, &n))
+			return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
 		if(n < 1024)
 			return "thinking budget must be at least 1024 tokens";
 		if(n >= c->maxtokens)
@@ -768,6 +811,22 @@ wrthinking(Session *s, char *data)
 		return nil;
 	}
 	return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
+}
+
+/*
+ * Provider/model/base-URL request-shape quirks (Conv.oldmaxtok,
+ * Conv.reasonquirk; see openaiquirk in openai.c) record what a
+ * particular server+model combination is observed to want, not
+ * anything about the conversation itself.  Reset them whenever
+ * provider, model, or base URL changes, so a workaround learned
+ * against one endpoint cannot leak into requests sent to a
+ * different one afterward (CODE-REVIEW.md finding #6).
+ */
+static void
+resetquirks(Conv *c)
+{
+	c->oldmaxtok = 0;
+	c->reasonquirk = Reffort;
 }
 
 /*
@@ -814,6 +873,7 @@ wrprovider(Session *s, char *data)
 	s->conv->prov = prov;
 	free(s->conv->apikey);
 	s->conv->apikey = estrdup(key);
+	resetquirks(s->conv);
 	bumpgraph();
 	return nil;
 }
@@ -832,6 +892,7 @@ wrbaseurl(Session *s, char *data)
 		s->conv->baseurl = nil;
 	else
 		s->conv->baseurl = estrdup(data);
+	resetquirks(s->conv);
 	return nil;
 }
 
@@ -932,8 +993,16 @@ rderror(Session *s)
 static char*
 wrmodel(Session *s, char *data)
 {
+	char *p;
+
+	if(data == nil || data[0] == '\0')
+		return "model name must not be empty";
+	for(p = data; *p != '\0'; p++)
+		if(*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			return "model name must not contain whitespace";
 	free(s->conv->model);
 	s->conv->model = estrdup(data);
+	resetquirks(s->conv);
 	bumpgraph();
 	return nil;
 }
@@ -943,8 +1012,7 @@ wrtokens(Session *s, char *data)
 {
 	int n;
 
-	n = atoi(data);
-	if(n <= 0)
+	if(!strictint(data, &n) || n <= 0)
 		return "invalid token count";
 	/* keep the thinking-budget invariant (see wrthinking) */
 	if(s->conv->thinkmode == Thinkbudget && n <= s->conv->thinking)
@@ -1582,8 +1650,8 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		 */
 		if(*v == '\0')
 			keep = 4;
-		else
-			keep = atoi(v);
+		else if(!strictint(v, &keep))
+			return "compact: invalid keep count";
 		if(keep < 1)
 			return "compact: keep count must be at least 1";
 		convcompact(s->conv, keep);
@@ -1616,8 +1684,8 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		while(*v == ' ') v++;
 		if(*v == '\0')
 			n = 3;	/* default: up to 3 rounds */
-		else
-			n = atoi(v);
+		else if(!strictint(v, &n))
+			return "autocontinue: invalid count";
 		if(n < 0) n = 0;
 		s->autocont = n;
 	} else if(strcmp(cmd, "noautocontinue") == 0){
@@ -1908,7 +1976,7 @@ usage(void)
 void
 threadmain(int argc, char **argv)
 {
-	char *srvname, *mtpt, *defprovname, *key;
+	char *srvname, *mtpt, *defprovname, *key, *arg;
 
 	srvname = nil;
 	mtpt = "/mnt/claude";
@@ -1934,7 +2002,9 @@ threadmain(int argc, char **argv)
 		defprovname = EARGF(usage());
 		break;
 	case 't':
-		defmaxtokens = atoi(EARGF(usage()));
+		arg = EARGF(usage());
+		if(!strictint(arg, &defmaxtokens) || defmaxtokens <= 0)
+			usage();
 		break;
 	default:
 		usage();

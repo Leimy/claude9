@@ -294,6 +294,67 @@ readfile(int fd)
 	return buf;
 }
 
+/*
+ * Like readfile, but never grows past max bytes and reports
+ * whether more data remained unread past that point.
+ *
+ * readfile itself is unbounded, which is fine for callers that
+ * already trust the source (an HTTP response body, a skills
+ * file dropped in place by whoever configured claude9fs).  It
+ * is not fine for the model-facing read_file tool: a model (or
+ * a prompt-injected file it was told to read) can name a huge
+ * file, a synthetic file with effectively unbounded output, or
+ * a blocking device, any of which could exhaust server memory
+ * or wedge a tool worker indefinitely (CODE-REVIEW.md finding
+ * #2).  toolread uses this instead of readfile for that reason;
+ * other readfile callers are unaffected.
+ */
+static char*
+readfilelimit(int fd, long max, int *truncatedp)
+{
+	char *buf;
+	long n, len, cap;
+
+	*truncatedp = 0;
+	cap = 8192;
+	if(cap > max + 1)
+		cap = max + 1;
+	buf = emalloc(cap);
+	len = 0;
+	n = 0;
+	for(;;){
+		/*
+		 * Stop as soon as the cap is full.  Do not peek one
+		 * more byte: on a stream or synthetic file that extra
+		 * read can block indefinitely after we already have all
+		 * the output we are willing to return.  "truncated"
+		 * therefore means "the limit was reached; more data may
+		 * exist", which is the only safe claim for a general 9P
+		 * file without a trustworthy length.
+		 */
+		if(len >= max){
+			*truncatedp = 1;
+			break;
+		}
+		n = read(fd, buf + len, cap - len - 1);
+		if(n <= 0)
+			break;
+		len += n;
+		if(len >= cap - 1 && len < max){
+			cap *= 2;
+			if(cap > max + 1)
+				cap = max + 1;
+			buf = erealloc(buf, cap);
+		}
+	}
+	if(n < 0){
+		free(buf);
+		return nil;
+	}
+	buf[len] = '\0';
+	return buf;
+}
+
 static char *defaultsysprompt =
 	"You are a coding assistant running on Plan 9 (9front). "
 	"You have tools to create, edit, and delete files. "
@@ -883,63 +944,27 @@ repairtoolresults(Json *msgs)
 			dropped, dropped > 1 ? "s" : "");
 }
 
-static Json*
-anthropicbuildreq(Conv *c)
+/*
+ * Build the neutral messages array from a Conv's message list:
+ * one {role, content} object per surviving message, content
+ * always a Jarray of blocks (text/thinking/tool_use/
+ * tool_result), with blank text blocks stripped, consecutive
+ * same-role messages merged, and the tool_use/tool_result
+ * protocol invariants repaired.
+ *
+ * Both provider builders call this -- anthropicbuildreq uses
+ * it directly as the wire "messages" array; openaibuildreq
+ * translates each {role, content} entry to the OpenAI shape
+ * (appendassistantmsg/appendtoolresultmsgs) -- so a corrupted
+ * or interrupted history is normalized once, before either
+ * wire-format translation, instead of only on the Anthropic
+ * path (see PROVIDERS.md and CODE-REVIEW.md finding #5).
+ */
+Json*
+neutralmessages(Conv *c)
 {
-	Json *req, *msgs, *msg, *content, *block, *sys, *cc;
+	Json *msgs, *msg, *content;
 	Msg *m;
-
-	req = jobject();
-	jset(req, "model", jstring(c->model));
-	jset(req, "max_tokens", jintval(c->maxtokens));
-
-	/*
-	 * Extended thinking.  Two API shapes, model-dependent:
-	 *
-	 * Thinkbudget (opus/sonnet/haiku families):
-	 *   thinking: {type: "enabled", budget_tokens: N}
-	 * Whoever sets Conv.thinking enforces the API's invariant
-	 * 1024 <= budget < maxtokens (see wrthinking in claude9fs.c),
-	 * so the value is passed through as-is.
-	 *
-	 * Thinkadaptive (fable family):
-	 *   thinking: {type: "adaptive"}
-	 *   output_config: {effort: "..."}   (optional)
-	 * These models reject type "enabled" outright.
-	 */
-	if(c->thinkmode == Thinkbudget && c->thinking > 0){
-		Json *think;
-
-		think = jobject();
-		jset(think, "type", jstring("enabled"));
-		jset(think, "budget_tokens", jintval(c->thinking));
-		jset(req, "thinking", think);
-	} else if(c->thinkmode == Thinkadaptive){
-		Json *think, *oc;
-
-		think = jobject();
-		jset(think, "type", jstring("adaptive"));
-		jset(req, "thinking", think);
-		if(c->effort != nil && c->effort[0] != '\0'){
-			oc = jobject();
-			jset(oc, "effort", jstring(c->effort));
-			jset(req, "output_config", oc);
-		}
-	}
-
-	if(c->sysprompt){
-		sys = jarray();
-		block = jobject();
-		jset(block, "type", jstring("text"));
-		jset(block, "text", jstring(c->sysprompt));
-		cc = jobject();
-		jset(cc, "type", jstring("ephemeral"));
-		jset(block, "cache_control", cc);
-		jappend(sys, block);
-		jset(req, "system", sys);
-	}
-
-	jset(req, "tools", mktools());
 
 	msgs = jarray();
 	for(m = c->msgs; m != nil; m = m->next){
@@ -1034,6 +1059,68 @@ anthropicbuildreq(Conv *c)
 	 */
 	repairtooluse(msgs);
 	repairtoolresults(msgs);
+
+	return msgs;
+}
+
+static Json*
+anthropicbuildreq(Conv *c)
+{
+	Json *req, *msgs, *msg, *content, *block, *sys, *cc;
+
+	req = jobject();
+	jset(req, "model", jstring(c->model));
+	jset(req, "max_tokens", jintval(c->maxtokens));
+
+	/*
+	 * Extended thinking.  Two API shapes, model-dependent:
+	 *
+	 * Thinkbudget (opus/sonnet/haiku families):
+	 *   thinking: {type: "enabled", budget_tokens: N}
+	 * Whoever sets Conv.thinking enforces the API's invariant
+	 * 1024 <= budget < maxtokens (see wrthinking in claude9fs.c),
+	 * so the value is passed through as-is.
+	 *
+	 * Thinkadaptive (fable family):
+	 *   thinking: {type: "adaptive"}
+	 *   output_config: {effort: "..."}   (optional)
+	 * These models reject type "enabled" outright.
+	 */
+	if(c->thinkmode == Thinkbudget && c->thinking > 0){
+		Json *think;
+
+		think = jobject();
+		jset(think, "type", jstring("enabled"));
+		jset(think, "budget_tokens", jintval(c->thinking));
+		jset(req, "thinking", think);
+	} else if(c->thinkmode == Thinkadaptive){
+		Json *think, *oc;
+
+		think = jobject();
+		jset(think, "type", jstring("adaptive"));
+		jset(req, "thinking", think);
+		if(c->effort != nil && c->effort[0] != '\0'){
+			oc = jobject();
+			jset(oc, "effort", jstring(c->effort));
+			jset(req, "output_config", oc);
+		}
+	}
+
+	if(c->sysprompt){
+		sys = jarray();
+		block = jobject();
+		jset(block, "type", jstring("text"));
+		jset(block, "text", jstring(c->sysprompt));
+		cc = jobject();
+		jset(cc, "type", jstring("ephemeral"));
+		jset(block, "cache_control", cc);
+		jappend(sys, block);
+		jset(req, "system", sys);
+	}
+
+	jset(req, "tools", mktools());
+
+	msgs = neutralmessages(c);
 
 	if(msgs->nitem > 0){
 		msg = jidx(msgs, msgs->nitem - 1);
@@ -1205,19 +1292,46 @@ replyfree(Reply *r)
 	free(r);
 }
 
+enum {
+	Toolreadmax = 262144,	/* cap on read_file tool output; see readfilelimit */
+};
+
 static char*
 toolread(char *path)
 {
-	int fd;
-	char *data;
+	int fd, truncated;
+	char *data, *out;
+	Dir *d;
 
 	fd = open(path, OREAD);
 	if(fd < 0)
 		return esmprint("error: open %s: %r", path);
-	data = readfile(fd);
+
+	/*
+	 * Directories read back as raw 9P directory-entry bytes,
+	 * not text; refuse explicitly rather than handing the
+	 * model a confusing blob (see CODE-REVIEW.md finding #2).
+	 */
+	d = dirfstat(fd);
+	if(d != nil){
+		if(d->qid.type & QTDIR){
+			free(d);
+			close(fd);
+			return esmprint("error: %s is a directory; use list_directory", path);
+		}
+		free(d);
+	}
+
+	data = readfilelimit(fd, Toolreadmax, &truncated);
 	close(fd);
 	if(data == nil)
 		return esmprint("error: read %s: %r", path);
+	if(truncated){
+		out = esmprint("warning: %s is larger than %d bytes; "
+			"output truncated\n%s", path, Toolreadmax, data);
+		free(data);
+		return out;
+	}
 	return data;
 }
 
@@ -1392,6 +1506,132 @@ toolmk(char *dir, char *args)
 }
 
 /*
+ * Install len bytes of data as the complete contents of path,
+ * without ever leaving path holding a partial write if
+ * something fails partway through (CODE-REVIEW.md finding #1:
+ * the previous implementation truncated path with
+ * create(path, OWRITE, ...) and then wrote the replacement in
+ * place, so a write failure after the truncate lost the
+ * original and could leave path half old, half new).
+ *
+ * The data is first written in full to a temporary sibling
+ * file in the same directory; only once that succeeds is the
+ * original removed and the temp file renamed into its place.
+ * Plan 9's wstat refuses to rename onto an existing name (see
+ * stat(5): "it is an error to change the name to that of an
+ * existing file"), so a plain rename-over-the-original isn't
+ * available; remove-then-rename is the closest thing to an
+ * atomic replace Plan 9 offers.  It leaves a brief window
+ * where the name doesn't exist, but it never leaves the name
+ * holding a half-written mixture of old and new content, which
+ * is the actual failure this function exists to prevent.
+ *
+ * If the rename step fails after the original is already
+ * removed, a best-effort attempt is made to recreate path
+ * directly from the same verified bytes, so the caller doesn't
+ * end up with no file at all; if even that fails, the verified
+ * temp file is deliberately left behind (named in the error)
+ * instead of removed, so the fully-written replacement is never
+ * silently lost -- it can be recovered by hand.
+ *
+ * Returns nil on success, or a malloc'd error string (caller
+ * frees) on failure.
+ */
+static char*
+installfile(char *path, char *data, long len)
+{
+	char *tmp, *leaf, *slash;
+	int fd, i;
+	Dir d, *orig;
+
+	orig = dirstat(path);
+	if(orig == nil)
+		return esmprint("error: stat %s before install: %r", path);
+
+	/*
+	 * OEXCL prevents an unrelated pre-existing sibling from
+	 * being truncated.  Include a counter because several
+	 * independent sessions may share a process id and attempt
+	 * replacement concurrently.
+	 */
+	tmp = nil;
+	fd = -1;
+	for(i = 0; i < 100; i++){
+		free(tmp);
+		tmp = esmprint("%s.tmp.%d.%d", path, getpid(), i);
+		fd = create(tmp, OWRITE|OEXCL, orig->mode & 0777);
+		if(fd >= 0)
+			break;
+	}
+	if(fd < 0){
+		free(orig);
+		free(tmp);
+		return esmprint("error: create unique temp file for %s: %r", path);
+	}
+	if(writeall(fd, data, len) < 0){
+		close(fd);
+		remove(tmp);
+		free(orig);
+		free(tmp);
+		return esmprint("error: write temp file for %s: %r", path);
+	}
+	close(fd);
+
+	/* Preserve writable metadata that the server permits us to set. */
+	nulldir(&d);
+	d.mode = orig->mode;
+	d.gid = orig->gid;
+	if(dirwstat(tmp, &d) < 0){
+		remove(tmp);
+		free(orig);
+		free(tmp);
+		return esmprint("error: preserve metadata for %s: %r", path);
+	}
+
+	if(remove(path) < 0){
+		/* original untouched; the verified copy is disposable */
+		remove(tmp);
+		free(orig);
+		free(tmp);
+		return esmprint("error: remove %s before install: %r", path);
+	}
+
+	slash = strrchr(path, '/');
+	leaf = slash != nil ? slash + 1 : path;
+	nulldir(&d);
+	d.name = leaf;
+	if(dirwstat(tmp, &d) < 0){
+		/*
+		 * path is already gone; fall back to recreating it
+		 * directly from the same verified bytes rather than
+		 * leaving the caller with no file at all.
+		 */
+		fd = create(path, OWRITE, orig->mode & 0777);
+		if(fd < 0 || writeall(fd, data, len) < 0){
+			if(fd >= 0)
+				close(fd);
+			free(orig);
+			return esmprint("error: rename %s into place failed (%r), "
+				"and recreating %s also failed; "
+				"verified replacement content is preserved at %s",
+				tmp, path, tmp);
+		}
+		close(fd);
+		nulldir(&d);
+		d.mode = orig->mode;
+		d.gid = orig->gid;
+		dirwstat(path, &d);
+		remove(tmp);
+		free(orig);
+		free(tmp);
+		return nil;
+	}
+	free(orig);
+	free(tmp);
+	return nil;
+}
+
+/*
  * replace_string: find old_str in the file, verify it occurs
  * exactly once, replace it with new_str.  Returns a status
  * string (caller frees).
@@ -1399,14 +1639,17 @@ toolmk(char *dir, char *args)
  * This is the content-addressed edit model used by Claude Code's
  * str_replace_editor.  It is safe against stale state: if the
  * file has changed and the old text is no longer present, the
- * operation fails loudly instead of silently corrupting.
+ * operation fails loudly instead of silently corrupting.  It is
+ * also safe against a write failure partway through the install
+ * (see installfile): the original is never truncated until a
+ * complete copy of the replacement is already verified on disk.
  */
 static char*
 toolreplace(char *path, char *oldstr, char *newstr)
 {
 	int fd, count;
 	long filelen, oldlen, newlen;
-	char *data, *p, *match, *result;
+	char *data, *p, *match, *result, *err;
 
 	if(path == nil || path[0] == '\0')
 		return esmprint("error: no file path");
@@ -1456,19 +1699,10 @@ toolreplace(char *path, char *oldstr, char *newstr)
 
 	free(data);
 
-	/* write back */
-	fd = create(path, OWRITE, 0666);
-	if(fd < 0){
-		free(result);
-		return esmprint("error: create %s: %r", path);
-	}
-	if(writeall(fd, result, strlen(result)) < 0){
-		close(fd);
-		free(result);
-		return esmprint("error: write %s: %r", path);
-	}
-	close(fd);
+	err = installfile(path, result, filelen - oldlen + newlen);
 	free(result);
+	if(err != nil)
+		return err;
 
 	if(newlen == 0)
 		return esmprint("deleted %ld bytes in %s", oldlen, path);
