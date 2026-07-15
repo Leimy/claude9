@@ -24,13 +24,22 @@ claudegraph.$O: claudegraph.c
 $LIBVIEW:V:
 	@{cd /usr/dave/work/libview && mk}
 
+# Unit tests: build with "mk tests", then run ./tests yourself.
+# tests.c #includes claude.c to reach its static internals, so
+# it links with json.$O only (claude.$O would duplicate symbols).
+tests: tests.$O json.$O
+	$LD $LDFLAGS -o $target tests.$O json.$O
+
+tests.$O: tests.c claude.c claude.h json.h
+	$CC $CFLAGS tests.c
+
 %.$O: %.c
 	$CC $CFLAGS $stem.c
 
 claude9fs.$O claude.$O json.$O: claude.h json.h
 
 clean:V:
-	rm -f *.[$OS] claude9fs claudegraph
+	rm -f *.[$OS] claude9fs claudegraph tests
 
 install:V: claude9fs claudegraph
 	cp claude9fs $BIN/

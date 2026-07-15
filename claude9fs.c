@@ -8,6 +8,16 @@
 #include "json.h"
 #include "claude.h"
 
+/*
+ * Qid paths are QPATH(sid, type) = sid<<8 | type.  Root-level
+ * files (Qclone..Qgraphlive) use their bare enum value as the
+ * whole path, i.e. sid 0 -- and so do session 0's files.  The
+ * two ranges stay disjoint only because every root type is
+ * numerically below Qsess and every per-session type is Qsess
+ * or above.  Keep it that way: add new root files between
+ * Qgraphlive and Qsess, and new session files after Qsess, or
+ * session 0's qids will collide with a root file's.
+ */
 enum {
 	Qroot,
 	Qclone,
@@ -88,6 +98,19 @@ static char *namepath = "/mnt/names/name";
 static Session *sessions;
 static int nextsid;
 static QLock sessionlk;
+
+/*
+ * Serializes session allocation on clone reads.  The Qclone
+ * path in fsread releases the srv loop around newsession()
+ * (genname does blocking file I/O on namefs, and a hung name
+ * server must not wedge all 9P traffic), so two concurrent
+ * reads on the same clone fid could otherwise both see
+ * fa->clone == nil and each allocate a session, leaking one
+ * that nothing would ever hang up.  Held only around that
+ * check-and-allocate; newsession takes sessionlk beneath it,
+ * and nothing takes clonelk while holding any other lock.
+ */
+static QLock clonelk;
 
 /*
  * graphgen increments whenever the session graph changes in a
@@ -1267,6 +1290,16 @@ fsflush(Req *r)
 	respond(r, nil);
 }
 
+/*
+ * A fid is opened at most once (lib9p rejects a second Topen on
+ * an already-open fid) and a walked fid starts with a nil aux,
+ * so fa is always freshly allocated and zeroed here.  Only the
+ * fields whose "unset" value is not zero need initializing:
+ * both generation cursors use -1 as their sentinel, because 0
+ * is a real generation (a fresh session's streamgen, or the
+ * global graphgen before any change) and a zeroed cursor would
+ * be mistaken for "already latched to / delivered generation 0".
+ */
 static void
 fsopen(Req *r)
 {
@@ -1285,8 +1318,8 @@ fsopen(Req *r)
 	type = QTYPE(path);
 	sid = QSID(path);
 
-	fa->streamgen = -1;	/* not yet latched */
 	if(type == Qstream){
+		fa->streamgen = -1;	/* not yet latched */
 		s = sessget(sid);
 		if(s != nil){
 			qlock(&s->streamlk);
@@ -1295,14 +1328,8 @@ fsopen(Req *r)
 			qunlock(&s->streamlk);
 			sessput(s);
 		}
-	}
-	/* Qgraph: forget any snapshot from a previous open of this fid */
-	free(fa->graphbuf);
-	fa->graphbuf = nil;
-	fa->graphlen = 0;
-	fa->graphoff = 0;
-	fa->graphgen = -1;
-	fa->grapheof = 0;
+	}else if(path == Qgraph || path == Qgraphlive)
+		fa->graphgen = -1;	/* no snapshot delivered yet */
 	respond(r, nil);
 }
 
@@ -1328,8 +1355,21 @@ fsread(Req *r)
 	}
 
 	if(path == Qclone){
-		if(fa->clone == nil)
-			fa->clone = newsession();
+		if(fa->clone == nil){
+			/*
+			 * newsession -> genname reads namefs, which can
+			 * block indefinitely if the name server is hung,
+			 * so don't hold the srv loop across it.  See
+			 * clonelk's comment for why the allocation is
+			 * locked and re-checked.
+			 */
+			srvrelease(&clsrv);
+			qlock(&clonelk);
+			if(fa->clone == nil)
+				fa->clone = newsession();
+			qunlock(&clonelk);
+			srvacquire(&clsrv);
+		}
 		s = fa->clone;
 		readstr(r, s->name);
 		respond(r, nil);

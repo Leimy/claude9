@@ -1254,6 +1254,13 @@ toolman(char *query)
 
 	if(query == nil || query[0] == '\0')
 		return esmprint("error: empty man page query");
+	/*
+	 * Refuse rather than silently truncate: a truncated query
+	 * would look up the wrong page and confuse the model.
+	 */
+	if(strlen(query) >= sizeof qbuf)
+		return esmprint("error: man page query too long (limit %d bytes)",
+			(int)sizeof qbuf - 1);
 
 	snprint(qbuf, sizeof qbuf, "%s", query);
 	q = qbuf;
