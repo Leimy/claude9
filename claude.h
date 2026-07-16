@@ -12,6 +12,29 @@ enum {
 	Thinkadaptive,	/* thinking.type=adaptive, output_config.effort (fable) */
 };
 
+/*
+ * openai reasoning_effort quirk ladder (Conv.reasonquirk).
+ * Some servers reject function tools when reasoning is in
+ * effect -- whether because we sent reasoning_effort, or
+ * because the server applies a DEFAULT reasoning effort for
+ * the model when the field is absent (observed live: a fresh
+ * Thinkoff session, field never sent, still rejected).  In
+ * the latter case the only way to honor "do not set
+ * reasoning_effort" is to send an explicit "none" to override
+ * the server-side default; omitting the field can never fix
+ * anything.  openaiquirk walks this ladder monotonically as
+ * rejections come in; each state changes what openaibuildreq
+ * emits.  See openaiquirk in openai.c.
+ */
+enum {
+	Reffort,	/* normal: send effort iff Thinkadaptive */
+	Romit,		/* effort value rejected with tools: omit the field */
+	Rnone,		/* absence also rejected (server default reasoning):
+			 * send explicit reasoning_effort "none" */
+	Rdead,		/* even "none" rejected: suppress the field and
+			 * let errors surface; terminal */
+};
+
 /* growable string buffer */
 typedef struct Sbuf Sbuf;
 struct Sbuf {
@@ -32,9 +55,26 @@ struct Msg {
 };
 
 struct Conv {
+	int prov;	/* provider index (see providerlookup); default anthropic */
+	char *baseurl;	/* nil/empty = provider default; else overrides the
+			 * chat endpoint URL (openai-compatible servers live
+			 * at arbitrary addresses) */
 	char *apikey;
 	char *model;
 	int maxtokens;
+	int oldmaxtok;	/* openai quirk: server wants legacy "max_tokens"
+			 * instead of "max_completion_tokens"; set
+			 * automatically when the server complains
+			 * (see openaiquirk) */
+	int reasonquirk;	/* openai quirk ladder state (Reffort,
+				 * Romit, Rnone, Rdead; see the enum
+				 * above): how to spell -- or not spell
+				 * -- reasoning_effort so this server
+				 * accepts function tools.  Tools are
+				 * load-bearing, so the fix is always on
+				 * the reasoning side, never dropping
+				 * tools.  Advanced automatically by
+				 * openaiquirk as the server complains. */
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
 	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
 	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
@@ -65,6 +105,7 @@ void	convclear(Conv *c);
  * text was appended last time.
  */
 void	convsetprompt(Conv *c, char *base, char *skills);
+/* text may be nil (stored as ""); rawjson may be nil for plain text */
 Msg*	msgnew(int role, char *text, char *rawjson);
 void	convappend(Conv *c, Msg *m);
 /*
@@ -129,7 +170,20 @@ char*	claudeconverse(Conv *c, Usage *usage,
 		void (*cb)(char *chunk, void *aux), void *aux, char **errp);
 void	sbappend(Sbuf *b, char *s, int n);
 char*	readfile(int fd);
-char*	fetchmodels(char *apikey);	/* model ids, one per line */
+char*	fetchmodels(int prov, char *apikey);	/* model ids, one per line */
+/*
+ * Providers are named wire-format implementations (request
+ * assembly, auth headers, stream parsing) private to claude.c;
+ * the public handle is a small index so no provider types leak
+ * into this header (kencc type signatures require complete
+ * types on both sides of a link).  providerlookup maps a name
+ * ("anthropic", ...) to an index, -1 if unknown.  convnew
+ * defaults every conversation to the anthropic provider;
+ * callers may reassign Conv.prov between prompts.
+ */
+int	providerlookup(char *name);
+char*	providername(int prov);
+int	providercount(void);	/* valid indexes are 0..providercount()-1 */
 
 /* emalloc wrappers: succeed or sysfatal */
 void*	emalloc(ulong n);

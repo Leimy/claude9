@@ -1,14 +1,18 @@
 # claude9
 
-A Claude AI client for 9front, exposed as a 9P filesystem.
+A multi-provider AI coding client for 9front, exposed as a 9P
+filesystem.  It supports the Anthropic Messages API and OpenAI Chat
+Completions-compatible APIs.
 
-claude9 consists of two components:
+claude9 consists of three user-facing components:
 
-- **claude9fs** - a 9P filesystem server that exposes Claude
-  sessions as files, suitable for scripting and integration with
-  any tool that can read and write files.
-- **claudetalk** - an rc shell script that drives claude9fs to
-  give you an interactive chat interface in the terminal.
+- **claude9fs** - a 9P filesystem server that exposes model sessions
+  as files, suitable for scripting and integration with any tool that
+  can read and write files.
+- **claudetalk** - an rc shell script that drives claude9fs to give you
+  an interactive chat interface in the terminal.
+- **claudegraph** - a libdraw viewer for live main and sub-agent
+  sessions.
 
 Together they replace the older standalone `claude9` chat
 client; everything that program did can be done through the
@@ -49,8 +53,8 @@ through the API**.  Concretely that includes things like:
 - writing new files (for example into `$home/bin` or `lib/profile`)
   that then run the next time you log in;
 - reading secrets (ssh/factotum-adjacent files, API keys,
-  private mail) and sending their contents to Anthropic as
-  part of a tool result;
+  private mail) and sending their contents to the configured
+  provider as part of a tool result;
 - following an instruction smuggled into a document
   ("prompt injection") that turns a request like "summarise
   this file" into "delete the following files".
@@ -58,9 +62,9 @@ through the API**.  Concretely that includes things like:
 It cannot escape the permissions of the user running
 claude9fs, and it does not get raw shell or network access -
 the only side effects are the file tools above, the utility
-tools (`read_man_page`, `mk`), plus the HTTPS calls claude9fs
-itself makes to the Anthropic API.  But within those limits it
-can do real damage.
+tools (`read_man_page`, `mk`), plus the HTTP(S) calls claude9fs
+itself makes through webfs to the configured API endpoint.  But
+within those limits it can do real damage.
 
 **Note that the `mk` tool is arbitrary code execution.**  mk
 recipes are rc commands run with your full authority; a model
@@ -92,8 +96,8 @@ in.
 - Treat anything the model is asked to read - web pages,
   issue trackers, third-party source - as potentially
   hostile input that may try to redirect its tool use.
-- Read `claude.c` if you want to see exactly what each tool
-  does; it is short.
+- Read the tool-execution section of `claude.c` if you want to
+  see exactly what each tool does.
 - For a stronger boundary, run the whole thing as a dedicated
   user whose only file permissions are on the project tree.
 
@@ -102,8 +106,9 @@ in.
 	mk
 	mk install
 
-This builds claude9fs and installs it to `$home/bin/$objtype`.
-The `claudetalk` rc script is installed to `/rc/bin`, which is
+This builds claude9fs and claudegraph and installs them to
+`$home/bin/$objtype`.  The `claudetalk` rc script is installed
+to `/rc/bin`, which is
 the canonical location for system-wide rc scripts on 9front;
 `mk install` therefore needs write permission there (run it as
 the appropriate user, e.g. `glenda` on a default 9front install,
@@ -111,27 +116,43 @@ or adjust `RCBIN` in the mkfile).
 
 ## Setup
 
-Set your Anthropic API key in the environment:
+Set the key for the provider you intend to use:
 
 	ANTHROPIC_API_KEY=sk-ant-...
+	OPENAI_API_KEY=sk-...
+
+Anthropic is the default provider.  Start with `-P openai` to make
+OpenAI the default; only the selected default provider's key is
+required at startup.  If both variables are present, a live session
+can switch providers through its `provider` file or claudetalk's
+`/provider` command.
 
 HTTP is handled via webfs (`/mnt/web`), which must be mounted.
+OpenAI-compatible servers can be selected per session through the
+`baseurl` file.
 
 ## claude9fs - 9P Filesystem
 
-	claude9fs [-K skillsdir] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]
+	claude9fs [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt]
+	          [-M model] [-P provider] [-t maxtokens]
 
 Flags:
 
 	-K skillsdir   load skill files from this directory into the system prompt
+	-n namepath    name-server file used to name sessions (default: /mnt/names/name)
 	-s srvname     post to /srv with this name
 	-m mtpt        mount point (default: /mnt/claude)
-	-M model       default model (default: claude-opus-4-8)
-	-t maxtokens   default max tokens per round (default: 16384)
+	-M model       default model (provider-specific default when omitted)
+	-P provider    default provider: anthropic or openai (default: anthropic)
+	-t maxtokens   positive default max tokens per round (default: 16384)
 
-claude9fs serves a 9P filesystem where each Claude conversation
-is a numbered directory.  Reading `clone` allocates a new session
-and returns its number.
+When `-M` is omitted, the default model is `claude-opus-4-8` for
+Anthropic and `gpt-4o` for OpenAI.
+
+claude9fs serves a 9P filesystem where each model conversation is
+a named directory.  Reading `clone` allocates a new session and
+returns its generated name (or a numeric fallback when namefs is
+unavailable).
 
 ### Filesystem Layout
 
@@ -151,6 +172,8 @@ and returns its number.
 			tokens    read/write max output tokens per round
 			thinking  read/write extended thinking setting (0 = off)
 			system    read/write the system prompt
+			provider  read/write provider (anthropic or openai)
+			baseurl   read/write chat endpoint override (- clears it)
 			usage     read token usage statistics
 			error     read last error message
 
@@ -168,7 +191,9 @@ and returns its number.
 
 New sessions start with:
 
-	model         claude-opus-4-8   (override with -M)
+	provider      anthropic         (override with -P)
+	model         provider default  (override with -M)
+	baseurl       provider default
 	tokens        16384             (override with -t)
 	thinking      off
 	autocontinue  off
@@ -193,6 +218,67 @@ The error strings name the other file, so an interactive
 client always sees why a setting was refused and which knob
 to turn.
 
+### Providers and endpoints
+
+Each session has a `provider` file containing `anthropic` or
+`openai`.  Switching it selects the matching API key from the
+server environment and fails if that key was not available when
+claude9fs started.  It does not change the model name; set `model`
+too when moving between provider model namespaces.
+
+The `baseurl` file overrides the selected provider's chat endpoint.
+Write an empty string or `-` to return to the provider default.  This
+is primarily for OpenAI-compatible servers such as llama.cpp, vllm,
+or an API gateway.  The root `models` file queries provider-default
+model-list endpoints for providers whose keys are available; it does
+not use a session's `baseurl`, so a custom OpenAI-compatible endpoint
+(one with a non-default model catalog) will not show up there --
+such servers usually serve exactly the model they were started with,
+so this is rarely a problem in practice.
+
+### `provider` and `model` are independent knobs
+
+This trips people up, so it is worth saying plainly: **switching
+`provider` never touches `model`, and switching `model` never touches
+`provider`.**  They are two unrelated string fields on the session;
+claude9fs does not validate that a model name actually belongs to the
+currently selected provider.  Concretely:
+
+- After `echo openai > provider`, the session's `model` file still
+  holds whatever it held before (e.g. an Anthropic model name like
+  `claude-opus-4-8`).  The provider switch by itself does not fail --
+  only the next `prompt` request does, since OpenAI's API has never
+  heard of that model name.  You must also write the right `model`
+  for the provider you just switched to; claudetalk's `/provider`
+  command prints a reminder to do this.
+- Conversely, changing `model` alone -- without touching `provider`
+  -- is completely normal and the common case: it is how you move
+  between models *within* one provider's namespace (e.g. from
+  `claude-opus-4-8` to `claude-haiku-4-5-20251001`, or from `gpt-4o`
+  to `gpt-4o-mini`), and it works exactly as you would expect. Model
+  and provider only need to be changed together when you are moving
+  to a *different* provider's model namespace.
+
+The root `models` file (see above) lists model ids grouped by
+provider name, which is where the two meet: use it to find a valid
+model id for whichever provider you intend to end up on, then write
+`model` (and `provider`, if you are also switching providers) to
+match. claudetalk's `/models` command (see below) defaults to
+showing just the current session's provider's models for exactly
+this reason -- with both API keys configured, the unfiltered list is
+two providers' worth of ids run together, and OpenAI's real `/models`
+endpoint in particular returns far more than chat models (embeddings,
+whisper, moderation, fine-tunes, ...), which buries the handful of
+names you actually want among many you don't.  `/models all` (or
+naming the other provider explicitly, `/models openai`) still shows
+everything when you want it.
+
+Request-shape quirks learned from an OpenAI-compatible endpoint are
+reset when provider, model, or base URL changes.  Conversation history
+uses a neutral internal form, so switching providers mid-session is
+supported; provider-specific thinking blocks may not carry equivalent
+meaning across that switch.
+
 ### Tool Use
 
 When you write to `prompt`, claude9fs runs the full tool loop:
@@ -210,8 +296,24 @@ there or has changed), and if it matches more than once the
 tool returns an error (the caller needs to include more
 surrounding context to make the match unique).  This is the
 same approach used by Claude Code's str_replace_editor and is
-much safer than line-number-based editing, which silently
-corrupts files when line numbers are stale or wrong.
+safer than line-number-based editing, which can silently corrupt
+files when line numbers are stale or wrong.  The replacement is
+written completely to an exclusively-created temporary sibling
+before the original is removed, and its mode and group are preserved
+where the file server permits.
+
+This is not a cross-process atomic compare-and-swap.  An editor,
+another session, or another process can still change the file between
+the initial read and the final remove-and-rename.  Same-path tool calls
+within one model turn are serialized, but external writers are not.
+Keep edited trees under version control and avoid concurrent edits to
+the same file.
+
+The model-facing `read_file` result is capped at 256 KiB and reports
+when the cap is reached.  Directories are rejected in favor of
+`list_directory`.  The cap bounds memory and history growth, but it
+cannot prevent an arbitrary special file from blocking before it
+produces data.
 
 ### Streaming
 
@@ -290,7 +392,9 @@ thinking setting automatically.
 
 The effort word in adaptive mode is passed through to
 `output_config.effort` verbatim (e.g. `low`, `medium`,
-`high`); omit it to let the model decide.
+`high`); omit it to let the model decide.  It must be one
+whitespace-free word.  Model names likewise must be non-empty
+and contain no whitespace.
 
 In budget mode the API requires 1024 <= budget < max_tokens,
 because thinking tokens spend from the same per-round output
@@ -358,9 +462,9 @@ The current setting is shown in `ctl` output as
 `autocontinue N` (0 means disabled).
 
 Because continuations fire within seconds of each truncation,
-the Anthropic prompt cache stays warm -- the entire conversation
-prefix is a cache hit on each follow-up, so you only pay for
-new output tokens.
+provider-side prompt caching can usually reuse the unchanged
+conversation prefix.  Anthropic receives explicit cache-control
+markers; OpenAI-compatible caching behavior is server-dependent.
 
 Auto-continue is off by default.  Each continuation round
 counts against the same usage totals shown in the `usage` file.
@@ -371,9 +475,9 @@ The conversation grows monotonically: every prompt, every
 assistant reply, and every tool round (the `tool_use` blocks
 and their `tool_result` bodies) is kept and resent as input on
 the next request.  Tool output dominates -- a single `mk` run
-can carry up to 64KB, and `read_file`/`list_directory` results
-are stored verbatim -- so a long tool-using session accumulates
-input fast.
+can carry up to 64 KiB, `read_file` up to 256 KiB, and directory
+listings are stored verbatim -- so a long tool-using session
+accumulates input fast.
 
 This matters two ways:
 
@@ -384,9 +488,8 @@ This matters two ways:
   the floor cost of every exchange.
 
 - **The hard limit.**  The model's input context window is
-  fixed by Anthropic (on the order of 200K tokens for current
-  models; it varies by model).  claude9fs does not set it and
-  cannot raise it; `tokens` is an *output* cap and does not
+  fixed by the provider and varies by model.  claude9fs does not
+  set it and cannot raise it; `tokens` is an *output* cap and does not
   affect input (see the guillotine section).  When the history
   plus system prompt plus tool definitions exceed the window,
   the API rejects the request with "prompt is too long".  Once
@@ -450,12 +553,15 @@ sub-agent server) or resolve it -- resolving names into a graph
 is a client's job.
 
 Two root-level files expose every live session's name, model,
-busy flag, and parent as one tab-separated line each:
+busy flag, parent, and point-in-time idle age as one tab-separated
+line each:
 
-	name<TAB>model<TAB>busy<TAB>parent
+	name<TAB>model<TAB>busy<TAB>parent<TAB>idlesecs
 
-`parent` is `-` when unset.  The two files carry the same
-snapshot and differ only in what happens once a reader has
+`parent` is `-` when unset.  `idlesecs` is 0 while busy;
+otherwise it is the number of seconds since the last busy
+transition when the snapshot was generated.  The two files carry
+the same snapshot and differ only in what happens once a reader has
 drained it:
 
 `graph` is an ordinary, always-terminating file: a read returns
@@ -493,26 +599,30 @@ agent's own file-reading tools).  Reach for `graph` unless you
 are writing a live viewer that wants to block for updates.
 
 `claudegraph`, built alongside claude9fs from this same source
-tree, is a small libdraw program that opens one `graphlive` fid
-per mount point and forks a proc per source that just sits in a
-blocking read loop, redrawing whenever a read returns.  It
-draws the sessions as boxes with edges from parent to child,
-highlighting busy sessions in yellow.  Hovering the pointer
-over a box shows that session's full name, model, busy state,
-and parent in a status strip along the bottom of the window
-(handy when a long name or model has been clipped to fit its
-box); with nothing hovered the strip shows a running count of
-sessions, how many are busy, and how many sources are watched:
+tree, is a libdraw program that opens one `graphlive` fid per
+mount point and forks a proc per source that sits in a blocking
+read loop, redrawing whenever a read returns.  It draws a rotating
+3D force-directed graph: sessions are spheres, parent-child links
+are edges, busy sessions pulse amber, and long-idle sessions fade.
+Drag rotates, the scroll wheel zooms, space toggles automatic
+rotation, and `0` resets the view.  Hovering a sphere shows the
+session name, model, state, and parent.  Button 3 over a sphere
+offers `hangup`, which writes to that session's `ctl` file:
 
 	claudegraph [-T reconnectms] [mtpt ...]
 
 With no arguments it watches `/mnt/claude` and `/mnt/claudesub`.
 There is no polling in steady state; `-T` only controls how
 long a watcher waits before retrying if a source's claude9fs
-disappears or hasn't started yet (default 2000ms) -- the one
-case a blocking read can't cover. It is read-only: it never
-writes anything, so it is safe to leave running for the life of
-a claudetalk session.  Quit with `q` or Delete.
+disappears or has not started yet (default 2000ms).  Apart from
+the explicit button-3 `hangup` action, watching is passive.  Quit
+with `q` or Delete.
+
+Current framing limitation: the server can deliver one snapshot
+across several reads, but claudegraph presently treats each read as
+a complete snapshot and uses a 64 KiB buffer.  Ordinary session sets
+fit, but a larger snapshot can briefly make nodes disappear and
+reappear.  Explicit snapshot framing remains planned.
 
 #### Launching claudetalk with a live graph window
 
@@ -528,7 +638,7 @@ uses:
 or, in acme, `New` a window and run `claudegraph` in it (acme's
 win(1) plumbing runs commands started this way in their own
 window automatically).  claudegraph does not need to run before
-claudetalk, or vice versa: `-K` mounts are picked up whenever
+claudetalk, or vice versa: service mounts are picked up whenever
 claudegraph next tries to open `/mnt/claude/graphlive` or
 `/mnt/claudesub/graphlive`, and reconnects on its own (see `-T`
 above) if a mount isn't there yet or goes away and comes back
@@ -554,13 +664,11 @@ the file.  This lets you configure persistent instructions --
 coding conventions, project context, persona tweaks -- without
 editing C or passing a giant `-sysprompt` string.
 
-Skills are loaded at startup and benefit from Anthropic's
-prompt caching: the skills text is a cache hit on every request
-after the first, adding no extra latency or cost in the steady
-state.  Editing a skill file only costs a fresh cache write on
-the next request of each session it's applied to -- rare and
-small, since skill files change far less often than every
-request.
+Skills are loaded at startup and form a stable prefix suitable
+for provider-side prompt caching.  Anthropic receives explicit
+cache-control markers; OpenAI-compatible caching behavior depends
+on the selected server.  Editing a skill file changes that prefix
+on the next request of each session to which the reload applies.
 
 #### Example: set up a skills directory
 
@@ -619,15 +727,19 @@ regular files are read.
 
 ## claudetalk - rc Shell Client
 
-	claudetalk [-d] [-a session] [-M model] [-t maxtokens] [-K skillsdir]
+	claudetalk [-d] [-g] [-a session] [-M model] [-P provider]
+	           [-t maxtokens] [-K skillsdir] [-n namepath]
 
 Flags:
 
-	-a n      attach to existing session n (instead of cloning a new one)
-	-d        detach on exit: leave session alive for later reattachment
+	-a name   attach to an existing named session (skip server startup)
+	-d        detach on exit: leave the session alive for later reattachment
+	-g        open claudegraph in a new window
 	-M model  default model (passed through to claude9fs)
-	-t n      default max tokens (passed through to claude9fs)
+	-P name   default provider: anthropic or openai
+	-t n      positive default max tokens (passed through to claude9fs)
 	-K dir    skills directory (passed through to claude9fs)
+	-n path   name-server path (passed through to claude9fs)
 
 claudetalk is an rc script that bootstraps the claude9fs
 environment (including a sub-agent server for sub-agent
@@ -638,9 +750,15 @@ file in the background while writing to `prompt`.
 ### Commands
 
 	/sessions      list live sessions (current session marked with *)
-	/models        list available models
+	/models        list models for the current session's provider
+	/models <p>    list models for provider <p> (anthropic or openai)
+	/models all    list models for every provider with a key configured
 	/model         show current model
 	/model <name>  switch model
+	/provider      show current provider
+	/provider <p>  switch provider (anthropic or openai)
+	/baseurl       show endpoint override
+	/baseurl <url> set endpoint override; '-' clears it
 	/tokens        show current max tokens
 	/tokens <n>    set max tokens
 	/thinking      show extended thinking setting
@@ -653,6 +771,7 @@ file in the background while writing to `prompt`.
 	/autocontinue [n]  enable auto-continue on max_tokens (default 3)
 	/noautocontinue    disable auto-continue
 	/reloadskills  re-read the skills directory (all live sessions)
+	/graph         open claudegraph in a new window
 	/detach        keep session alive on exit (can reattach later)
 	/help          show command list
 	/quit          exit
@@ -726,19 +845,23 @@ can also drive them from rc without claudetalk:
 
 ## Source Files
 
-	claude.c       API client: conversation, HTTP via webfs, tool execution
-	claude.h       shared data structures and function declarations
-	json.c         JSON parser and serializer
-	json.h         JSON type definitions
-	claude9fs.c    9P filesystem server
-	claudetalk     rc script client
-	claudegraph.c  standalone libdraw viewer for the session graph
+	claude.c       conversation engine, tools, webfs transport, Anthropic provider
+	openai.c       OpenAI Chat Completions-compatible provider
+	claude.h       shared public data structures and declarations
+	claudeimpl.h   internal provider/tool interfaces
+	json.c/json.h  JSON parser, serializer, and types
+	claude9fs.c    9P filesystem and session server
+	claudetalk     rc interactive client and server bootstrap
+	claudegraph.c  libdraw viewer for the live session graph
+	tests.c        pure-logic and provider request/stream tests
+	PROVIDERS.md   provider implementation notes and live-test history
 
 ## Dependencies
 
 	9front
-	webfs (for HTTP to the Anthropic API)
-	Anthropic API key
+	webfs (for HTTP(S) API access)
+	Anthropic and/or OpenAI API key
+	libview at the path configured by the mkfile (for claudegraph)
 
 ## License
 

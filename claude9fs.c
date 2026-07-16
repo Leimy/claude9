@@ -35,6 +35,8 @@ enum {
 	Qerror,
 	Qstream,
 	Qthinking,
+	Qprovider,
+	Qbaseurl,
 };
 
 #define QPATH(sid, type)	((uvlong)(sid)<<8 | (type))
@@ -88,7 +90,9 @@ struct Faux {
 static Srv clsrv;
 
 static char *apikey;
-static char *defmodel = "claude-opus-4-8";
+static char *openaikey;	/* nil if $OPENAI_API_KEY not set */
+static int defprov;	/* default provider for new sessions (-P; anthropic) */
+static char *defmodel;	/* nil until -M or per-provider default applied */
 static int defmaxtokens = 16384;
 static char *defsysprompt = nil;
 static char *skillsdir = nil;
@@ -221,6 +225,43 @@ readskills(char *dir)
 }
 
 static void freesession(Session*);
+static char* provkey(int);
+
+/*
+ * Strict decimal parser for control-file numeric settings
+ * (token counts, thinking budgets, compaction/autocontinue
+ * counts).  Unlike atoi, which accepts a bare numeric prefix
+ * and silently ignores trailing garbage (so "1024garbage" or
+ * "" both "succeed" as some number), this requires the whole
+ * trimmed input to be a valid, in-range decimal integer and
+ * fails otherwise, so a mistyped or truncated control write is
+ * refused instead of silently doing something unintended (see
+ * CODE-REVIEW.md finding #7).  Returns 1 and *np set on
+ * success, 0 (leaving *np unspecified) on any parse failure.
+ */
+int
+strictint(char *s, int *np)
+{
+	char *end;
+	vlong n;
+
+	if(s == nil)
+		return 0;
+	while(*s == ' ' || *s == '\t')
+		s++;
+	if(*s == '\0')
+		return 0;
+	/* vlong (64-bit), not long, so the int-range check below is meaningful */
+	n = strtoll(s, &end, 10);
+	while(*end == ' ' || *end == '\t')
+		end++;
+	if(*end != '\0' || end == s)
+		return 0;
+	if(n < -2147483647LL || n > 2147483647LL)
+		return 0;
+	*np = (int)n;
+	return 1;
+}
 
 /*
  * Session lifetime: sessions live on the global list until a
@@ -345,7 +386,14 @@ newsession(void)
 	}
 	s->name = name;
 	s->lastact = time(0);
-	s->conv = convnew(apikey, defmodel, defmaxtokens, defsysprompt, skills);
+	/*
+	 * New sessions start on the default provider with its key
+	 * (threadmain guarantees provkey(defprov) is set).  convnew
+	 * itself defaults Conv.prov to anthropic, so it must be
+	 * overridden when -P selected something else.
+	 */
+	s->conv = convnew(provkey(defprov), defmodel, defmaxtokens, defsysprompt, skills);
+	s->conv->prov = defprov;
 	s->streamrz.l = &s->streamlk;
 	s->streamdone = 1;
 	s->next = sessions;
@@ -480,10 +528,14 @@ static char* rdthinking(Session*);
 static char* rdsystem(Session*);
 static char* rdusage(Session*);
 static char* rderror(Session*);
+static char* rdprovider(Session*);
+static char* rdbaseurl(Session*);
 static char* wrmodel(Session*, char*);
 static char* wrtokens(Session*, char*);
 static char* wrthinking(Session*, char*);
 static char* wrsystem(Session*, char*);
+static char* wrprovider(Session*, char*);
+static char* wrbaseurl(Session*, char*);
 
 static struct {
 	char *name;
@@ -502,6 +554,8 @@ static struct {
 	{ "error",	Qerror,		0444,	rderror,	nil },
 	{ "stream",	Qstream,	0444,	nil,		nil },
 	{ "thinking",	Qthinking,	0666,	rdthinking,	wrthinking },
+	{ "provider",	Qprovider,	0666,	rdprovider,	wrprovider },
+	{ "baseurl",	Qbaseurl,	0666,	rdbaseurl,	wrbaseurl },
 };
 
 /*
@@ -731,6 +785,12 @@ wrthinking(Session *s, char *data)
 		p = data + 8;
 		while(*p == ' ' || *p == '\t')
 			p++;
+		if(*p != '\0'){
+			char *q;
+			for(q = p; *q != '\0'; q++)
+				if(*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')
+					return "adaptive effort must be one word";
+		}
 		c->thinkmode = Thinkadaptive;
 		c->thinking = 0;
 		free(c->effort);
@@ -738,7 +798,8 @@ wrthinking(Session *s, char *data)
 		return nil;
 	}
 	if(data[0] >= '0' && data[0] <= '9'){
-		n = atoi(data);
+		if(!strictint(data, &n))
+			return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
 		if(n < 1024)
 			return "thinking budget must be at least 1024 tokens";
 		if(n >= c->maxtokens)
@@ -750,6 +811,89 @@ wrthinking(Session *s, char *data)
 		return nil;
 	}
 	return "usage: 0 | off | <budget-tokens> | adaptive [effort]";
+}
+
+/*
+ * Provider/model/base-URL request-shape quirks (Conv.oldmaxtok,
+ * Conv.reasonquirk; see openaiquirk in openai.c) record what a
+ * particular server+model combination is observed to want, not
+ * anything about the conversation itself.  Reset them whenever
+ * provider, model, or base URL changes, so a workaround learned
+ * against one endpoint cannot leak into requests sent to a
+ * different one afterward (CODE-REVIEW.md finding #6).
+ */
+static void
+resetquirks(Conv *c)
+{
+	c->oldmaxtok = 0;
+	c->reasonquirk = Reffort;
+}
+
+/*
+ * Map a provider index to its API key.  Returns nil if the key
+ * is not available (not set in the environment).
+ */
+static char*
+provkey(int prov)
+{
+	char *name;
+
+	name = providername(prov);
+	if(name == nil)
+		return nil;
+	if(strcmp(name, "anthropic") == 0)
+		return apikey;
+	if(strcmp(name, "openai") == 0)
+		return openaikey;
+	return nil;
+}
+
+static char*
+rdprovider(Session *s)
+{
+	return estrdup(providername(s->conv->prov));
+}
+
+static char*
+wrprovider(Session *s, char *data)
+{
+	int prov;
+	char *key, *name;
+
+	prov = providerlookup(data);
+	if(prov < 0)
+		return "unknown provider (anthropic or openai)";
+	key = provkey(prov);
+	if(key == nil || key[0] == '\0'){
+		name = providername(prov);
+		if(strcmp(name, "openai") == 0)
+			return "no OPENAI_API_KEY in environment";
+		return "no API key for provider in environment";
+	}
+	s->conv->prov = prov;
+	free(s->conv->apikey);
+	s->conv->apikey = estrdup(key);
+	resetquirks(s->conv);
+	bumpgraph();
+	return nil;
+}
+
+static char*
+rdbaseurl(Session *s)
+{
+	return estrdup(s->conv->baseurl != nil ? s->conv->baseurl : "");
+}
+
+static char*
+wrbaseurl(Session *s, char *data)
+{
+	free(s->conv->baseurl);
+	if(data[0] == '\0' || strcmp(data, "-") == 0)
+		s->conv->baseurl = nil;
+	else
+		s->conv->baseurl = estrdup(data);
+	resetquirks(s->conv);
+	return nil;
 }
 
 static char*
@@ -785,7 +929,9 @@ rdctl(Session *s)
 		"bytes %ld\n"
 		"busy %d\n"
 		"autocontinue %d\n"
-		"thinking %s\n",
+		"thinking %s\n"
+		"provider %s\n"
+		"baseurl %s\n",
 		s->name,
 		s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
 		s->conv->model,
@@ -795,7 +941,9 @@ rdctl(Session *s)
 		nbytes,
 		s->busy,
 		s->autocont,
-		think);
+		think,
+		providername(s->conv->prov),
+		s->conv->baseurl != nil ? s->conv->baseurl : "-");
 	free(think);
 	return text;
 }
@@ -845,8 +993,16 @@ rderror(Session *s)
 static char*
 wrmodel(Session *s, char *data)
 {
+	char *p;
+
+	if(data == nil || data[0] == '\0')
+		return "model name must not be empty";
+	for(p = data; *p != '\0'; p++)
+		if(*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			return "model name must not contain whitespace";
 	free(s->conv->model);
 	s->conv->model = estrdup(data);
+	resetquirks(s->conv);
 	bumpgraph();
 	return nil;
 }
@@ -856,8 +1012,7 @@ wrtokens(Session *s, char *data)
 {
 	int n;
 
-	n = atoi(data);
-	if(n <= 0)
+	if(!strictint(data, &n) || n <= 0)
 		return "invalid token count";
 	/* keep the thinking-budget invariant (see wrthinking) */
 	if(s->conv->thinkmode == Thinkbudget && n <= s->conv->thinking)
@@ -1035,14 +1190,38 @@ fsstat(Req *r)
 	respond(r, "unknown file");
 }
 
+/*
+ * List models from every provider whose API key is available,
+ * grouped under a "name:" header per provider.  A provider
+ * whose fetch fails gets an error line instead of sinking the
+ * whole read; a provider with no key is silently skipped.
+ */
 static void
 modelstext(Req *r)
 {
-	char *buf;
+	Fmt f;
+	char *buf, *key;
+	int i, any;
 
-	buf = fetchmodels(apikey);
-	if(buf == nil)
-		buf = esmprint("error fetching models: %r\n");
+	fmtstrinit(&f);
+	any = 0;
+	for(i = 0; i < providercount(); i++){
+		key = provkey(i);
+		if(key == nil || key[0] == '\0')
+			continue;
+		any = 1;
+		buf = fetchmodels(i, key);
+		if(buf == nil){
+			fmtprint(&f, "%s: error fetching models: %r\n",
+				providername(i));
+			continue;
+		}
+		fmtprint(&f, "%s:\n%s", providername(i), buf);
+		free(buf);
+	}
+	if(!any)
+		fmtprint(&f, "no API keys available\n");
+	buf = fmtstrflush(&f);
 	readstr(r, buf);
 	free(buf);
 	respond(r, nil);
@@ -1471,8 +1650,8 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		 */
 		if(*v == '\0')
 			keep = 4;
-		else
-			keep = atoi(v);
+		else if(!strictint(v, &keep))
+			return "compact: invalid keep count";
 		if(keep < 1)
 			return "compact: keep count must be at least 1";
 		convcompact(s->conv, keep);
@@ -1505,8 +1684,8 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		while(*v == ' ') v++;
 		if(*v == '\0')
 			n = 3;	/* default: up to 3 rounds */
-		else
-			n = atoi(v);
+		else if(!strictint(v, &n))
+			return "autocontinue: invalid count";
 		if(n < 0) n = 0;
 		s->autocont = n;
 	} else if(strcmp(cmd, "noautocontinue") == 0){
@@ -1789,17 +1968,19 @@ fsdestroyfid(Fid *fid)
 static void
 usage(void)
 {
-	fprint(2, "usage: %s [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt] [-M model] [-t maxtokens]\n", argv0);
+	fprint(2, "usage: %s [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt] "
+		"[-M model] [-P provider] [-t maxtokens]\n", argv0);
 	threadexitsall("usage");
 }
 
 void
 threadmain(int argc, char **argv)
 {
-	char *srvname, *mtpt;
+	char *srvname, *mtpt, *defprovname, *key, *arg;
 
 	srvname = nil;
 	mtpt = "/mnt/claude";
+	defprovname = "anthropic";
 
 	ARGBEGIN{
 	case 'n':
@@ -1817,8 +1998,13 @@ threadmain(int argc, char **argv)
 	case 'M':
 		defmodel = EARGF(usage());
 		break;
+	case 'P':
+		defprovname = EARGF(usage());
+		break;
 	case 't':
-		defmaxtokens = atoi(EARGF(usage()));
+		arg = EARGF(usage());
+		if(!strictint(arg, &defmaxtokens) || defmaxtokens <= 0)
+			usage();
 		break;
 	default:
 		usage();
@@ -1827,10 +2013,37 @@ threadmain(int argc, char **argv)
 	if(argc != 0)
 		usage();
 
+	/*
+	 * Keys: both env vars are read; only the DEFAULT provider's
+	 * key is required.  Sessions can switch to any provider
+	 * whose key is present (see wrprovider).  The default stays
+	 * anthropic -- we are claude9fs, after all -- but -P openai
+	 * with only $OPENAI_API_KEY set is a supported way to run.
+	 */
 	apikey = getenv("ANTHROPIC_API_KEY");
-	if(apikey == nil || apikey[0] == '\0'){
-		fprint(2, "set $ANTHROPIC_API_KEY\n");
+	openaikey = getenv("OPENAI_API_KEY");
+	defprov = providerlookup(defprovname);
+	if(defprov < 0){
+		fprint(2, "unknown provider %s (anthropic or openai)\n", defprovname);
+		threadexitsall("bad provider");
+	}
+	key = provkey(defprov);
+	if(key == nil || key[0] == '\0'){
+		fprint(2, "no API key for default provider %s: "
+			"set $ANTHROPIC_API_KEY, or $OPENAI_API_KEY with -P openai\n",
+			defprovname);
 		threadexitsall("no api key");
+	}
+	/*
+	 * Default model follows the default provider unless -M
+	 * overrides it: an anthropic model name sent to openai (or
+	 * vice versa) fails every request out of the box.
+	 */
+	if(defmodel == nil){
+		if(strcmp(providername(defprov), "openai") == 0)
+			defmodel = "gpt-4o";
+		else
+			defmodel = "claude-opus-4-8";
 	}
 
 	if(skillsdir != nil){
