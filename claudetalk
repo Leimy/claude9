@@ -217,8 +217,40 @@ fn docmd {
 		}
 	}
 	if not if(~ $cmd /models){
+		shift
+		# The root models file lists every provider that has an
+		# API key configured, not just the one this session is
+		# using -- with both keys set that is two providers'
+		# worth of ids in one blob, and OpenAI's real endpoint
+		# in particular returns far more than just chat models
+		# (embeddings, whisper, moderation, fine-tunes...), so
+		# the unfiltered dump is noisy once you've actually
+		# picked a provider.  Default to just this session's
+		# current provider's section; "/models all" (or naming
+		# the other provider explicitly) still shows everything.
+		curprov=`{cat $sess/provider >[2]/dev/null}
+		if(~ $#curprov 0)
+			curprov=anthropic
+		which=$curprov
+		if(! ~ $#* 0)
+			which=$1
 		echo 'fetching models...' >[1=2]
-		cat $mnt/models >[1=2]
+		if(~ $which all){
+			cat $mnt/models >[1=2]
+		}
+		if not {
+			awk -v 'want='^$"which '
+				$0 == want ":" { show = 1; found = 1; next }
+				/:$/ { show = 0 }
+				show { print; printed = 1 }
+				END {
+					if (!found)
+						print "no models found for provider " want " (check spelling/API key; try \"/models all\")"
+					else if (!printed)
+						print "(no models listed for " want ")"
+				}
+			' $mnt/models >[1=2]
+		}
 	}
 	if not if(~ $cmd /model){
 		shift
@@ -255,7 +287,9 @@ fn docmd {
 	if not if(~ $cmd /help){
 		echo 'commands:' >[1=2]
 		echo '  /sessions      list live sessions' >[1=2]
-		echo '  /models        list available models' >[1=2]
+		echo '  /models        list models for the current provider' >[1=2]
+		echo '  /models <p>    list models for provider <p> (anthropic or openai)' >[1=2]
+		echo '  /models all    list models for every provider with a key configured' >[1=2]
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
 		echo '  /provider      show current provider' >[1=2]

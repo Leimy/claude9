@@ -39,7 +39,26 @@ keys, provider/baseurl files, and claudetalk controls.  Still not
 done: live confirmation that "none" satisfies the gpt-5.6-sol
 endpoint, more live testing (tool rounds against real OpenAI and
 a compat server), and the gaps below.
-Last updated: after README reconciliation and review remediation.
+Also fixed since: claudetalk's `/models` command used to dump the
+root `models` file unfiltered, which lists every provider with a
+configured key -- confusing once a session has actually picked a
+provider, since with both keys set you'd get both providers' model
+ids run together, and OpenAI's real endpoint returns far more than
+chat models (embeddings, whisper, moderation, fine-tunes, ...).
+`/models` now defaults to just the current session's provider (read
+from the session's `provider` file); `/models <provider>` or
+`/models all` still show everything.  This is filtering done
+client-side in the rc script (via awk against the section headers
+`modelstext` already emits in claude9fs.c); the root `models` file
+itself is unchanged -- it is a root-level file with no session
+context, so it cannot filter server-side.  README now has a
+"provider and model are independent knobs" section spelling out that
+`/model` can be (and normally is) changed without touching
+`/provider`, and vice versa, since this was a second point of
+confusion raised alongside the `/models` one.
+
+Last updated: after claudetalk /models provider-scoping and the
+README "independent knobs" clarification.
 
 ## The reasoning_effort saga: server-side default reasoning
 

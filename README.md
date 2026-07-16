@@ -231,7 +231,47 @@ Write an empty string or `-` to return to the provider default.  This
 is primarily for OpenAI-compatible servers such as llama.cpp, vllm,
 or an API gateway.  The root `models` file queries provider-default
 model-list endpoints for providers whose keys are available; it does
-not use a session's `baseurl`.
+not use a session's `baseurl`, so a custom OpenAI-compatible endpoint
+(one with a non-default model catalog) will not show up there --
+such servers usually serve exactly the model they were started with,
+so this is rarely a problem in practice.
+
+### `provider` and `model` are independent knobs
+
+This trips people up, so it is worth saying plainly: **switching
+`provider` never touches `model`, and switching `model` never touches
+`provider`.**  They are two unrelated string fields on the session;
+claude9fs does not validate that a model name actually belongs to the
+currently selected provider.  Concretely:
+
+- After `echo openai > provider`, the session's `model` file still
+  holds whatever it held before (e.g. an Anthropic model name like
+  `claude-opus-4-8`).  The provider switch by itself does not fail --
+  only the next `prompt` request does, since OpenAI's API has never
+  heard of that model name.  You must also write the right `model`
+  for the provider you just switched to; claudetalk's `/provider`
+  command prints a reminder to do this.
+- Conversely, changing `model` alone -- without touching `provider`
+  -- is completely normal and the common case: it is how you move
+  between models *within* one provider's namespace (e.g. from
+  `claude-opus-4-8` to `claude-haiku-4-5-20251001`, or from `gpt-4o`
+  to `gpt-4o-mini`), and it works exactly as you would expect. Model
+  and provider only need to be changed together when you are moving
+  to a *different* provider's model namespace.
+
+The root `models` file (see above) lists model ids grouped by
+provider name, which is where the two meet: use it to find a valid
+model id for whichever provider you intend to end up on, then write
+`model` (and `provider`, if you are also switching providers) to
+match. claudetalk's `/models` command (see below) defaults to
+showing just the current session's provider's models for exactly
+this reason -- with both API keys configured, the unfiltered list is
+two providers' worth of ids run together, and OpenAI's real `/models`
+endpoint in particular returns far more than chat models (embeddings,
+whisper, moderation, fine-tunes, ...), which buries the handful of
+names you actually want among many you don't.  `/models all` (or
+naming the other provider explicitly, `/models openai`) still shows
+everything when you want it.
 
 Request-shape quirks learned from an OpenAI-compatible endpoint are
 reset when provider, model, or base URL changes.  Conversation history
@@ -710,7 +750,9 @@ file in the background while writing to `prompt`.
 ### Commands
 
 	/sessions      list live sessions (current session marked with *)
-	/models        list available models
+	/models        list models for the current session's provider
+	/models <p>    list models for provider <p> (anthropic or openai)
+	/models all    list models for every provider with a key configured
 	/model         show current model
 	/model <name>  switch model
 	/provider      show current provider
