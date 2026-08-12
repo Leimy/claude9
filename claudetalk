@@ -14,8 +14,10 @@
 #   -g            also pop up a claudegraph window on the session graph
 #   -M model      default model for claude9fs
 #   -P provider   default provider for claude9fs (anthropic or openai;
-#                 needs the matching API key in the environment:
-#                 $ANTHROPIC_API_KEY or $OPENAI_API_KEY)
+#                 anthropic needs $ANTHROPIC_API_KEY -- it has no keyless
+#                 mode.  openai's $OPENAI_API_KEY is optional: a session
+#                 can point openai at a keyless local/self-hosted server
+#                 instead, e.g. Ollama, via /baseurl)
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
@@ -57,7 +59,16 @@ if(! ~ $#namepath 0)
 
 fn startsub {
 	if(test -f /srv/$subsrvname){
-		# Sub-agent server already posted; just mount it.
+		# Startup defaults belong to the server, not the client.
+		# Reusing a posted server would silently ignore flags that
+		# affect new sessions, so replace it when any were supplied.
+		if(! ~ $#fsflags 0){
+			if(test -f $submnt/clone)
+				unmount $submnt >[2]/dev/null
+			rm -f /srv/$subsrvname
+		}
+	}
+	if(test -f /srv/$subsrvname){
 		if(! test -f $submnt/clone)
 			mount -c /srv/$subsrvname $submnt
 		echo 'sub-agent: '$submnt' (already running)' >[1=2]
@@ -71,7 +82,15 @@ fn startsub {
 
 fn startmain {
 	if(test -f /srv/$srvname){
-		# Main server already posted; just mount it.
+		# See startsub: command-line defaults must not be silently
+		# discarded merely because an older server is still posted.
+		if(! ~ $#fsflags 0){
+			if(test -f $mnt/clone)
+				unmount $mnt >[2]/dev/null
+			rm -f /srv/$srvname
+		}
+	}
+	if(test -f /srv/$srvname){
 		if(! test -f $mnt/clone)
 			mount -c /srv/$srvname $mnt
 		echo 'claude9fs: '$mnt' (already running)' >[1=2]
@@ -160,7 +179,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -270,6 +289,10 @@ fn docmd {
 		shift
 		setget $sess/baseurl baseurl $*
 	}
+	if not if(~ $cmd /advisor){
+		shift
+		setget $sess/advisor advisor $*
+	}
 	if not if(~ $cmd /tokens){
 		shift
 		setget $sess/tokens tokens $*
@@ -293,11 +316,16 @@ fn docmd {
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
 		echo '  /provider      show current provider' >[1=2]
-		echo '  /provider <p>  switch provider: anthropic or openai (needs its API key;' >[1=2]
-		echo '                 switch /model too - model names are per-provider)' >[1=2]
+		echo '  /provider <p>  switch provider: anthropic (needs its API key) or' >[1=2]
+		echo '                 openai (key optional -- fine for a keyless local' >[1=2]
+		echo '                 server via /baseurl, e.g. Ollama); switch /model too' >[1=2]
+		echo '                 - model names are per-provider' >[1=2]
 		echo '  /baseurl       show endpoint URL override' >[1=2]
 		echo '  /baseurl <url> point an openai-compatible server (llama.cpp, vllm, ...)' >[1=2]
 		echo '  /baseurl -     clear the override (back to provider default)' >[1=2]
+		echo '  /advisor       show Anthropic server-side advisor setting' >[1=2]
+		echo '  /advisor off   disable advisor' >[1=2]
+		echo '  /advisor <model> [max_uses=N] [max_tokens=N] [cache=5m|1h]' >[1=2]
 		echo '  /tokens        show max output tokens' >[1=2]
 		echo '  /tokens <n>    set max output tokens' >[1=2]
 		echo '  /thinking      show extended thinking setting' >[1=2]
@@ -405,19 +433,12 @@ while(){
 			# waiting for a round that will never come.
 			# Kill it so wait does not hang; the resulting
 			# Tflush is handled cleanly by claude9fs.
-			# Order matters: rc opens the redirections
-			# left to right, and note may already be
-			# gone (the cat process can exit on its own,
-			# e.g. via the Tflush this triggers, before
-			# we get here) -- an open failure on the
-			# still-pending ">" is reported to whatever
-			# fd2 is at that point in the parse.  Put the
-			# >[2]/dev/null FIRST so fd2 is already
-			# silenced when the /proc/$cpid/note open is
-			# attempted, instead of leaking "can't
-			# create: .../note: file does not exist" to
-			# the real terminal despite the redirection.
-			echo kill >[2]/dev/null > /proc/$cpid/note
+			# The stream reader may already have exited by
+			# now.  Test for its note file before writing it;
+			# redirecting the write is not enough on rc because
+			# a failed redirection is diagnosed by the shell.
+			if(test -e /proc/$cpid/note)
+				echo kill > /proc/$cpid/note
 			wait $cpid
 			echo 'error:' >[1=2]
 			cat $sess/error >[1=2]

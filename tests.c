@@ -26,6 +26,8 @@
 static int nrun;
 static int nfail;
 
+static char* writetmpsse(char*);
+
 static void
 ok(int cond, char *name)
 {
@@ -445,6 +447,27 @@ tbuildreq(void)
 	ok(content != nil && content->nitem == 1, "blank block stripped from rawjson");
 	okstr(jstr(jidx(content, 0), "text"), "ans", "real block survives");
 	jsonfree(req);
+
+	/* Anthropic advisor definition is appended and parameterized. */
+	c->advisormodel = estrdup("claude-opus-4-8");
+	c->advisormaxuses = 2;
+	c->advisormaxtokens = 2048;
+	c->advisorcache = estrdup("5m");
+	req = anthropicbuildreq(c);
+	{
+		Json *ta, *at, *ca;
+		ta = jget(req, "tools");
+		at = jidx(ta, ta->nitem - 1);
+		okstr(jstr(at, "type"), "advisor_20260301", "advisor tool type");
+		okstr(jstr(at, "name"), "advisor", "advisor tool name");
+		okstr(jstr(at, "model"), "claude-opus-4-8", "advisor model");
+		ok(jint(at, "max_uses") == 2, "advisor max_uses");
+		ok(jint(at, "max_tokens") == 2048, "advisor max_tokens");
+		ca = jget(at, "caching");
+		okstr(jstr(ca, "ttl"), "5m", "advisor cache ttl");
+		ok(jget(at, "cache_control") != nil, "advisor is final cache breakpoint");
+	}
+	jsonfree(req);
 	convfree(c);
 }
 
@@ -527,6 +550,7 @@ terrs(void)
 	ok(!overlimiterr("API error: overloaded"), "overlimiterr non-match");
 	ok(!overlimiterr(nil), "overlimiterr nil");
 	ok(toollimiterr("tool loop limit reached (20 rounds)"), "toollimiterr matches");
+	ok(!toollimiterr("tool/advisor loop limit reached (20 rounds)"), "advisor cap is not auto-continuable");
 	ok(!toollimiterr("some other error"), "toollimiterr non-match");
 	ok(!toollimiterr(nil), "toollimiterr nil");
 }
@@ -699,6 +723,110 @@ ttoolman(void)
 	res = toolman(big);
 	ok(strncmp(res, "error", 5) == 0, "oversize man query rejected");
 	free(res);
+}
+
+static void
+tadvisorstream(void)
+{
+	char *path, *sse;
+	Biobuf *bp;
+	Usage u;
+	Reply *r;
+	Json *raw, *b;
+
+	sse =
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n"
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv1\",\"name\":\"advisor\",\"input\":{}}}\n"
+		"data: {\"type\":\"content_block_stop\",\"index\":0}\n"
+		"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"advisor_tool_result\",\"tool_use_id\":\"srv1\",\"content\":{\"type\":\"advisor_redacted_result\",\"encrypted_content\":\"opaque\"}}}\n"
+		"data: {\"type\":\"content_block_stop\",\"index\":1}\n"
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":3}}\n"
+		"data: {\"type\":\"message_stop\"}\n";
+	path = writetmpsse(sse);
+	ok(path != nil, "advisor stream temp file");
+	if(path == nil) return;
+	bp = Bopen(path, OREAD);
+	memset(&u, 0, sizeof u);
+	r = anthropicreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	ok(r != nil, "advisor stream parsed");
+	if(r == nil) return;
+	ok(r->paused, "advisor pause_turn marked");
+	ok(r->tools == nil, "advisor server tool not locally executed");
+	okstr(u.stop_reason, "pause_turn", "advisor stop reason");
+	raw = jsonparse(r->rawjson);
+	ok(raw != nil && raw->nitem == 2, "advisor blocks preserved");
+	if(raw != nil && raw->nitem == 2){
+		b = jidx(raw, 1);
+		okstr(jstr(b, "type"), "advisor_tool_result", "advisor result type preserved");
+		okstr(jstr(jget(b, "content"), "encrypted_content"), "opaque", "advisor encrypted result preserved");
+	}
+	jsonfree(raw);
+	replyfree(r);
+	free(u.stop_reason);
+}
+
+/* --- claude.c: web_search HTML scraping helpers --- */
+
+static void
+twebsearch(void)
+{
+	char *s, *html;
+	Searchresult results[Maxsearchresults];
+	int n;
+
+	s = urlencode("hello world/&?");
+	okstr(s, "hello%20world%2F%26%3F", "urlencode escapes reserved chars");
+	free(s);
+
+	s = estrdup("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &apos;f&apos;");
+	htmlunescape(s);
+	okstr(s, "a & b <c> \"d\" 'e' 'f'", "htmlunescape decodes common entities");
+	free(s);
+
+	s = urldecoden("hello%20world", "hello%20world" + strlen("hello%20world"));
+	okstr(s, "hello world", "urldecoden decodes percent escapes");
+	free(s);
+
+	/* DuckDuckGo redirect wrapper unwraps to the real target */
+	s = resolvehref("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=x");
+	okstr(s, "https://example.com/page", "resolvehref unwraps uddg redirect");
+	free(s);
+
+	/* protocol-relative URL gets an https prefix */
+	s = resolvehref("//example.org/x");
+	okstr(s, "https://example.org/x", "resolvehref fixes protocol-relative URL");
+	free(s);
+
+	/*
+	 * A synthetic results page: a relative nav link back to the
+	 * search engine itself (filtered: not http/https after
+	 * resolution), an icon anchor and a text anchor wrapping the
+	 * same target (deduped, longer text wins), and a second,
+	 * distinct result.
+	 */
+	html =
+		"<a href=\"/html/?q=x\">next page</a>"
+		"<a href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=1\">icon</a>"
+		"<a href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=1\">Example A</a>"
+		"<a href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fother.example%2Fb&amp;rut=2\">Other B</a>";
+	n = extractlinks(html, html + strlen(html), "duckduckgo", results, Maxsearchresults);
+	ok(n == 2, "extractlinks: nav link filtered, duplicate href deduped");
+	if(n == 2){
+		okstr(results[0].href, "https://example.com/a", "extractlinks: first result href");
+		okstr(results[0].title, "Example A", "extractlinks: dedup keeps longer title");
+		okstr(results[1].href, "https://other.example/b", "extractlinks: second result href");
+		okstr(results[1].title, "Other B", "extractlinks: second result title");
+	}
+	freesearchresults(results, n);
+
+	/* no anchors at all -> zero results, not a crash */
+	n = extractlinks("<p>no links here</p>",
+		"<p>no links here</p>" + strlen("<p>no links here</p>"),
+		"duckduckgo", results, Maxsearchresults);
+	ok(n == 0, "extractlinks: no anchors yields zero results");
 }
 
 /* --- openai.c: request assembly --- */
@@ -912,7 +1040,7 @@ topenaibuildreq(void)
 	if(req != nil){
 		tools = jget(req, "tools");
 		ok(tools != nil, "openai: tools array present");
-		ok(tools != nil && tools->nitem == 7, "openai: tools array has 7 entries");
+		ok(tools != nil && tools->nitem == 8, "openai: tools array has 8 entries");
 		if(tools != nil && tools->nitem > 0){
 			t = jidx(tools, 0);
 			okstr(jstr(t, "type"), "function", "openai: tools[0].type=function");
@@ -1427,6 +1555,8 @@ threadmain(int argc, char **argv)
 	treplace();
 	tmkparents();
 	ttoolman();
+	twebsearch();
+	tadvisorstream();
 	topenaibuildreq();
 	topenaiquirk();
 	topenaiquirkreasoning();

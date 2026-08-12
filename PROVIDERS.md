@@ -57,8 +57,37 @@ context, so it cannot filter server-side.  README now has a
 `/provider`, and vice versa, since this was a second point of
 confusion raised alongside the `/models` one.
 
+Also fixed since: the openai provider required a non-empty
+$OPENAI_API_KEY before a session could switch to it (wrprovider)
+or before claude9fs would start with -P openai (threadmain),
+even though the openai provider is just the Chat Completions
+wire format and plenty of real targets for it -- Ollama's
+/v1/chat/completions, llama.cpp, vllm -- perform no auth check
+at all.  Anthropic genuinely has no keyless mode (cloud-only
+service), so it keeps the hard requirement; a new provneedskey()
+helper in claude9fs.c distinguishes the two instead of a blanket
+"provider needs a key" rule.  provkey() was also changed to
+never return nil (only ""), since convnew's estrdup(apikey)
+would otherwise crash on a keyless openai session -- previously
+this path was unreachable because wrprovider/threadmain always
+rejected a missing key first.  openaiheaders (openai.c) now
+skips the Authorization header line entirely when the key is
+empty, rather than sending a malformed "Bearer " with nothing
+after it; some strict servers reject the latter, while omitting
+the header outright is universally fine for a server that
+performs no auth.  A missing key aimed at real api.openai.com
+still fails, just later and more informatively: at request time,
+as a clear 401 from the server, instead of at provider-switch or
+startup time.  README now documents this under "Local and
+self-hosted servers", including the slop-management angle (route
+local models to low-stakes, easily-verified tasks; tool-calling
+reliability varies a lot by local model and tools are load-
+bearing for this program).
+
 Last updated: after claudetalk /models provider-scoping and the
-README "independent knobs" clarification.
+README "independent knobs" clarification, plus the openai
+keyless-provider change for local/self-hosted (e.g. Ollama)
+servers.
 
 ## The reasoning_effort saga: server-side default reasoning
 
@@ -453,6 +482,17 @@ Session files to use it:
   echo openai > provider        (needs $OPENAI_API_KEY)
   echo gpt-4o-mini > model
   echo 'http://myserver/v1/chat/completions' > baseurl  (optional)
+
+## Anthropic Advisor server tool
+
+The Anthropic provider supports the beta Advisor server tool when a
+session's `advisor` file is enabled. The request adds the
+`advisor_20260301` tool and `advisor-tool-2026-03-01` beta header.
+Anthropic stream parsing preserves `server_tool_use` and
+`advisor_tool_result` as opaque neutral blocks; they never enter the
+local ToolCall chain. `pause_turn` is replayed immediately without a
+user message or tool result. OpenAI request construction ignores these
+Anthropic-only blocks and never advertises Advisor.
 
 ## Known gaps / next steps
 

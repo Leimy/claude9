@@ -24,6 +24,7 @@ enum {
 	Adelete,
 	Amanpage,
 	Amk,
+	Awebsearch,
 
 	Maxargs = 3,	/* max parameters per tool */
 };
@@ -65,7 +66,8 @@ struct Tooldef {
  * Reply assembled from a single API round: text, tool calls,
  * and a raw JSON snapshot of the assistant's content in the
  * NEUTRAL content-array form (see PROVIDERS.md): an array of
- * {text | thinking | redacted_thinking | tool_use} blocks in
+ * {text | thinking | redacted_thinking | tool_use |
+ *  server_tool_use | advisor_tool_result} blocks in
  * the anthropic spelling.  Every provider's readstream must
  * emit rawjson in this form; every provider's buildreq must
  * accept it when replaying history.
@@ -75,7 +77,8 @@ struct Reply {
 	char *text;		/* concatenated text blocks */
 	char *rawjson;		/* neutral JSON content array */
 	ToolCall *tools;	/* linked list of tool calls */
-	int stopped;		/* 1 unless the model stopped to call tools */
+	int stopped;		/* 1 unless the model stopped to call client tools */
+	int paused;		/* Anthropic stop_reason == pause_turn */
 };
 
 /*
@@ -111,7 +114,7 @@ struct Provider {
 	char *name;
 	char *apiurl;
 	char *modelsurl;
-	int (*headers)(int fd, char *apikey);
+	int (*headers)(int fd, Conv *c);
 	Json* (*buildreq)(Conv*);
 	Reply* (*readstream)(Conv*, Biobuf *bp, Usage*,
 		void (*cb)(char*, void*), void *aux);
@@ -135,7 +138,7 @@ void	replyfree(Reply *r);
 Json*	neutralmessages(Conv *c);
 
 /* openai.c */
-int	openaiheaders(int fd, char *apikey);
+int	openaiheaders(int fd, Conv *c);
 Json*	openaibuildreq(Conv *c);
 Reply*	openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 		void (*cb)(char*, void*), void *aux);

@@ -37,6 +37,7 @@ enum {
 	Qthinking,
 	Qprovider,
 	Qbaseurl,
+	Qadvisor,
 };
 
 #define QPATH(sid, type)	((uvlong)(sid)<<8 | (type))
@@ -530,12 +531,14 @@ static char* rdusage(Session*);
 static char* rderror(Session*);
 static char* rdprovider(Session*);
 static char* rdbaseurl(Session*);
+static char* rdadvisor(Session*);
 static char* wrmodel(Session*, char*);
 static char* wrtokens(Session*, char*);
 static char* wrthinking(Session*, char*);
 static char* wrsystem(Session*, char*);
 static char* wrprovider(Session*, char*);
 static char* wrbaseurl(Session*, char*);
+static char* wradvisor(Session*, char*);
 
 static struct {
 	char *name;
@@ -556,6 +559,7 @@ static struct {
 	{ "thinking",	Qthinking,	0666,	rdthinking,	wrthinking },
 	{ "provider",	Qprovider,	0666,	rdprovider,	wrprovider },
 	{ "baseurl",	Qbaseurl,	0666,	rdbaseurl,	wrbaseurl },
+	{ "advisor",	Qadvisor,	0666,	rdadvisor,	wradvisor },
 };
 
 /*
@@ -830,8 +834,11 @@ resetquirks(Conv *c)
 }
 
 /*
- * Map a provider index to its API key.  Returns nil if the key
- * is not available (not set in the environment).
+ * Map a provider index to its API key.  Never returns nil (only
+ * an empty string) so callers -- notably convnew's estrdup of
+ * the result -- don't need a nil check: a provider whose env
+ * var isn't set just gets "", which provneedskey below decides
+ * whether to treat as an error.
  */
 static char*
 provkey(int prov)
@@ -839,13 +846,31 @@ provkey(int prov)
 	char *name;
 
 	name = providername(prov);
-	if(name == nil)
-		return nil;
 	if(strcmp(name, "anthropic") == 0)
-		return apikey;
+		return apikey != nil ? apikey : "";
 	if(strcmp(name, "openai") == 0)
-		return openaikey;
-	return nil;
+		return openaikey != nil ? openaikey : "";
+	return "";
+}
+
+/*
+ * Whether a provider requires a key before use.  Anthropic is a
+ * cloud-only service with no keyless mode, so a missing key is
+ * always a configuration mistake worth catching immediately.
+ * OpenAI-shaped (Chat Completions) requests, though, may target
+ * a local or self-hosted server reached through webfs -- an
+ * Ollama, llama.cpp, or vllm instance running on the Mac side of
+ * this setup, typically addressed via a session's baseurl
+ * override -- and such servers commonly perform no auth check
+ * at all.  For openai, a missing key is not necessarily wrong:
+ * if the assumption is mistaken (e.g. baseurl still points at
+ * real api.openai.com), the request fails at send time with a
+ * clear 401 from the server, which is an acceptable diagnostic.
+ */
+static int
+provneedskey(int prov)
+{
+	return strcmp(providername(prov), "anthropic") == 0;
 }
 
 static char*
@@ -858,18 +883,14 @@ static char*
 wrprovider(Session *s, char *data)
 {
 	int prov;
-	char *key, *name;
+	char *key;
 
 	prov = providerlookup(data);
 	if(prov < 0)
 		return "unknown provider (anthropic or openai)";
 	key = provkey(prov);
-	if(key == nil || key[0] == '\0'){
-		name = providername(prov);
-		if(strcmp(name, "openai") == 0)
-			return "no OPENAI_API_KEY in environment";
+	if(provneedskey(prov) && key[0] == '\0')
 		return "no API key for provider in environment";
-	}
 	s->conv->prov = prov;
 	free(s->conv->apikey);
 	s->conv->apikey = estrdup(key);
@@ -897,9 +918,91 @@ wrbaseurl(Session *s, char *data)
 }
 
 static char*
+rdadvisor(Session *s)
+{
+	Conv *c;
+	Fmt f;
+
+	c = s->conv;
+	if(c->advisormodel == nil)
+		return estrdup("off");
+	fmtstrinit(&f);
+	fmtprint(&f, "%s", c->advisormodel);
+	if(c->advisormaxuses > 0)
+		fmtprint(&f, " max_uses=%d", c->advisormaxuses);
+	if(c->advisormaxtokens > 0)
+		fmtprint(&f, " max_tokens=%d", c->advisormaxtokens);
+	if(c->advisorcache != nil)
+		fmtprint(&f, " cache=%s", c->advisorcache);
+	return fmtstrflush(&f);
+}
+
+static char*
+wradvisor(Session *s, char *data)
+{
+	Conv *c;
+	char *buf, *p, *q, *model, *cache;
+	int maxuses, maxtokens, n;
+
+	c = s->conv;
+	if(strcmp(providername(c->prov), "anthropic") != 0)
+		return "advisor is available only with the anthropic provider";
+	if(strcmp(data, "off") == 0 || strcmp(data, "0") == 0){
+		free(c->advisormodel);
+		c->advisormodel = nil;
+		c->advisormaxuses = 0;
+		c->advisormaxtokens = 0;
+		free(c->advisorcache);
+		c->advisorcache = nil;
+		return nil;
+	}
+	buf = estrdup(data);
+	p = buf;
+	while(*p == ' ' || *p == '\t') p++;
+	if(*p == '\0'){
+		free(buf);
+		return "advisor: expected off or a model name";
+	}
+	model = p;
+	while(*p != '\0' && *p != ' ' && *p != '\t') p++;
+	if(*p != '\0') *p++ = '\0';
+	maxuses = maxtokens = 0;
+	cache = nil;
+	while(*p != '\0'){
+		while(*p == ' ' || *p == '\t') p++;
+		if(*p == '\0') break;
+		q = p;
+		while(*p != '\0' && *p != ' ' && *p != '\t') p++;
+		if(*p != '\0') *p++ = '\0';
+		if(strncmp(q, "max_uses=", 9) == 0){
+			if(!strictint(q + 9, &n) || n <= 0){ free(buf); return "advisor: max_uses must be positive"; }
+			maxuses = n;
+		}else if(strncmp(q, "max_tokens=", 11) == 0){
+			if(!strictint(q + 11, &n) || n < 1024){ free(buf); return "advisor: max_tokens must be at least 1024"; }
+			maxtokens = n;
+		}else if(strncmp(q, "cache=", 6) == 0){
+			q += 6;
+			if(strcmp(q, "5m") != 0 && strcmp(q, "1h") != 0){ free(buf); return "advisor: cache must be 5m or 1h"; }
+			cache = q;
+		}else{
+			free(buf);
+			return "advisor: options are max_uses=N max_tokens=N cache=5m|1h";
+		}
+	}
+	free(c->advisormodel);
+	c->advisormodel = estrdup(model);
+	c->advisormaxuses = maxuses;
+	c->advisormaxtokens = maxtokens;
+	free(c->advisorcache);
+	c->advisorcache = cache != nil ? estrdup(cache) : nil;
+	free(buf);
+	return nil;
+}
+
+static char*
 rdctl(Session *s)
 {
-	char *think, *text;
+	char *think, *advisor, *text;
 	Msg *m;
 	long nmsg, nbytes;
 	int nexch;
@@ -919,6 +1022,7 @@ rdctl(Session *s)
 	nbytes = convinputbytes(s->conv);
 	nexch = convnexchanges(s->conv);
 	think = thinkingtext(s->conv);
+	advisor = rdadvisor(s);
 	text = esmprint(
 		"name %s\n"
 		"parent %s\n"
@@ -931,7 +1035,8 @@ rdctl(Session *s)
 		"autocontinue %d\n"
 		"thinking %s\n"
 		"provider %s\n"
-		"baseurl %s\n",
+		"baseurl %s\n"
+		"advisor %s\n",
 		s->name,
 		s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
 		s->conv->model,
@@ -943,8 +1048,10 @@ rdctl(Session *s)
 		s->autocont,
 		think,
 		providername(s->conv->prov),
-		s->conv->baseurl != nil ? s->conv->baseurl : "-");
+		s->conv->baseurl != nil ? s->conv->baseurl : "-",
+		advisor);
 	free(think);
+	free(advisor);
 	return text;
 }
 
@@ -2028,11 +2135,22 @@ threadmain(int argc, char **argv)
 		threadexitsall("bad provider");
 	}
 	key = provkey(defprov);
-	if(key == nil || key[0] == '\0'){
-		fprint(2, "no API key for default provider %s: "
-			"set $ANTHROPIC_API_KEY, or $OPENAI_API_KEY with -P openai\n",
-			defprovname);
-		threadexitsall("no api key");
+	if(key[0] == '\0'){
+		if(provneedskey(defprov)){
+			fprint(2, "no API key for default provider %s: "
+				"set $ANTHROPIC_API_KEY, or $OPENAI_API_KEY with -P openai\n",
+				defprovname);
+			threadexitsall("no api key");
+		}
+		/*
+		 * openai with no key: fine for a keyless local/compat
+		 * server (see provneedskey), but say so -- a forgotten
+		 * $OPENAI_API_KEY aimed at real api.openai.com will
+		 * only surface as a 401 on the first request otherwise.
+		 */
+		fprint(2, "warning: no $OPENAI_API_KEY set; requests will carry no "
+			"Authorization header (fine for a keyless local/compat "
+			"server; api.openai.com will reject them with 401)\n");
 	}
 	/*
 	 * Default model follows the default provider unless -M

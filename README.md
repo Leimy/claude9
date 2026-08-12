@@ -34,6 +34,9 @@ following tools without asking you for confirmation each time:
 - `list_directory` - list any directory the process can read.
 - `delete_file` - remove a file at any path the process can
   write to.
+- `web_search` - have claude9fs itself issue an outbound HTTP
+  GET (through webfs) to a search engine with a model-chosen
+  query, and return a list of result titles and URLs.
 
 Tool calls run with the full authority of the user that started
 claude9fs.  On Plan 9 that typically means your whole home tree,
@@ -57,14 +60,23 @@ through the API**.  Concretely that includes things like:
   provider as part of a tool result;
 - following an instruction smuggled into a document
   ("prompt injection") that turns a request like "summarise
-  this file" into "delete the following files".
+  this file" into "delete the following files";
+- following a prompt-injected instruction to `web_search` for
+  sensitive text found in a file, leaking it to the search
+  engine and the network path used to reach it, as the query
+  string of an outbound request claude9fs makes on the model's
+  behalf.
 
 It cannot escape the permissions of the user running
 claude9fs, and it does not get raw shell or network access -
 the only side effects are the file tools above, the utility
-tools (`read_man_page`, `mk`), plus the HTTP(S) calls claude9fs
-itself makes through webfs to the configured API endpoint.  But
-within those limits it can do real damage.
+tools (`read_man_page`, `mk`, `web_search`), plus the HTTP(S)
+calls claude9fs itself makes through webfs to the configured
+API endpoint and, for `web_search`, to a fixed search engine
+(there is no general-purpose URL-fetch tool, so the model
+cannot direct claude9fs's outbound requests at an arbitrary
+host, only search a fixed one with model-chosen query text).
+But within those limits it can do real damage.
 
 **Note that the `mk` tool is arbitrary code execution.**  mk
 recipes are rc commands run with your full authority; a model
@@ -127,6 +139,16 @@ required at startup.  If both variables are present, a live session
 can switch providers through its `provider` file or claudetalk's
 `/provider` command.
 
+`$OPENAI_API_KEY` is optional, not required: the OpenAI provider
+speaks Chat Completions, the wire format also implemented by local
+and self-hosted servers (Ollama, llama.cpp, vllm) that perform no
+auth at all.  A session can switch to `openai` and go straight to
+such a server (via `baseurl`, see below) with no key configured;
+claude9fs sends no `Authorization` header in that case.  Anthropic
+has no keyless mode -- it is cloud-only -- so `$ANTHROPIC_API_KEY`
+is always required to select or switch to that provider.  See
+"Local and self-hosted servers" below.
+
 HTTP is handled via webfs (`/mnt/web`), which must be mounted.
 OpenAI-compatible servers can be selected per session through the
 `baseurl` file.
@@ -174,6 +196,7 @@ unavailable).
 			system    read/write the system prompt
 			provider  read/write provider (anthropic or openai)
 			baseurl   read/write chat endpoint override (- clears it)
+			advisor   Anthropic server-side advisor setting
 			usage     read token usage statistics
 			error     read last error message
 
@@ -196,6 +219,7 @@ New sessions start with:
 	baseurl       provider default
 	tokens        16384             (override with -t)
 	thinking      off
+	advisor       off
 	autocontinue  off
 
 The defaults are chosen to interlock: 16384 output tokens per
@@ -222,19 +246,51 @@ to turn.
 
 Each session has a `provider` file containing `anthropic` or
 `openai`.  Switching it selects the matching API key from the
-server environment and fails if that key was not available when
-claude9fs started.  It does not change the model name; set `model`
-too when moving between provider model namespaces.
+server environment.  Switching to `anthropic` fails if
+`$ANTHROPIC_API_KEY` was not available when claude9fs started, since
+Anthropic has no keyless mode.  Switching to `openai` succeeds even
+with no `$OPENAI_API_KEY` set -- see "Local and self-hosted servers"
+below.  Switching provider does not change the model name; set
+`model` too when moving between provider model namespaces.
 
 The `baseurl` file overrides the selected provider's chat endpoint.
 Write an empty string or `-` to return to the provider default.  This
 is primarily for OpenAI-compatible servers such as llama.cpp, vllm,
-or an API gateway.  The root `models` file queries provider-default
-model-list endpoints for providers whose keys are available; it does
-not use a session's `baseurl`, so a custom OpenAI-compatible endpoint
-(one with a non-default model catalog) will not show up there --
-such servers usually serve exactly the model they were started with,
-so this is rarely a problem in practice.
+Ollama, or an API gateway.  The root `models` file queries
+provider-default model-list endpoints for providers whose keys are
+available; it does not use a session's `baseurl`, so a custom
+OpenAI-compatible endpoint (one with a non-default model catalog)
+will not show up there -- such servers usually serve exactly the
+model they were started with, so this is rarely a problem in
+practice.
+
+#### Local and self-hosted servers
+
+The `openai` provider is just the Chat Completions wire format; it
+does not require talking to api.openai.com.  Point a session at a
+local or self-hosted server with `baseurl`, and no key is needed if
+that server performs no auth -- Ollama's OpenAI-compatible endpoint
+(`/v1/chat/completions`) is exactly this case:
+
+	echo openai > /mnt/claude/$n/provider
+	echo llama3 > /mnt/claude/$n/model
+	echo 'http://<mac-host>:11434/v1/chat/completions' > /mnt/claude/$n/baseurl
+
+With `$OPENAI_API_KEY` unset, claude9fs sends the request with no
+`Authorization` header at all, rather than a malformed empty bearer
+token.  If `baseurl` is later pointed back at real api.openai.com
+without a key, the request simply fails at send time with a clear
+401 from the server -- not a startup-time or provider-switch-time
+error -- which is an acceptable diagnostic for a misconfiguration.
+
+Tool-calling support and reliability vary a lot between local
+models; not every model that claims function-calling actually
+emits well-formed tool-call JSON under a multi-round tool loop like
+this program's.  Since tools are load-bearing here (`create_file`,
+`replace_string`, `mk`, ...), it is worth routing local models to
+low-stakes, easily-verified tasks and having a stronger model (or
+you) review anything they touch, rather than trusting them with the
+same latitude as the default cloud providers.
 
 ### `provider` and `model` are independent knobs
 
@@ -279,14 +335,53 @@ uses a neutral internal form, so switching providers mid-session is
 supported; provider-specific thinking blocks may not carry equivalent
 meaning across that switch.
 
+### Anthropic Advisor
+
+Anthropic sessions can enable the beta server-side Advisor tool through
+the `advisor` file. It is disabled by default. Configure it while using the Anthropic
+provider; OpenAI requests do not include it:
+
+	echo 'claude-opus-4-8 max_uses=2 max_tokens=4096 cache=5m' > advisor
+	echo off > advisor
+
+The first word is the advisor model. Optional settings are `max_uses=N`,
+`max_tokens=N` (minimum 1024), and `cache=5m|1h`. Anthropic runs the
+advisor inference on its server, supplies it with the full transcript,
+and returns control to the executor in the same Messages API turn.
+claude9fs preserves plaintext and encrypted advisor result blocks and
+automatically resumes `pause_turn` responses. Advisor calls are not
+claude9fs sub-agent sessions: they have no filesystem tools, independent
+lifecycle, or graph node.
+
+claudetalk exposes the same setting as `/advisor`. Advisor tokens are
+reported by Anthropic separately in `usage.iterations`; the current
+`usage` file continues to show the executor's top-level totals only.
+
 ### Tool Use
 
 When you write to `prompt`, claude9fs runs the full tool loop:
 Claude has access to file tools (`create_file`, `replace_string`,
 `read_file`, `list_directory`, `delete_file`) and a few utility
-tools (`read_man_page`, `mk`) which are executed automatically
-as part of the round, with results sent back to Claude until it
-produces a final response.
+tools (`read_man_page`, `mk`, `web_search`) which are executed
+automatically as part of the round, with results sent back to
+Claude until it produces a final response.
+
+`web_search` is the only tool that reaches outside the local
+machine on the model's own initiative (as opposed to the fixed
+API endpoint claude9fs always talks to).  It fetches a single,
+hardcoded search engine URL (DuckDuckGo's no-JS HTML endpoint)
+through webfs, with the model's query as the `q=` parameter, and
+returns a plain list of result titles and URLs -- it does not
+fetch the URLs it finds, and there is no separate fetch-a-URL
+tool, so the model cannot direct claude9fs's network access at
+an arbitrary host.  Because search result pages are scraped
+(there is no free, keyless search API to call instead) rather
+than parsed against a documented format, treat results as a
+best-effort pointer to further reading, not a definitive answer:
+a request that returns nothing usefully parseable falls back to
+a truncated, tag-stripped dump of the raw page text, tagged with
+a `warning:` prefix, so a change in the search engine's page
+layout degrades to noise instead of silent failure.
 
 The `replace_string` tool does content-addressed editing: it
 takes an `old_str` to find and a `new_str` to replace it with.
@@ -741,6 +836,13 @@ Flags:
 	-K dir    skills directory (passed through to claude9fs)
 	-n path   name-server path (passed through to claude9fs)
 
+When starting a new session without `-a`, supplying any server option
+(`-M`, `-P`, `-t`, `-K`, or `-n`) replaces already-posted main and
+sub-agent servers so the requested defaults actually take effect.
+Existing sessions on those servers are consequently lost.  With no
+server options, claudetalk continues to reuse posted servers.  Attach
+mode never restarts them.
+
 claudetalk is an rc script that bootstraps the claude9fs
 environment (including a sub-agent server for sub-agent
 support) and provides an interactive chat interface.  It
@@ -759,6 +861,9 @@ file in the background while writing to `prompt`.
 	/provider <p>  switch provider (anthropic or openai)
 	/baseurl       show endpoint override
 	/baseurl <url> set endpoint override; '-' clears it
+	/advisor       show Anthropic advisor setting
+	/advisor off   disable it
+	/advisor <model> [max_uses=N] [max_tokens=N] [cache=5m|1h]
 	/tokens        show current max tokens
 	/tokens <n>    set max tokens
 	/thinking      show extended thinking setting

@@ -17,10 +17,25 @@
 #include "claude.h"
 #include "claudeimpl.h"
 
-/* OpenAI auth: bearer token. */
+/*
+ * OpenAI auth: bearer token.  A nil/empty key means no key is
+ * configured for this provider (see provneedskey in
+ * claude9fs.c) -- typically a keyless local or self-hosted
+ * Chat Completions server (Ollama, llama.cpp, vllm) reached via
+ * baseurl.  Sending no Authorization header at all in that case
+ * is friendlier than a bogus "Bearer " with nothing after it:
+ * some strict servers reject a malformed/empty bearer value
+ * outright, while simply omitting the header is universally
+ * fine for a server that performs no auth.
+ */
 int
-openaiheaders(int fd, char *apikey)
+openaiheaders(int fd, Conv *c)
 {
+	char *apikey;
+
+	apikey = c->apikey;
+	if(apikey == nil || apikey[0] == '\0')
+		return 0;
 	if(fprint(fd, "headers Authorization: Bearer %s\r\n", apikey) < 0)
 		return -1;
 	return 0;
@@ -259,6 +274,8 @@ appendtoolresultmsgs(Json *msgs, Json *content)
 		} else if(strcmp(btype, "text") == 0){
 			text = jstr(block, "text");
 			if(text != nil && !blankstr(text)){
+				if(hastext)
+					fmtprint(&f, "\n");
 				fmtprint(&f, "%s", text);
 				hastext = 1;
 			}
