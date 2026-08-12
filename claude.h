@@ -78,6 +78,10 @@ struct Conv {
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
 	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
 	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
+	char *advisormodel;	/* Anthropic server-side advisor; nil = disabled */
+	int advisormaxuses;	/* 0 = omit/unlimited */
+	int advisormaxtokens;	/* 0 = omit/provider default */
+	char *advisorcache;	/* nil, "5m", or "1h" */
 	char *basesys;	/* sysprompt before skills are appended */
 	char *sysprompt;	/* basesys + current skills: what's actually sent */
 	Msg *msgs;

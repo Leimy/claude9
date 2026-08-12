@@ -75,7 +75,7 @@ esmprint(char *fmt, ...)
  * (openai.c); the openai* entry points are declared there
  * too.
  */
-static int anthropicheaders(int, char*);
+static int anthropicheaders(int, Conv*);
 static Json* anthropicbuildreq(Conv*);
 static Reply* anthropicreadstream(Conv*, Biobuf*, Usage*,
 	void (*)(char*, void*), void*);
@@ -207,6 +207,19 @@ static Tooldef tools[] = {
 		"target.  Output is truncated if it grows very large.",
 		{{ "path", "Directory to run mk in (empty for current directory)" },
 		 { "targets", "Space-separated mk targets/args, or empty for the default target" }}},
+
+	{ Awebsearch, "web_search",
+		"Search the web through webfs and return a list of result "
+		"titles and URLs (no page content -- there is no tool to "
+		"fetch an arbitrary URL, only to search for one).  Use "
+		"this for current events, external documentation, or "
+		"anything not covered by local man pages and source.  "
+		"Results come from scraping a search engine's result "
+		"page, so titles may be imprecise and results can "
+		"occasionally be empty even when relevant pages exist; "
+		"treat it as a pointer to URLs, not an authoritative "
+		"answer.",
+		{{ "query", "Search query text" }}},
 };
 
 Tooldef*
@@ -357,8 +370,12 @@ readfilelimit(int fd, long max, int *truncatedp)
 
 static char *defaultsysprompt =
 	"You are a coding assistant running on Plan 9 (9front). "
-	"You have tools to create, edit, and delete files. "
-	"Use the tools when the user asks you to make changes. "
+	"You can use all tools supplied with each request.  In particular, "
+	"read_file reads file contents and list_directory browses directories; "
+	"use them when the user asks you to inspect or review a project.  "
+	"You also have tools to create, edit, and delete files. "
+	"Use the tools when the user asks you to inspect or make changes. "
+	"Do not claim that a supplied tool is unavailable after you have used it. "
 	"Use only ASCII characters in your responses.\n"
 	"\n"
 	"Checking your work\n"
@@ -445,6 +462,8 @@ convfree(Conv *c)
 	free(c->model);
 	free(c->baseurl);
 	free(c->effort);
+	free(c->advisormodel);
+	free(c->advisorcache);
 	free(c->basesys);
 	free(c->sysprompt);
 	free(c);
@@ -600,29 +619,44 @@ toolschema(Tooldef *td)
  * Build tool definitions JSON, anthropic shape.
  */
 static Json*
-mktools(void)
+mktools(Conv *c)
 {
-	Json *arr, *t, *cc;
+	Json *arr, *t, *cc, *cache;
 	Tooldef *td;
 	int i;
 
 	arr = jarray();
 	for(i = 0; i < nelem(tools); i++){
 		td = &tools[i];
-
 		t = jobject();
 		jset(t, "name", jstring(td->name));
 		jset(t, "description", jstring(td->desc));
 		jset(t, "input_schema", toolschema(td));
-
-		/* mark the last tool with cache_control for prompt caching */
-		if(i == nelem(tools) - 1){
-			cc = jobject();
-			jset(cc, "type", jstring("ephemeral"));
-			jset(t, "cache_control", cc);
-		}
-
 		jappend(arr, t);
+	}
+	if(c->advisormodel != nil){
+		t = jobject();
+		jset(t, "type", jstring("advisor_20260301"));
+		jset(t, "name", jstring("advisor"));
+		jset(t, "model", jstring(c->advisormodel));
+		if(c->advisormaxuses > 0)
+			jset(t, "max_uses", jintval(c->advisormaxuses));
+		if(c->advisormaxtokens > 0)
+			jset(t, "max_tokens", jintval(c->advisormaxtokens));
+		if(c->advisorcache != nil){
+			cache = jobject();
+			jset(cache, "type", jstring("ephemeral"));
+			jset(cache, "ttl", jstring(c->advisorcache));
+			jset(t, "caching", cache);
+		}
+		jappend(arr, t);
+	}
+	/* Cache all stable tool definitions, including advisor. */
+	if(arr->nitem > 0){
+		t = jidx(arr, arr->nitem - 1);
+		cc = jobject();
+		jset(cc, "type", jstring("ephemeral"));
+		jset(t, "cache_control", cc);
 	}
 	return arr;
 }
@@ -1118,7 +1152,7 @@ anthropicbuildreq(Conv *c)
 		jset(req, "system", sys);
 	}
 
-	jset(req, "tools", mktools());
+	jset(req, "tools", mktools(c));
 
 	msgs = neutralmessages(c);
 
@@ -1183,10 +1217,12 @@ weberror(char *webdir)
 
 /* Anthropic auth: api key plus a pinned API version. */
 static int
-anthropicheaders(int fd, char *apikey)
+anthropicheaders(int fd, Conv *c)
 {
-	if(fprint(fd, "headers x-api-key: %s\r\n", apikey) < 0
-	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0)
+	if(fprint(fd, "headers x-api-key: %s\r\n", c->apikey) < 0
+	|| fprint(fd, "headers anthropic-version: %s\r\n", apiversion) < 0
+	|| (c->advisormodel != nil
+	 && fprint(fd, "headers anthropic-beta: advisor-tool-2026-03-01\r\n") < 0))
 		return -1;
 	return 0;
 }
@@ -1199,7 +1235,7 @@ anthropicheaders(int fd, char *apikey)
  * on error returns -1 with errstr set.
  */
 static int
-webhttp(Provider *p, char *apikey, char *url, char *postbody, int stream, int *clonefdp)
+webhttp(Provider *p, Conv *c, char *url, char *postbody, int stream, int *clonefdp)
 {
 	int clonefd, fd, n;
 	char buf[256], *webdir, *path;
@@ -1227,7 +1263,7 @@ webhttp(Provider *p, char *apikey, char *url, char *postbody, int stream, int *c
 	|| fprint(fd, "request %s\n", postbody ? "POST" : "GET") < 0
 	|| (postbody && fprint(fd, "headers Content-Type: application/json\r\n") < 0)
 	|| (stream && fprint(fd, "headers Accept: text/event-stream\r\n") < 0)
-	|| p->headers(fd, apikey) < 0){
+	|| p->headers(fd, c) < 0){
 		close(fd);
 		goto err;
 	}
@@ -1711,6 +1747,418 @@ toolreplace(char *path, char *oldstr, char *newstr)
 }
 
 /*
+ * web_search: scrape a search engine's result page through
+ * webfs and return a list of (title, URL) pairs.  There is no
+ * search API that works without a key and without cost, so
+ * this hits DuckDuckGo's no-JS HTML endpoint
+ * (html.duckduckgo.com/html/) and extracts real outbound links
+ * from the returned page.
+ *
+ * Design note on why this scrapes generically instead of
+ * targeting DuckDuckGo's specific result markup (CSS classes
+ * like "result__a"): this program has no network access of its
+ * own to verify what that markup currently looks like, and
+ * result-page HTML changes without notice.  Extracting every
+ * <a href> anchor's visible text is robust to layout changes at
+ * the cost of losing snippets and occasionally picking up a
+ * stray navigational link.  The one DuckDuckGo-specific piece
+ * that *is* required regardless of layout is unwrapping its
+ * click-tracking redirect (every result link is rewritten to
+ * "//duckduckgo.com/l/?uddg=<percent-encoded target>&...");
+ * without that step every link would point back at
+ * duckduckgo.com's redirector instead of the real target, and
+ * filtering out duckduckgo.com hosted links (to drop the site's
+ * own nav/footer/settings links) would remove the results too.
+ * That redirect scheme has been stable for years across many
+ * independent scraping tools, so it is a safer bet than the
+ * page's visual layout.
+ *
+ * Only ever fetches this one fixed search URL: there is no
+ * fetch_url tool and this function does not take one, so the
+ * model cannot use it to make claude9fs issue an HTTP request
+ * to an arbitrary attacker-chosen host (see README's safety
+ * section).  The query text itself does leave the machine (as
+ * the DuckDuckGo query string), which is the real risk to be
+ * aware of: prompt-injected content could induce a search for
+ * sensitive text, leaking it to the search engine and the
+ * network path to reach it.
+ */
+
+enum {
+	Websearchfetchmax = 131072,	/* cap on the raw results page fetched */
+	Maxsearchresults = 8,
+	Searchsnippetlen = 2000,	/* fallback raw-text dump size */
+};
+
+typedef struct Searchresult Searchresult;
+struct Searchresult {
+	char *title;
+	char *href;
+};
+
+static void
+freesearchresults(Searchresult *r, int n)
+{
+	int i;
+
+	for(i = 0; i < n; i++){
+		free(r[i].title);
+		free(r[i].href);
+	}
+}
+
+/* Minimal RFC 3986 percent-encoding for a query string value. */
+static char*
+urlencode(char *s)
+{
+	Fmt f;
+	uchar c;
+
+	fmtstrinit(&f);
+	for(; *s != '\0'; s++){
+		c = *s;
+		if((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		|| (c >= '0' && c <= '9')
+		|| c == '-' || c == '.' || c == '_' || c == '~')
+			fmtprint(&f, "%c", c);
+		else
+			fmtprint(&f, "%%%02X", c);
+	}
+	return fmtstrflush(&f);
+}
+
+static int
+hexval(int c)
+{
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* Percent- (and '+'-) decode the byte range [s, end). */
+static char*
+urldecoden(char *s, char *end)
+{
+	Fmt f;
+	int hi, lo;
+
+	fmtstrinit(&f);
+	for(; s < end; s++){
+		if(*s == '%' && s + 2 < end
+		&& (hi = hexval(s[1])) >= 0 && (lo = hexval(s[2])) >= 0){
+			fmtprint(&f, "%c", (hi << 4) | lo);
+			s += 2;
+		} else if(*s == '+')
+			fmtprint(&f, " ");
+		else
+			fmtprint(&f, "%c", *s);
+	}
+	return fmtstrflush(&f);
+}
+
+/*
+ * Decode the handful of HTML entities that show up in scraped
+ * result pages, in place (the result is never longer than the
+ * input).  Not a general entity decoder: numeric entities
+ * (&#NN;) are left as-is, which is a cosmetic shortcoming, not
+ * a correctness one.
+ */
+static void
+htmlunescape(char *s)
+{
+	char *r, *w;
+
+	r = w = s;
+	while(*r != '\0'){
+		if(*r == '&'){
+			if(strncmp(r, "&amp;", 5) == 0){ *w++ = '&'; r += 5; continue; }
+			if(strncmp(r, "&lt;", 4) == 0){ *w++ = '<'; r += 4; continue; }
+			if(strncmp(r, "&gt;", 4) == 0){ *w++ = '>'; r += 4; continue; }
+			if(strncmp(r, "&quot;", 6) == 0){ *w++ = '"'; r += 6; continue; }
+			if(strncmp(r, "&#39;", 5) == 0){ *w++ = '\''; r += 5; continue; }
+			if(strncmp(r, "&apos;", 6) == 0){ *w++ = '\''; r += 6; continue; }
+			if(strncmp(r, "&nbsp;", 6) == 0){ *w++ = ' '; r += 6; continue; }
+		}
+		*w++ = *r++;
+	}
+	*w = '\0';
+}
+
+/* Strip "<...>" tag spans from [start, end), returning plain text. */
+static char*
+striptagsrange(char *start, char *end)
+{
+	Fmt f;
+	char *p;
+	int intag;
+
+	fmtstrinit(&f);
+	intag = 0;
+	for(p = start; p < end; p++){
+		if(*p == '<'){ intag = 1; continue; }
+		if(*p == '>'){ intag = 0; continue; }
+		if(!intag)
+			fmtprint(&f, "%c", *p);
+	}
+	return fmtstrflush(&f);
+}
+
+/* Collapse runs of whitespace to one space and trim both ends. */
+static char*
+collapsews(char *s)
+{
+	Fmt f;
+	int lastspace, wrote;
+
+	fmtstrinit(&f);
+	lastspace = 1;	/* suppress leading space */
+	wrote = 0;
+	for(; *s != '\0'; s++){
+		if(*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r'){
+			if(!lastspace && wrote)
+				fmtprint(&f, " ");
+			lastspace = 1;
+		} else {
+			fmtprint(&f, "%c", *s);
+			lastspace = 0;
+			wrote = 1;
+		}
+	}
+	return fmtstrflush(&f);
+}
+
+static char*
+substrdup(char *start, char *end)
+{
+	char *s;
+	long n;
+
+	n = end - start;
+	s = emalloc(n + 1);
+	memmove(s, start, n);
+	s[n] = '\0';
+	return s;
+}
+
+/*
+ * Find attr="..." within the byte range [tagstart, tagend)
+ * (tagstart points at '<', tagend at the matching '>') and
+ * return its raw (still HTML-entity-escaped) value, or nil.
+ */
+static char*
+findattr(char *tagstart, char *tagend, char *attr)
+{
+	char needle[64];
+	int alen;
+	char *p, *v, *q;
+
+	snprint(needle, sizeof needle, "%s=\"", attr);
+	alen = strlen(needle);
+	for(p = tagstart; p + alen <= tagend; p++){
+		if(memcmp(p, needle, alen) == 0){
+			v = p + alen;
+			q = memchr(v, '"', tagend - v);
+			if(q == nil)
+				return nil;
+			return substrdup(v, q);
+		}
+	}
+	return nil;
+}
+
+/*
+ * Resolve a raw href attribute value to an absolute URL,
+ * unwrapping DuckDuckGo's "/l/?uddg=<encoded target>" redirect
+ * (see the toolwebsearch comment) and fixing up protocol-
+ * relative ("//host/path") URLs.  Always returns a malloc'd
+ * string; may not be a valid absolute URL if the input wasn't
+ * (callers filter on the http(s) prefix afterward).
+ */
+static char*
+resolvehref(char *raw)
+{
+	char *href, *u, *amp, *real;
+
+	href = estrdup(raw);
+	htmlunescape(href);
+
+	u = strstr(href, "uddg=");
+	if(u != nil){
+		u += 5;
+		amp = strchr(u, '&');
+		real = urldecoden(u, amp != nil ? amp : u + strlen(u));
+		free(href);
+		return real;
+	}
+	if(href[0] == '/' && href[1] == '/'){
+		real = esmprint("https:%s", href);
+		free(href);
+		return real;
+	}
+	return href;
+}
+
+/*
+ * Scan every <a ...>text</a> anchor in [html, end) and collect
+ * external http(s) links with non-empty text into out (up to
+ * max entries).  Links that resolve back to skiphost (the
+ * search engine's own domain, e.g. its nav/footer/settings
+ * links, or an un-unwrapped self-link) are dropped, as are
+ * consecutive duplicate hrefs (some result templates repeat an
+ * icon link and a text link to the same target).  Returns the
+ * number of results collected.
+ */
+static int
+extractlinks(char *html, char *end, char *skiphost,
+	Searchresult *out, int max)
+{
+	char *p, *tagstart, *tagend, *rawhref, *href, *text, *lasthref;
+	int n;
+
+	n = 0;
+	lasthref = nil;
+	p = html;
+	while(n < max && (p = strstr(p, "<a ")) != nil){
+		tagstart = p;
+		tagend = memchr(tagstart, '>', end - tagstart);
+		if(tagend == nil)
+			break;
+		p = tagend + 1;
+
+		rawhref = findattr(tagstart, tagend, "href");
+		if(rawhref == nil)
+			continue;
+		href = resolvehref(rawhref);
+		free(rawhref);
+
+		if(strncmp(href, "http://", 7) != 0
+		&& strncmp(href, "https://", 8) != 0){
+			free(href);
+			continue;
+		}
+		if(skiphost != nil && strstr(href, skiphost) != nil){
+			free(href);
+			continue;
+		}
+		text = striptagsrange(tagend + 1,
+			strstr(tagend, "</a>") != nil ? strstr(tagend, "</a>") : end);
+		htmlunescape(text);
+		{
+			char *collapsed = collapsews(text);
+			free(text);
+			text = collapsed;
+		}
+		if(text[0] == '\0'){
+			free(href);
+			free(text);
+			continue;
+		}
+
+		if(lasthref != nil && strcmp(href, lasthref) == 0){
+			/*
+			 * Same target as the previous accepted link
+			 * (e.g. an icon anchor immediately followed by
+			 * the readable text anchor, or vice versa).
+			 * Keep whichever anchor text is longer, on the
+			 * heuristic that a longer string is more likely
+			 * to be the real title than icon/alt text.
+			 */
+			if(n > 0 && strlen(text) > strlen(out[n-1].title)){
+				free(out[n-1].title);
+				out[n-1].title = text;
+			} else
+				free(text);
+			free(href);
+			continue;
+		}
+
+		out[n].href = href;
+		out[n].title = text;
+		free(lasthref);
+		lasthref = estrdup(href);
+		n++;
+	}
+	free(lasthref);
+	return n;
+}
+
+/* Auth for the search fetch: none, just a browser-like UA. */
+static int
+websearchheaders(int fd, Conv *c)
+{
+	USED(c);
+	return fprint(fd,
+		"headers User-Agent: Mozilla/5.0 (compatible; claude9-websearch/1.0)\r\n") < 0
+		? -1 : 0;
+}
+
+static Provider websearchprov = {
+	"websearch", nil, nil, websearchheaders, nil, nil, nil
+};
+
+static char*
+toolwebsearch(char *query)
+{
+	char *enc, *url, *html, *out;
+	int fd, clonefd, truncated, n, i;
+	Searchresult results[Maxsearchresults];
+	Fmt f;
+
+	if(query == nil || query[0] == '\0')
+		return esmprint("error: empty search query");
+
+	enc = urlencode(query);
+	url = esmprint("https://html.duckduckgo.com/html/?q=%s", enc);
+	free(enc);
+
+	fd = webhttp(&websearchprov, nil, url, nil, 0, &clonefd);
+	free(url);
+	if(fd < 0)
+		return esmprint("error: web search: %r");
+
+	html = readfilelimit(fd, Websearchfetchmax, &truncated);
+	close(fd);
+	close(clonefd);
+	if(html == nil)
+		return esmprint("error: web search: read response: %r");
+
+	n = extractlinks(html, html + strlen(html), "duckduckgo",
+		results, Maxsearchresults);
+	if(n == 0){
+		/*
+		 * No links matched -- either a genuinely empty result
+		 * set, or (more likely, given this scraper cannot be
+		 * tested against the live page from here) a markup
+		 * change this extractor doesn't handle.  Fall back to
+		 * a raw, tag-stripped, truncated dump so the caller
+		 * gets *something* instead of silence.
+		 */
+		char *stripped, *collapsed;
+
+		stripped = striptagsrange(html, html + strlen(html));
+		htmlunescape(stripped);
+		collapsed = collapsews(stripped);
+		free(stripped);
+		free(html);
+		if(strlen(collapsed) > Searchsnippetlen)
+			collapsed[Searchsnippetlen] = '\0';
+		out = esmprint("warning: could not parse search results for '%s'; "
+			"raw page text (truncated):\n%s", query, collapsed);
+		free(collapsed);
+		return out;
+	}
+	free(html);
+
+	fmtstrinit(&f);
+	fmtprint(&f, "web search results for '%s':\n\n", query);
+	for(i = 0; i < n; i++)
+		fmtprint(&f, "%d. %s\n   %s\n\n", i + 1, results[i].title, results[i].href);
+	freesearchresults(results, n);
+	return fmtstrflush(&f);
+}
+
+/*
  * Execute a tool call. Returns result string (caller frees).
  * args[] is in Tooldef param order: args[0] is the path.
  */
@@ -1754,6 +2202,9 @@ exectool(ToolCall *tc)
 
 	case Amk:
 		return toolmk(path, tc->args[1]);
+
+	case Awebsearch:
+		return toolwebsearch(path);
 	}
 
 	return esmprint("error: unknown tool '%s'",
@@ -1994,6 +2445,7 @@ struct Sblock {
 	char *redacted;	/* redacted_thinking: opaque data blob */
 	char *toolid;
 	char *toolname;
+	char *opaque;	/* complete server-side content block JSON */
 };
 
 /*
@@ -2033,6 +2485,12 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 	head = tail = nil;
 
 	for(i = 0; i < nblocks; i++){
+		if(blocks[i].opaque != nil){
+			block = jsonparse(blocks[i].opaque);
+			if(block != nil)
+				jappend(content, block);
+			continue;
+		}
 		if(blocks[i].isthinking){
 			/*
 			 * Thinking blocks must be passed back verbatim
@@ -2115,6 +2573,8 @@ blocks2reply(Sblock *blocks, int nblocks, char *stop_reason)
 		r->stopped = 0;
 	else
 		r->stopped = 1;
+	if(stop_reason != nil && strcmp(stop_reason, "pause_turn") == 0)
+		r->paused = 1;
 	return r;
 }
 
@@ -2130,6 +2590,7 @@ freeblocks(Sblock *blocks, int nblocks)
 		free(blocks[i].redacted);
 		free(blocks[i].toolid);
 		free(blocks[i].toolname);
+		free(blocks[i].opaque);
 	}
 }
 
@@ -2217,7 +2678,10 @@ sseevent(Json *ev, Sblock *blocks, int *nblocksp,
 		dtype = jstr(cblock, "type");
 		if(dtype == nil)
 			return 0;
-		if(strcmp(dtype, "tool_use") == 0){
+		if(strcmp(dtype, "server_tool_use") == 0
+		|| strcmp(dtype, "advisor_tool_result") == 0){
+			b->opaque = jsonstr(cblock);
+		} else if(strcmp(dtype, "tool_use") == 0){
 			b->istool = 1;
 			s = jstr(cblock, "id");
 			b->toolid = estrdup(s ? s : "");
@@ -2390,7 +2854,7 @@ sendonce1(Conv *c, Usage *usage,
 		return nil;
 	}
 
-	fd = webhttp(p, c->apikey,
+	fd = webhttp(p, c,
 		c->baseurl != nil && c->baseurl[0] != '\0' ? c->baseurl : p->apiurl,
 		body, 1, &clonefd);
 	free(body);
@@ -2548,6 +3012,16 @@ claudeconverse(Conv *c, Usage *usage,
 		convappend(c, msgnew(Massistant,
 			r->text ? r->text : "", r->rawjson));
 
+		if(r->paused){
+			/*
+			 * Anthropic may pause while its server-side advisor is
+			 * pending.  Replay the assistant content unchanged and
+			 * immediately resend: no user message or tool_result is
+			 * permitted on this path.
+			 */
+			replyfree(r);
+			continue;
+		}
 		if(r->stopped){
 			/*
 			 * The max_tokens guillotine can fall mid
@@ -2590,9 +3064,9 @@ claudeconverse(Conv *c, Usage *usage,
 	 * prompt, but the user must be told this answer is not done.
 	 */
 	if(errp != nil)
-		*errp = esmprint("tool loop limit reached (%d rounds)", Maxrounds);
+		*errp = esmprint("tool/advisor loop limit reached (%d rounds)", Maxrounds);
 	if(cb != nil)
-		cb("\n[tool loop limit reached; send another prompt to continue]\n", aux);
+		cb("\n[tool/advisor loop limit reached]\n", aux);
 	return fmtstrflush(&f);
 }
 
@@ -2614,7 +3088,12 @@ fetchmodels(int prov, char *apikey)
 		return nil;
 	}
 	p = &providers[prov];
-	fd = webhttp(p, apikey, p->modelsurl, nil, 0, &clonefd);
+	{
+		Conv c;
+		memset(&c, 0, sizeof c);
+		c.apikey = apikey;
+		fd = webhttp(p, &c, p->modelsurl, nil, 0, &clonefd);
+	}
 	if(fd < 0)
 		return nil;
 	data = readfile(fd);
