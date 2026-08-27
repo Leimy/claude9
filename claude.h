@@ -82,6 +82,12 @@ struct Conv {
 	int advisormaxuses;	/* 0 = omit/unlimited */
 	int advisormaxtokens;	/* 0 = omit/provider default */
 	char *advisorcache;	/* nil, "5m", or "1h" */
+	char **searchurls;	/* URLs seen in this conversation's web_search
+				 * results; web_fetch may only retrieve a
+				 * URL that appears here (see rememberurl/
+				 * urlsearched in claude.c); convclear revokes
+				 * them with the message history */
+	int nsearchurls;
 	char *basesys;	/* sysprompt before skills are appended */
 	char *sysprompt;	/* basesys + current skills: what's actually sent */
 	Msg *msgs;

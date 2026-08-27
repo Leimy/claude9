@@ -37,6 +37,9 @@ following tools without asking you for confirmation each time:
 - `web_search` - have claude9fs itself issue an outbound HTTP
   GET (through webfs) to a search engine with a model-chosen
   query, and return a list of result titles and URLs.
+- `web_fetch` - fetch the text content of a URL, but only a
+  URL that a previous `web_search` call in the same session
+  actually returned.
 
 Tool calls run with the full authority of the user that started
 claude9fs.  On Plan 9 that typically means your whole home tree,
@@ -65,18 +68,30 @@ through the API**.  Concretely that includes things like:
   sensitive text found in a file, leaking it to the search
   engine and the network path used to reach it, as the query
   string of an outbound request claude9fs makes on the model's
-  behalf.
+  behalf;
+- following an instruction planted in a fetched page's own
+  text (a second-order prompt injection: a hostile page shows
+  up in ordinary search results, the model `web_fetch`es it,
+  and its content redirects the model's next actions), since
+  `web_fetch`'s output is untrusted text like any other tool
+  result;
+- contacting a redirect target chosen by a hostile search
+  result: redirected content is rejected, but webfs follows
+  the redirect before claude9fs can inspect the final URL.
 
 It cannot escape the permissions of the user running
 claude9fs, and it does not get raw shell or network access -
 the only side effects are the file tools above, the utility
-tools (`read_man_page`, `mk`, `web_search`), plus the HTTP(S)
-calls claude9fs itself makes through webfs to the configured
-API endpoint and, for `web_search`, to a fixed search engine
-(there is no general-purpose URL-fetch tool, so the model
-cannot direct claude9fs's outbound requests at an arbitrary
-host, only search a fixed one with model-chosen query text).
-But within those limits it can do real damage.
+tools (`read_man_page`, `mk`, `web_search`, `web_fetch`), plus
+the HTTP(S) calls claude9fs itself makes through webfs to the
+configured API endpoint and, for `web_search`/`web_fetch`, to
+a fixed search engine or a URL that engine itself returned.
+There is no general-purpose URL-fetch tool: the model cannot
+name an arbitrary URL to `web_fetch`, only one it already saw
+in a current-session `web_search` result.  A hostile result can
+redirect webfs elsewhere before claude9fs rejects the redirected
+content, so this is not a complete outbound-host boundary.  But
+within those limits it can do real damage.
 
 **Note that the `mk` tool is arbitrary code execution.**  mk
 recipes are rc commands run with your full authority; a model
@@ -362,26 +377,50 @@ reported by Anthropic separately in `usage.iterations`; the current
 When you write to `prompt`, claude9fs runs the full tool loop:
 Claude has access to file tools (`create_file`, `replace_string`,
 `read_file`, `list_directory`, `delete_file`) and a few utility
-tools (`read_man_page`, `mk`, `web_search`) which are executed
-automatically as part of the round, with results sent back to
-Claude until it produces a final response.
+tools (`read_man_page`, `mk`, `web_search`, `web_fetch`) which
+are executed automatically as part of the round, with results
+sent back to Claude until it produces a final response.
 
-`web_search` is the only tool that reaches outside the local
-machine on the model's own initiative (as opposed to the fixed
-API endpoint claude9fs always talks to).  It fetches a single,
-hardcoded search engine URL (DuckDuckGo's no-JS HTML endpoint)
-through webfs, with the model's query as the `q=` parameter, and
-returns a plain list of result titles and URLs -- it does not
-fetch the URLs it finds, and there is no separate fetch-a-URL
-tool, so the model cannot direct claude9fs's network access at
-an arbitrary host.  Because search result pages are scraped
-(there is no free, keyless search API to call instead) rather
-than parsed against a documented format, treat results as a
-best-effort pointer to further reading, not a definitive answer:
-a request that returns nothing usefully parseable falls back to
-a truncated, tag-stripped dump of the raw page text, tagged with
-a `warning:` prefix, so a change in the search engine's page
-layout degrades to noise instead of silent failure.
+`web_search` and `web_fetch` are the only tools that reach
+outside the local machine on the model's own initiative (as
+opposed to the fixed API endpoint claude9fs always talks to).
+`web_search` fetches a single, hardcoded search engine URL
+(DuckDuckGo's no-JS HTML endpoint) through webfs, with the
+model's query as the `q=` parameter, and returns a plain list
+of result titles and URLs.  Because search result pages are
+scraped (there is no free, keyless search API to call instead)
+rather than parsed against a documented format, treat results
+as a best-effort pointer to further reading, not a definitive
+answer: a request that returns nothing usefully parseable falls
+back to a truncated, tag-stripped dump of the raw page text,
+tagged with a `warning:` prefix, so a change in the search
+engine's page layout degrades to noise instead of silent
+failure.
+
+`web_fetch` retrieves the text content (tags, scripts, and
+styles stripped) of one URL -- but only a URL that was itself
+returned by a `web_search` call earlier in the same session,
+copied exactly.  This is the "click a search result" pattern
+some other agentic tools use (e.g. the old ChatGPT browsing
+plugin's `search()`/`click(id)`), rather than a raw
+`fetch_url(url)` primitive.  Fetching a URL the model invents,
+or one it read out of a file instead of a search result, is
+rejected rather than attempted.  The remembered URLs are
+cleared with conversation history.
+
+webfs follows HTTP redirects internally.  claude9fs checks the
+final parsed URL and rejects the content unless it exactly
+matches the searched URL, so redirected content never enters
+the model.  That check necessarily happens after webfs has
+followed the redirect, however: a hostile searched site can
+still make an outbound connection to its redirect target.
+The search allowlist is therefore a strong content-provenance
+check, not a complete SSRF or network-destination boundary;
+restrict the process namespace and network environment when
+that distinction matters.  Large pages are truncated, and the
+risk noted above (a fetched page's own content is untrusted
+input, like any other tool result) applies to whatever text
+comes back.
 
 The `replace_string` tool does content-addressed editing: it
 takes an `old_str` to find and a `new_str` to replace it with.

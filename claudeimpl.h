@@ -25,6 +25,7 @@ enum {
 	Amanpage,
 	Amk,
 	Awebsearch,
+	Awebfetch,
 
 	Maxargs = 3,	/* max parameters per tool */
 };

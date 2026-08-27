@@ -829,6 +829,105 @@ twebsearch(void)
 	ok(n == 0, "extractlinks: no anchors yields zero results");
 }
 
+/*
+ * --- claude.c: web_fetch's URL allowlist and HTML-stripping
+ * helpers.  toolwebfetch's permission check happens before any
+ * network I/O, so its rejection paths are pure logic and safe
+ * to test here; the success path (an actual fetch) is
+ * deliberately NOT exercised, per this file's no-network rule
+ * (see the header comment) -- urlsearched() is checked directly
+ * instead of calling toolwebfetch on a permitted URL.
+ */
+
+static void
+twebfetch(void)
+{
+	Conv *c;
+	char *s, *res, buf[64];
+	int i;
+
+	/* stripblock: removes a tag's body, case-insensitively */
+	s = stripblock("before<script>var x=1;</script>after", "script");
+	okstr(s, "beforeafter", "stripblock removes script body");
+	free(s);
+
+	s = stripblock("a<STYLE type=\"text/css\">.x{color:red}</STYLE>b", "style");
+	okstr(s, "ab", "stripblock matches tag name case-insensitively");
+	free(s);
+
+	/* a tag name that merely starts with the pattern is not a match */
+	s = stripblock("keep<scripted>not a script tag</scripted>keep2", "script");
+	okstr(s, "keep<scripted>not a script tag</scripted>keep2",
+		"stripblock requires a tag boundary, not a bare prefix match");
+	free(s);
+
+	/* no closing tag: drop to the end rather than loop or crash */
+	s = stripblock("a<script>never closed", "script");
+	okstr(s, "a", "stripblock drops to end when no closing tag is found");
+	free(s);
+
+	/* rememberurl / urlsearched: dedup and lookup */
+	c = convnew("k", "m", 100, "s", nil);
+	rememberurl(c, "https://a.example/1");
+	rememberurl(c, "https://b.example/2");
+	rememberurl(c, "https://a.example/1");	/* exact repeat */
+	ok(c->nsearchurls == 2, "rememberurl dedups exact repeats");
+	ok(urlsearched(c, "https://a.example/1"), "urlsearched finds remembered url");
+	ok(urlsearched(c, "https://b.example/2"), "urlsearched finds second remembered url");
+	ok(!urlsearched(c, "https://c.example/3"), "urlsearched rejects a url never searched");
+
+	/* eviction: oldest entries drop once Maxkepturls is exceeded */
+	for(i = 0; i < Maxkepturls + 5; i++){
+		snprint(buf, sizeof buf, "https://cap.example/%d", i);
+		rememberurl(c, buf);
+	}
+	ok(c->nsearchurls == Maxkepturls, "rememberurl caps total remembered urls");
+	ok(!urlsearched(c, "https://a.example/1"),
+		"rememberurl evicts oldest entries once over cap");
+	snprint(buf, sizeof buf, "https://cap.example/%d", Maxkepturls + 4);
+	ok(urlsearched(c, buf), "rememberurl keeps the most recently added entry");
+	convfree(c);
+
+	/* toolwebfetch: every rejection path is checked before any network I/O */
+	c = convnew("k", "m", 100, "s", nil);
+
+	res = toolwebfetch(c, nil);
+	ok(strncmp(res, "error", 5) == 0, "toolwebfetch: nil url rejected");
+	free(res);
+
+	res = toolwebfetch(c, "");
+	ok(strncmp(res, "error", 5) == 0, "toolwebfetch: empty url rejected");
+	free(res);
+
+	res = toolwebfetch(c, "ftp://example.com/x");
+	ok(strncmp(res, "error", 5) == 0, "toolwebfetch: non-http(s) scheme rejected");
+	free(res);
+
+	res = toolwebfetch(c, "https://not-searched.example/page");
+	ok(strstr(res, "not returned by a previous web_search") != nil,
+		"toolwebfetch: url absent from this session's search results is rejected");
+	free(res);
+
+	rememberurl(c, "https://searched.example/ok");
+	ok(urlsearched(c, "https://searched.example/ok"),
+		"toolwebfetch: a remembered url would now pass the permission check");
+	ok(fetchurlallowed("https://searched.example/ok",
+		"https://searched.example/ok"),
+		"webfetch: exact final URL is accepted");
+	ok(!fetchurlallowed("https://searched.example/ok",
+		"https://redirected.example/elsewhere"),
+		"webfetch: redirected final URL is rejected");
+	ok(!fetchurlallowed("https://searched.example/ok", nil),
+		"webfetch: unverifiable final URL is rejected");
+
+	convclear(c);
+	ok(c->nsearchurls == 0 && c->searchurls == nil,
+		"convclear drops remembered search URLs");
+	ok(!urlsearched(c, "https://searched.example/ok"),
+		"cleared conversation cannot fetch an old search result");
+	convfree(c);
+}
+
 /* --- openai.c: request assembly --- */
 
 static void
@@ -1040,7 +1139,7 @@ topenaibuildreq(void)
 	if(req != nil){
 		tools = jget(req, "tools");
 		ok(tools != nil, "openai: tools array present");
-		ok(tools != nil && tools->nitem == 8, "openai: tools array has 8 entries");
+		ok(tools != nil && tools->nitem == 9, "openai: tools array has 9 entries");
 		if(tools != nil && tools->nitem > 0){
 			t = jidx(tools, 0);
 			okstr(jstr(t, "type"), "function", "openai: tools[0].type=function");
@@ -1556,6 +1655,7 @@ threadmain(int argc, char **argv)
 	tmkparents();
 	ttoolman();
 	twebsearch();
+	twebfetch();
 	tadvisorstream();
 	topenaibuildreq();
 	topenaiquirk();

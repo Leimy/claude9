@@ -210,9 +210,9 @@ static Tooldef tools[] = {
 
 	{ Awebsearch, "web_search",
 		"Search the web through webfs and return a list of result "
-		"titles and URLs (no page content -- there is no tool to "
-		"fetch an arbitrary URL, only to search for one).  Use "
-		"this for current events, external documentation, or "
+		"titles and URLs (titles and URLs only, not page content -- "
+		"use web_fetch on one of the returned URLs to read a page).  "
+		"Use this for current events, external documentation, or "
 		"anything not covered by local man pages and source.  "
 		"Results come from scraping a search engine's result "
 		"page, so titles may be imprecise and results can "
@@ -220,6 +220,17 @@ static Tooldef tools[] = {
 		"treat it as a pointer to URLs, not an authoritative "
 		"answer.",
 		{{ "query", "Search query text" }}},
+
+	{ Awebfetch, "web_fetch",
+		"Fetch the text content of a web page and return it as "
+		"plain text (HTML tags, scripts, and styles stripped), "
+		"truncated if the page is large.  The url must be one "
+		"returned by a previous web_search call in this same "
+		"session, copied exactly -- call web_search first to "
+		"find a URL, then web_fetch it to read the page.  URLs "
+		"you did not get from a web_search result (invented, or "
+		"found in a file's contents) are rejected.",
+		{{ "url", "A URL exactly as returned by a previous web_search result" }}},
 };
 
 Tooldef*
@@ -437,6 +448,18 @@ convnew(char *apikey, char *model, int maxtokens, char *sysprompt, char *skills)
  * Free all messages, leaving the conversation empty but
  * otherwise configured (model, tokens, thinking, system).
  */
+static void
+clearsearchurls(Conv *c)
+{
+	int i;
+
+	for(i = 0; i < c->nsearchurls; i++)
+		free(c->searchurls[i]);
+	free(c->searchurls);
+	c->searchurls = nil;
+	c->nsearchurls = 0;
+}
+
 void
 convclear(Conv *c)
 {
@@ -450,6 +473,8 @@ convclear(Conv *c)
 	}
 	c->msgs = nil;
 	c->tail = nil;
+	/* Search-derived fetch authority is conversation history too. */
+	clearsearchurls(c);
 }
 
 void
@@ -2097,8 +2122,56 @@ static Provider websearchprov = {
 	"websearch", nil, nil, websearchheaders, nil, nil, nil
 };
 
+enum {
+	Maxkepturls = 64,	/* cap on remembered web_search result URLs per session */
+};
+
+/*
+ * Record url as fetchable via web_fetch for the rest of this
+ * conversation: it came out of a real web_search result, so a
+ * later web_fetch for it is not an arbitrary-host request the
+ * model invented on its own (see the toolwebfetch doc comment
+ * below).  Deduplicates; evicts the oldest entry (FIFO) once
+ * Maxkepturls is reached instead of growing without bound over
+ * a very long session.
+ */
+static void
+rememberurl(Conv *c, char *url)
+{
+	int i;
+
+	if(c == nil)
+		return;
+	for(i = 0; i < c->nsearchurls; i++)
+		if(strcmp(c->searchurls[i], url) == 0)
+			return;	/* already remembered */
+	if(c->nsearchurls >= Maxkepturls){
+		free(c->searchurls[0]);
+		memmove(c->searchurls, c->searchurls + 1,
+			(Maxkepturls - 1) * sizeof(char*));
+		c->nsearchurls--;
+	}
+	c->searchurls = erealloc(c->searchurls,
+		(c->nsearchurls + 1) * sizeof(char*));
+	c->searchurls[c->nsearchurls++] = estrdup(url);
+}
+
+/* True if url exactly matches a previously remembered web_search result. */
+static int
+urlsearched(Conv *c, char *url)
+{
+	int i;
+
+	if(c == nil)
+		return 0;
+	for(i = 0; i < c->nsearchurls; i++)
+		if(strcmp(c->searchurls[i], url) == 0)
+			return 1;
+	return 0;
+}
+
 static char*
-toolwebsearch(char *query)
+toolwebsearch(Conv *c, char *query)
 {
 	char *enc, *url, *html, *out;
 	int fd, clonefd, truncated, n, i;
@@ -2112,7 +2185,7 @@ toolwebsearch(char *query)
 	url = esmprint("https://html.duckduckgo.com/html/?q=%s", enc);
 	free(enc);
 
-	fd = webhttp(&websearchprov, nil, url, nil, 0, &clonefd);
+	fd = webhttp(&websearchprov, c, url, nil, 0, &clonefd);
 	free(url);
 	if(fd < 0)
 		return esmprint("error: web search: %r");
@@ -2152,10 +2225,198 @@ toolwebsearch(char *query)
 
 	fmtstrinit(&f);
 	fmtprint(&f, "web search results for '%s':\n\n", query);
-	for(i = 0; i < n; i++)
+	for(i = 0; i < n; i++){
+		rememberurl(c, results[i].href);
 		fmtprint(&f, "%d. %s\n   %s\n\n", i + 1, results[i].title, results[i].href);
+	}
 	freesearchresults(results, n);
 	return fmtstrflush(&f);
+}
+
+/*
+ * web_fetch: retrieve the text content of a URL, but only if
+ * that exact URL was returned by a previous web_search call in
+ * this same conversation (see rememberurl/urlsearched above).
+ *
+ * This is the "click a result" pattern some other agentic
+ * tools use (e.g. the old ChatGPT browsing plugin's
+ * search()/click(id)) rather than a raw fetch_url(url)
+ * primitive: the model can only name a URL returned as a real
+ * result, rather than any URL it or a prompt-injected document
+ * invents.  A searched URL can still be hostile.  In particular,
+ * webfs follows redirects before returning control; toolwebfetch
+ * rejects redirected content after checking parsed/url, but the
+ * redirect target has already been contacted.  This is a
+ * content-provenance check, not a complete outbound-host or SSRF
+ * boundary (see README's safety-risk list).
+ *
+ * Like toolwebsearch, this scrapes rather than uses a
+ * documented API: strips <script>/<style> bodies (their
+ * contents are JS/CSS, not natural-language text, and would
+ * otherwise show up as noise after generic tag-stripping),
+ * strips all remaining tags, decodes entities, collapses
+ * whitespace, and truncates to a bounded size.
+ */
+
+enum {
+	Webfetchmax = 262144,		/* cap on the raw page fetched */
+	Webfetchtextmax = 20000,	/* cap on extracted text returned to the model */
+};
+
+/*
+ * Remove <tag ...>...</tag> spans (case-insensitive tag name,
+ * any attributes) from html; used to drop <script> and <style>
+ * bodies before generic tag-stripping.  A tag with no matching
+ * close is dropped through to the end of the string, which is
+ * a safe (if slightly lossy) default for malformed HTML.
+ * Always returns a malloc'd string; frees neither its input
+ * nor takes ownership of it.
+ */
+static char*
+stripblock(char *html, char *tag)
+{
+	Fmt f;
+	char openpat[16], closepat[16];
+	char *p, *o, *oend, *cl;
+	int openlen, closelen, c;
+
+	snprint(openpat, sizeof openpat, "<%s", tag);
+	snprint(closepat, sizeof closepat, "</%s>", tag);
+	openlen = strlen(openpat);
+	closelen = strlen(closepat);
+
+	fmtstrinit(&f);
+	p = html;
+	for(;;){
+		o = cistrstr(p, openpat);
+		if(o == nil){
+			fmtprint(&f, "%s", p);
+			break;
+		}
+		/*
+		 * Require a tag boundary right after the name (one of
+		 * ">", whitespace, or "/") so e.g. "<scripted>" is not
+		 * mistaken for "<script".
+		 */
+		c = o[openlen];
+		if(c != '>' && c != ' ' && c != '\t' && c != '\n'
+		&& c != '\r' && c != '/'){
+			fmtprint(&f, "%.*s", (int)(o + openlen - p), p);
+			p = o + openlen;
+			continue;
+		}
+		fmtprint(&f, "%.*s", (int)(o - p), p);
+		oend = strchr(o, '>');
+		if(oend == nil)
+			break;	/* malformed: drop the rest */
+		cl = cistrstr(oend, closepat);
+		if(cl == nil)
+			break;	/* no closing tag: drop the rest */
+		p = cl + closelen;
+	}
+	return fmtstrflush(&f);
+}
+
+/* Auth for the fetch: none, just a browser-like UA (shared with search). */
+static Provider webfetchprov = {
+	"webfetch", nil, nil, websearchheaders, nil, nil, nil
+};
+
+static char*
+webfinalurl(int clonefd)
+{
+	char buf[64], *path, *s;
+	int n, fd;
+
+	if(seek(clonefd, 0, 0) < 0)
+		return nil;
+	n = read(clonefd, buf, sizeof buf - 1);
+	if(n <= 0)
+		return nil;
+	buf[n] = '\0';
+	while(n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' '))
+		buf[--n] = '\0';
+	path = esmprint("/mnt/web/%s/parsed/url", buf);
+	fd = open(path, OREAD);
+	free(path);
+	if(fd < 0)
+		return nil;
+	s = readfile(fd);
+	close(fd);
+	return s;
+}
+
+static int
+fetchurlallowed(char *requested, char *final)
+{
+	return requested != nil && final != nil
+		&& strcmp(requested, final) == 0;
+}
+
+static char*
+toolwebfetch(Conv *c, char *url)
+{
+	char *html, *final, *noscript, *nostyle, *stripped, *collapsed, *out;
+	int fd, clonefd, truncated;
+
+	if(url == nil || url[0] == '\0')
+		return esmprint("error: empty url");
+	if(strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)
+		return esmprint("error: url must be http:// or https://");
+	if(!urlsearched(c, url))
+		return esmprint("error: '%s' was not returned by a previous "
+			"web_search result in this session; call web_search "
+			"first and pass a URL exactly as it came back", url);
+
+	fd = webhttp(&webfetchprov, c, url, nil, 0, &clonefd);
+	if(fd < 0)
+		return esmprint("error: web fetch: %r");
+
+	/*
+	 * webfs follows redirects before returning body.  Fail
+	 * closed unless its final parsed URL is byte-for-byte the
+	 * searched URL: redirected content must not enter the model.
+	 * This check occurs after webfs followed the redirect, so it
+	 * limits returned content, not the network connection itself;
+	 * the README documents that residual SSRF-like exposure.
+	 */
+	final = webfinalurl(clonefd);
+	if(!fetchurlallowed(url, final)){
+		close(fd);
+		close(clonefd);
+		out = final == nil
+			? esmprint("error: web fetch: cannot verify final URL")
+			: esmprint("error: web fetch: redirect rejected: %s -> %s",
+				url, final);
+		free(final);
+		return out;
+	}
+	free(final);
+
+	html = readfilelimit(fd, Webfetchmax, &truncated);
+	close(fd);
+	close(clonefd);
+	if(html == nil)
+		return esmprint("error: web fetch: read response: %r");
+
+	noscript = stripblock(html, "script");
+	free(html);
+	nostyle = stripblock(noscript, "style");
+	free(noscript);
+	stripped = striptagsrange(nostyle, nostyle + strlen(nostyle));
+	free(nostyle);
+	htmlunescape(stripped);
+	collapsed = collapsews(stripped);
+	free(stripped);
+
+	if(strlen(collapsed) > Webfetchtextmax){
+		collapsed[Webfetchtextmax] = '\0';
+		out = esmprint("content of %s (truncated to %d bytes):\n\n%s",
+			url, Webfetchtextmax, collapsed);
+	} else
+		out = esmprint("content of %s:\n\n%s", url, collapsed);
+	free(collapsed);
+	return out;
 }
 
 /*
@@ -2163,7 +2424,7 @@ toolwebsearch(char *query)
  * args[] is in Tooldef param order: args[0] is the path.
  */
 static char*
-exectool(ToolCall *tc)
+exectool(Conv *c, ToolCall *tc)
 {
 	char *path;
 	int fd;
@@ -2204,7 +2465,10 @@ exectool(ToolCall *tc)
 		return toolmk(path, tc->args[1]);
 
 	case Awebsearch:
-		return toolwebsearch(path);
+		return toolwebsearch(c, path);
+
+	case Awebfetch:
+		return toolwebfetch(c, path);
 	}
 
 	return esmprint("error: unknown tool '%s'",
@@ -2287,6 +2551,7 @@ pathhash(char *path)
 /* one bucket of exectool() calls running in its own proc; see runtools */
 typedef struct Toolwork Toolwork;
 struct Toolwork {
+	Conv *c;
 	ToolCall *tc;	/* head of bucket chain, linked by bnext */
 	Channel *done;	/* elsize sizeof(ToolCall*); shared by all workers of a round */
 };
@@ -2299,7 +2564,7 @@ toolworker(void *v)
 
 	w = v;
 	for(tc = w->tc; tc != nil; tc = tc->bnext)
-		tc->result = exectool(tc);
+		tc->result = exectool(w->c, tc);
 	sendp(w->done, w->tc);
 	free(w);
 }
@@ -2345,7 +2610,7 @@ toolworker(void *v)
  * covers two sessions running mk at once (see runcmd's comment).
  */
 static void
-runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
+runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 {
 	ToolCall *tc, **bucket, **btail;
 	Toolwork *w;
@@ -2366,7 +2631,7 @@ runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	if(n == 0)
 		return;
 	if(n == 1){
-		calls->result = exectool(calls);
+		calls->result = exectool(c, calls);
 		return;
 	}
 
@@ -2376,7 +2641,29 @@ runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	bucket = emallocz(nb * sizeof(ToolCall*), 1);
 	btail = emallocz(nb * sizeof(ToolCall*), 1);
 	for(tc = calls; tc != nil; tc = tc->next){
-		i = pathhash(tc->args[0]) % nb;
+		/*
+		 * web_search and web_fetch both mutate the shared
+		 * Conv.searchurls list (rememberurl/urlsearched) with
+		 * no locking of their own, unlike every other tool,
+		 * which only ever touches its own ToolCall and the
+		 * file named in args[0].  Hash them all to one fixed
+		 * key instead of their actual argument (a search query
+		 * or a URL) so a turn that batches several such calls
+		 * -- e.g. two web_searches, or a search plus a fetch of
+		 * one of its own results -- lands them in the same
+		 * bucket and runs them one at a time, in issue order,
+		 * exactly like same-path file edits.  Without this, two
+		 * of these calls can land in different buckets and run
+		 * in concurrent procs that share memory, and
+		 * rememberurl's realloc of c->searchurls from one proc
+		 * can be freed out from under a concurrent reader/
+		 * writer in another -- malloc arena corruption, not
+		 * just a wrong answer.
+		 */
+		if(tc->type == Awebsearch || tc->type == Awebfetch)
+			i = pathhash("/web") % nb;
+		else
+			i = pathhash(tc->args[0]) % nb;
 		tc->bnext = nil;
 		if(btail[i] == nil)
 			bucket[i] = tc;
@@ -2391,6 +2678,7 @@ runtools(ToolCall *calls, void (*cb)(char*, void*), void *aux)
 		if(bucket[i] == nil)
 			continue;
 		w = emalloc(sizeof *w);
+		w->c = c;
 		w->tc = bucket[i];
 		w->done = done;
 		proccreate(toolworker, w, 32*1024);
@@ -3048,7 +3336,7 @@ claudeconverse(Conv *c, Usage *usage,
 			return fmtstrflush(&f);
 		}
 
-		runtools(r->tools, cb, aux);
+		runtools(c, r->tools, cb, aux);
 
 		resultjson = mktoolresults(r->tools);
 		convappend(c, msgnew(Muser, "", resultjson));
