@@ -109,6 +109,12 @@ Optionally set a system prompt to keep the sub-agent focused:
 
     create_file /mnt/claudesub/dizzy-monkey/system "You are a concise summarizer."
 
+For anything beyond a quick question, size the tool-loop budget
+now too (see "The tool-loop round cap" below for numbers):
+
+    create_file /mnt/claudesub/dizzy-monkey/ctl "maxrounds 60"
+    create_file /mnt/claudesub/dizzy-monkey/ctl "autocontinue 3"
+
 ### 4. Send a prompt and read the reply
 
 Write the user message to `prompt`.  The write blocks until
@@ -212,16 +218,43 @@ session's file edits are disjoint:
   each session's result and report a consolidated summary
   yourself once everyone is done.
 
-## The tool-loop round cap and autocontinue
+## The tool-loop round cap, maxrounds, and autocontinue
 
-Each `prompt` write runs up to 20 tool-use rounds internally
-(the hard-coded `Maxrounds` in claude.c) before claude9fs cuts
-the exchange off, even if the model still wants to call more
-tools.  A sub-agent working through a multi-file task (read
-several files, make several edits, run mk, fix, rerun) can
-easily hit this in a single prompt, especially the first
-message, which also has to spend rounds reading context before
-it can act.
+Each `prompt` write runs up to `maxrounds` tool-use rounds
+internally (default 20, `Defmaxrounds` in claude.h) before
+claude9fs cuts the exchange off, even if the model still wants
+to call more tools.  A sub-agent working through a multi-file
+task (read several files, make several edits, run mk, fix,
+rerun) can easily hit this in a single prompt, especially the
+first message, which also has to spend rounds reading context
+before it can act.
+
+**Preferred: raise the cap before sending the task.**  The cap
+is a per-session setting.  If you can see the task will need
+many tool calls, set it once and the sub-agent just runs to
+completion, with no interruption and no continuation prompt:
+
+    create_file /mnt/claudesub/0/ctl "maxrounds 60"
+
+`maxrounds` with no number restores the default; the current
+value is visible as `maxrounds N` in the session's `ctl`.  A
+change applies from the next prompt.  Sizing guide from
+experience: a read-only audit of ~15 files fits in 20; an
+implementation touching 5-8 files plus a build-fix cycle needs
+40-60; a large representation change across a tree wants 80+
+or should be split across sub-agents by file ownership.  (The
+sub-agent server can also be started with `claude9fs -r N` to
+make a higher default apply to every sub-agent.)
+
+**A bare "continue" prompt works.**  If a session does get cut
+off, you do not need anything special to resume it: the
+conversation is left well-formed, ending on a tool-results
+turn, so writing any new prompt -- literally the word
+`Continue.` -- resumes the tool loop with a fresh `maxrounds`
+budget.  Autocontinue (below) is exactly this, automated.
+Prefer a *specific* continuation over a bare one when you know
+where it stopped (see "If you didn't set autocontinue" below),
+since it saves the sub-agent re-deriving its plan.
 
 **How to tell this happened:** the conversation is left
 well-formed (every tool_use has a matching tool_result), so it
@@ -236,11 +269,11 @@ prompt write returns:
     -->  stop_reason end_turn     (the model actually stopped on its own)
 
 `error` reports the same condition explicitly, as
-"tool loop limit reached (20 rounds)".
+"tool loop limit reached (N rounds)".
 
-**Recommended: turn on autocontinue before sending the task**,
-so claude9fs resumes automatically instead of you having to
-poll and manually re-prompt:
+**Also turn on autocontinue as a backstop**, so claude9fs
+resumes automatically if the cap is hit anyway, instead of you
+having to poll and manually re-prompt:
 
     create_file /mnt/claudesub/0/ctl "autocontinue 3"
 
@@ -248,7 +281,28 @@ This also covers the sibling `max_tokens` case (a single
 round's output hitting its own token cap), which looks similar
 and is handled the same way.  Autocontinue sends a plain
 "Continue." on your behalf, up to the given number of times,
-and stops early if the model reaches a natural end (`end_turn`).
+each with a fresh `maxrounds` budget, and stops early if the
+model reaches a natural end (`end_turn`).  `maxrounds` and
+`autocontinue` compose: `maxrounds 40` plus `autocontinue 2`
+allows up to 120 rounds per prompt.
+
+One case autocontinue deliberately does not touch: if the cap
+fell on an Anthropic advisor `pause_turn` round, the history
+ends on an assistant turn that must be replayed unchanged, so
+no "Continue." is possible.  `error` then reads
+"tool/advisor loop limit reached" instead; sub-agents do not
+use the advisor, so you should not see this from them.
+
+**If autocontinue seems not to fire** (a session reports
+`stop_reason tool_use` and `error` says "loop limit reached"
+after one exchange even though `ctl` shows `autocontinue 3`),
+check which claude9fs binary is running: a build before the
+`maxrounds` change emitted the advisor wording for *every*
+capped loop, which the autocontinue check never matched, so
+autocontinue was silently dead for tool loops.  `mk install`
+from /usr/dave/work/claude9 and restart the servers (`rm
+/srv/claude /srv/claudesub`, then `claudetalk`).  A running
+server does not pick up a rebuilt binary.
 
 **If you didn't set autocontinue and a task gets cut off**,
 resume it yourself with a *specific* continuation prompt --
@@ -341,12 +395,15 @@ the background.  Drag rotates, scroll zooms, space toggles the
 slow auto-rotation, hovering a node shows its name/model/state,
 and button 3 over a node offers a `hangup` menu entry -- handy
 for cleaning up sub-agents someone forgot to hang up, since
-sessions live until an explicit hangup.  It does not poll: the
-`graph` file is a long-poll file (a blocking read that returns
-immediately with the current snapshot, then blocks until the
-next change), the same technique the `stream` file already
-uses for reply text, so updates appear the instant something
-changes rather than up to a second late.  If the user wants a
+sessions live until an explicit hangup.  It does not poll: it
+reads the sibling `graphlive` file, a long-poll file (a
+blocking read that returns immediately with the current
+snapshot, then blocks until the next change), the same
+technique the `stream` file already uses for reply text, so
+updates appear the instant something changes rather than up to
+a second late.  You, by contrast, should only ever read `graph`
+(EOF-terminated): a `read_file` on `graphlive` blocks forever
+after the first snapshot.  If the user wants a
 live visual of sub-agent activity, tell them to run it in a
 new window rather than trying to reconstruct the graph yourself
 from repeated `ls`/`ctl` reads:
@@ -366,7 +423,16 @@ whole life of a claudetalk session.
 
     claude-haiku-4-5-20251001      cheapest, good for simple tasks
     claude-sonnet-4-6              mid-range
+    claude-sonnet-5                mid-range, newer; a good default
+                                   for implementation and audit
+                                   sub-agents (worked well on a
+                                   multi-file C refactor and a
+                                   15-file read-only audit)
     claude-opus-4-8                most capable
+
+Read `/mnt/claudesub/models` (or `/mnt/claude/models`) for the
+live list rather than trusting this table; writing an unknown
+name to `model` is accepted and only fails at the first prompt.
 
 ## Security note: mk is not a shell
 
@@ -390,8 +456,9 @@ actual behavior (round caps, autocontinue, streaming, tool
 concurrency, etc.), read the real source there first rather
 than guessing from this document or from what a deployed copy
 happens to say -- `claude.c` has the tool loop (`claudeconverse`,
-`Maxrounds`, `toollimiterr`), autocontinue, and streaming logic
-all in one file.  Edit the copy under
+`Conv.maxrounds`/`Defmaxrounds`, `toollimiterr`) and streaming
+logic; `claude9fs.c` has autocontinue (`doprompt`) and the ctl
+commands (`handlectl`).  Edit the copy under
 `/usr/dave/work/claude9/skills/`, not just a deployed one, so
 the change survives a redeploy; then propagate it to whatever
 deployed skills directory is actually in use (check the skill

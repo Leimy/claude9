@@ -179,7 +179,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /reloadskills /graph /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -337,6 +337,7 @@ fn docmd {
 		echo '  /usage         show token usage' >[1=2]
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
 		echo '  /noautocontinue   disable auto-continue' >[1=2]
+		echo '  /maxrounds [n]  tool-loop round cap per prompt (default 20; no n = default)' >[1=2]
 		echo '  /reloadskills  re-read the skills directory (all sessions)' >[1=2]
 		echo '  /graph         open a claudegraph window on all live sessions' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
@@ -354,6 +355,17 @@ fn docmd {
 	if not if(~ $cmd /noautocontinue /noac){
 		echo 'noautocontinue' > $sess/ctl
 		echo 'autocontinue: 0' >[1=2]
+	}
+	if not if(~ $cmd /maxrounds){
+		shift
+		# Per-prompt tool-loop round cap; no argument restores
+		# the server default.  Takes effect from the next prompt.
+		if(~ $#* 0)
+			echo 'maxrounds' > $sess/ctl
+		if not
+			echo 'maxrounds '$1 > $sess/ctl
+		mr=`{awk '/^maxrounds/{print $2}' $sess/ctl}
+		echo 'maxrounds: '$mr >[1=2]
 	}
 	if not if(~ $cmd /reloadskills){
 		echo reloadskills > $sess/ctl

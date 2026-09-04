@@ -35,6 +35,10 @@ enum {
 			 * let errors surface; terminal */
 };
 
+enum {
+	Defmaxrounds = 20,	/* default Conv.maxrounds (see claudeconverse) */
+};
+
 /* growable string buffer */
 typedef struct Sbuf Sbuf;
 struct Sbuf {
@@ -82,6 +86,11 @@ struct Conv {
 	int advisormaxuses;	/* 0 = omit/unlimited */
 	int advisormaxtokens;	/* 0 = omit/provider default */
 	char *advisorcache;	/* nil, "5m", or "1h" */
+	int maxrounds;	/* tool-loop round cap per prompt; 0 = Defmaxrounds.
+			 * Each round is one API request; a round that
+			 * calls tools is followed by another.  Raise it
+			 * for long multi-file tasks so the loop does not
+			 * stop at the cap and need a "Continue." */
 	char **searchurls;	/* URLs seen in this conversation's web_search
 				 * results; web_fetch may only retrieve a
 				 * URL that appears here (see rememberurl/
@@ -153,9 +162,15 @@ int	overlimiterr(char *err);
  * True if an error string from claudeconverse is the specific
  * "tool loop limit reached" condition: the tool loop hit its
  * per-prompt round cap while the model was still calling tools.
- * The conversation is left well-formed and resumable, so this
- * is recoverable (auto-continue can send another "Continue."),
- * unlike a real API failure.
+ * The conversation is left well-formed and resumable (it ends
+ * on a tool_results user turn), so this is recoverable
+ * (auto-continue can send another "Continue."), unlike a real
+ * API failure.  The sibling "tool/advisor loop limit reached"
+ * wording, emitted when the cap fell on a server-side advisor
+ * pause_turn round, is deliberately NOT matched: that
+ * conversation ends on an assistant turn that must be replayed
+ * unchanged, and a "Continue." would violate the pause
+ * protocol.
  */
 int	toollimiterr(char *err);
 /*

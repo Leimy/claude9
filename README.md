@@ -171,7 +171,7 @@ OpenAI-compatible servers can be selected per session through the
 ## claude9fs - 9P Filesystem
 
 	claude9fs [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt]
-	          [-M model] [-P provider] [-t maxtokens]
+	          [-M model] [-P provider] [-t maxtokens] [-r maxrounds]
 
 Flags:
 
@@ -182,6 +182,7 @@ Flags:
 	-M model       default model (provider-specific default when omitted)
 	-P provider    default provider: anthropic or openai (default: anthropic)
 	-t maxtokens   positive default max tokens per round (default: 16384)
+	-r maxrounds   default tool-loop round cap per prompt (default: 20; see Tool Use)
 
 When `-M` is omitted, the default model is `claude-opus-4-8` for
 Anthropic and `gpt-4o` for OpenAI.
@@ -223,6 +224,7 @@ unavailable).
 	hangup             destroy the session
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
+	maxrounds [n]      set the per-prompt tool-loop round cap; no n restores the default
 	reloadskills       re-read the skills directory (see Skills)
 
 ### Defaults
@@ -236,6 +238,7 @@ New sessions start with:
 	thinking      off
 	advisor       off
 	autocontinue  off
+	maxrounds     20                (override with -r)
 
 The defaults are chosen to interlock: 16384 output tokens per
 round is enough that ordinary coding work never hits the cap,
@@ -381,6 +384,28 @@ tools (`read_man_page`, `mk`, `web_search`, `web_fetch`) which
 are executed automatically as part of the round, with results
 sent back to Claude until it produces a final response.
 
+Each API request in that loop is one *round*; a round in which
+the model calls tools is followed by another carrying the
+results.  The loop stops after `maxrounds` rounds (default 20)
+even if the model still wants tools, so a runaway loop costs a
+bounded number of requests.  The conversation is left
+well-formed when that happens -- every `tool_use` answered,
+ending on a tool-results turn -- and the `usage` file shows
+`stop_reason tool_use` while `error` says `tool loop limit
+reached (N rounds)`.  Writing another prompt (even just
+`Continue.`) resumes the work; auto-continue (below) does this
+for you.  For a task known to need many tool calls -- reading
+several files, editing, building, fixing, rebuilding -- raise
+the cap up front instead:
+
+	echo maxrounds 60 > /mnt/claude/$n/ctl    # this session
+	echo maxrounds > /mnt/claude/$n/ctl       # back to the default
+	claude9fs -r 60 ...                       # default for every session
+
+The current value is shown in `ctl` output as `maxrounds N`.
+A change applies from the next prompt; a round already in
+flight keeps the cap it started with.
+
 `web_search` and `web_fetch` are the only tools that reach
 outside the local machine on the model's own initiative (as
 opposed to the fixed API endpoint claude9fs always talks to).
@@ -472,8 +497,8 @@ limit.  Think guillotine, not word count.
 Three things follow from where the cap is applied:
 
 - **It is per round, not per prompt.**  One prompt can run up
-  to 20 tool-use rounds, and each round gets a fresh
-  `max_tokens` budget.  `tokens` bounds the worst-case output
+  to `maxrounds` tool-use rounds (default 20; see Tool Use),
+  and each round gets a fresh `max_tokens` budget.  `tokens` bounds the worst-case output
   (and output cost) of each round, not of the whole exchange.
 
 - **It does not limit input.**  Conversation history, system
@@ -574,14 +599,26 @@ until the model stops on its own (e.g. `end_turn`).
 
 Auto-continue also fires in one other case: when a single
 prompt runs the tool loop all the way to its per-prompt round
-cap (20 rounds; see "Tool Use") while the model is still
-calling tools.  That conversation is left well-formed and ends
-on a tool-results turn, so a `"Continue."` lets the model pick
-up the work it had not finished, exactly as with a `max_tokens`
-cut.  A genuine API error does *not* trigger a continuation:
-resending a broken or context-exceeded conversation would only
-repeat the failure, so the loop stops and the error is reported
-in the `error` file instead.
+cap (`maxrounds`, default 20; see "Tool Use") while the model
+is still calling tools.  That conversation is left well-formed
+and ends on a tool-results turn, so a `"Continue."` lets the
+model pick up the work it had not finished, exactly as with a
+`max_tokens` cut.  A genuine API error does *not* trigger a
+continuation: resending a broken or context-exceeded
+conversation would only repeat the failure, so the loop stops
+and the error is reported in the `error` file instead.  One
+capped loop is also excluded: if the cap fell on an Anthropic
+advisor `pause_turn` round, the history ends on an assistant
+turn that must be replayed unchanged, so no `"Continue."` is
+possible; the error reads `tool/advisor loop limit reached`
+to mark the difference.
+
+Each continuation is a fresh `maxrounds` budget, so
+`autocontinue 3` with the default cap allows up to 80 rounds
+per prompt in total.  If you already know a task is long,
+raising `maxrounds` is the cheaper knob: the model keeps its
+train of thought instead of being interrupted with
+`"Continue."` every 20 rounds.
 
 This works even when the cut lands mid tool call: the orphaned
 tool_use is answered with a `not executed` result (see the
@@ -914,6 +951,7 @@ file in the background while writing to `prompt`.
 	/usage         show token usage
 	/autocontinue [n]  enable auto-continue on max_tokens (default 3)
 	/noautocontinue    disable auto-continue
+	/maxrounds [n]     set the tool-loop round cap (default 20; no n = default)
 	/reloadskills  re-read the skills directory (all live sessions)
 	/graph         open claudegraph in a new window
 	/detach        keep session alive on exit (can reattach later)

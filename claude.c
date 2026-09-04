@@ -3235,18 +3235,23 @@ overlimiterr(char *err)
 		|| strstr(err, "maximum context length") != nil;
 }
 
-enum {
-	Maxrounds = 20,	/* tool-loop round cap per prompt */
-};
-
 /*
  * True if err is the specific, recoverable "tool loop limit
- * reached" condition raised when claudeconverse exhausts
- * Maxrounds while the model is still calling tools.  Unlike a
+ * reached" condition raised when claudeconverse exhausts its
+ * round cap while the model is still calling tools.  Unlike a
  * real API failure, the conversation is left well-formed
  * (every tool_use answered by a tool_result, ending on a user
- * turn), so it is safe to resume with another prompt.  The
- * exact wording must match the esmprint below.
+ * turn), so it is safe to resume with another prompt.
+ *
+ * The wording must match the esmprint at the end of
+ * claudeconverse exactly.  In particular it must NOT match the
+ * "tool/advisor loop limit reached" variant emitted when the
+ * cap fell on an advisor pause_turn round: that conversation
+ * ends on a replayed assistant turn, and appending a user
+ * "Continue." there violates the pause protocol.  (An earlier
+ * revision emitted the advisor wording unconditionally, which
+ * made this function never match and silently disabled
+ * auto-continue for every capped tool loop.)
  */
 int
 toollimiterr(char *err)
@@ -3263,15 +3268,22 @@ claudeconverse(Conv *c, Usage *usage,
 	Reply *r;
 	ToolCall *tc;
 	char *resultjson, *alltext, marker[256], errbuf[ERRMAX];
-	int round, ntext;
+	int round, ntext, maxrounds, lastpaused;
 	Fmt f;
 
 	if(errp != nil)
 		*errp = nil;
 	fmtstrinit(&f);
 	ntext = 0;
+	/*
+	 * Per-conversation round cap (ctl "maxrounds N" in
+	 * claude9fs), read once so a mid-loop change cannot make
+	 * the loop's bound move under it.
+	 */
+	maxrounds = c->maxrounds > 0 ? c->maxrounds : Defmaxrounds;
+	lastpaused = 0;
 
-	for(round = 0; round < Maxrounds; round++){
+	for(round = 0; round < maxrounds; round++){
 		r = sendonce(c, usage, cb, aux);
 		if(r == nil){
 			/*
@@ -3307,9 +3319,11 @@ claudeconverse(Conv *c, Usage *usage,
 			 * immediately resend: no user message or tool_result is
 			 * permitted on this path.
 			 */
+			lastpaused = 1;
 			replyfree(r);
 			continue;
 		}
+		lastpaused = 0;
 		if(r->stopped){
 			/*
 			 * The max_tokens guillotine can fall mid
@@ -3346,15 +3360,33 @@ claudeconverse(Conv *c, Usage *usage,
 	}
 
 	/*
-	 * Tool-loop round cap reached: the model was still asking
-	 * for tools when we cut it off.  The conversation ends with
-	 * tool results appended, so it can be resumed with another
-	 * prompt, but the user must be told this answer is not done.
+	 * Round cap reached.  Two distinct situations, and the
+	 * wording tells them apart (toollimiterr keys on it):
+	 *
+	 * Ordinary case: the model was still asking for tools when
+	 * we cut it off.  The conversation ends with tool results
+	 * appended (a user turn), so it can be resumed with another
+	 * prompt -- claude9fs's auto-continue does exactly that --
+	 * but the user must be told this answer is not done.
+	 *
+	 * Advisor case: the last round was a pause_turn, so the
+	 * conversation ends on a replayed assistant turn with no
+	 * tool results.  Appending a user message there violates
+	 * the pause protocol, so this is reported under a wording
+	 * toollimiterr does not match and auto-continue leaves it
+	 * alone.
 	 */
-	if(errp != nil)
-		*errp = esmprint("tool/advisor loop limit reached (%d rounds)", Maxrounds);
-	if(cb != nil)
-		cb("\n[tool/advisor loop limit reached]\n", aux);
+	if(lastpaused){
+		if(errp != nil)
+			*errp = esmprint("tool/advisor loop limit reached (%d rounds)", maxrounds);
+		if(cb != nil)
+			cb("\n[tool/advisor loop limit reached]\n", aux);
+	}else{
+		if(errp != nil)
+			*errp = esmprint("tool loop limit reached (%d rounds)", maxrounds);
+		if(cb != nil)
+			cb("\n[tool loop limit reached]\n", aux);
+	}
 	return fmtstrflush(&f);
 }
 

@@ -95,6 +95,7 @@ static char *openaikey;	/* nil if $OPENAI_API_KEY not set */
 static int defprov;	/* default provider for new sessions (-P; anthropic) */
 static char *defmodel;	/* nil until -M or per-provider default applied */
 static int defmaxtokens = 16384;
+static int defmaxrounds = 0;	/* 0 = Defmaxrounds; -r overrides */
 static char *defsysprompt = nil;
 static char *skillsdir = nil;
 static char *defskills = nil;
@@ -395,6 +396,7 @@ newsession(void)
 	 */
 	s->conv = convnew(provkey(defprov), defmodel, defmaxtokens, defsysprompt, skills);
 	s->conv->prov = defprov;
+	s->conv->maxrounds = defmaxrounds;
 	s->streamrz.l = &s->streamlk;
 	s->streamdone = 1;
 	s->next = sessions;
@@ -1033,6 +1035,7 @@ rdctl(Session *s)
 		"bytes %ld\n"
 		"busy %d\n"
 		"autocontinue %d\n"
+		"maxrounds %d\n"
 		"thinking %s\n"
 		"provider %s\n"
 		"baseurl %s\n"
@@ -1046,6 +1049,7 @@ rdctl(Session *s)
 		nbytes,
 		s->busy,
 		s->autocont,
+		s->conv->maxrounds > 0 ? s->conv->maxrounds : Defmaxrounds,
 		think,
 		providername(s->conv->prov),
 		s->conv->baseurl != nil ? s->conv->baseurl : "-",
@@ -1797,6 +1801,23 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		s->autocont = n;
 	} else if(strcmp(cmd, "noautocontinue") == 0){
 		s->autocont = 0;
+	} else if(strncmp(cmd, "maxrounds", 9) == 0
+	&& (cmd[9] == '\0' || cmd[9] == ' ')){
+		/*
+		 * Per-prompt tool-loop round cap (claudeconverse's
+		 * bound).  "maxrounds" alone restores the default.  A
+		 * round in flight keeps the cap it started with; the
+		 * new value applies from the next prompt.
+		 */
+		char *v;
+		int n;
+		v = cmd + 9;
+		while(*v == ' ') v++;
+		if(*v == '\0')
+			n = 0;	/* Defmaxrounds */
+		else if(!strictint(v, &n) || n < 1)
+			return "maxrounds: count must be a positive integer";
+		s->conv->maxrounds = n;
 	} else
 		return "unknown ctl command";
 	return nil;
@@ -1876,11 +1897,16 @@ doprompt(Req *r, Session *s, char *data)
 		 *    conversation is well-formed and "Continue." picks
 		 *    up where the cut fell.  err is nil here.
 		 *
-		 * 2. tool loop limit: the per-prompt round cap (20) was
-		 *    hit while the model was still calling tools.  This
-		 *    sets err to the recoverable "tool loop limit
-		 *    reached" string, but leaves the conversation
-		 *    well-formed and ending on a tool_results user turn.
+		 * 2. tool loop limit: the per-prompt round cap (ctl
+		 *    maxrounds, default Defmaxrounds) was hit while the
+		 *    model was still calling tools.  This sets err to
+		 *    the recoverable "tool loop limit reached" string,
+		 *    but leaves the conversation well-formed and ending
+		 *    on a tool_results user turn.  (The "tool/advisor"
+		 *    variant, emitted when the cap fell on an advisor
+		 *    pause, is deliberately not matched: that history
+		 *    ends on an assistant turn and cannot take a
+		 *    "Continue.")
 		 *    "Continue." (merged into that turn by buildreq)
 		 *    lets the model resume.  Clear err so the
 		 *    continuation round starts clean; if that round in
@@ -2076,7 +2102,7 @@ static void
 usage(void)
 {
 	fprint(2, "usage: %s [-K skillsdir] [-n namepath] [-s srvname] [-m mtpt] "
-		"[-M model] [-P provider] [-t maxtokens]\n", argv0);
+		"[-M model] [-P provider] [-t maxtokens] [-r maxrounds]\n", argv0);
 	threadexitsall("usage");
 }
 
@@ -2111,6 +2137,11 @@ threadmain(int argc, char **argv)
 	case 't':
 		arg = EARGF(usage());
 		if(!strictint(arg, &defmaxtokens) || defmaxtokens <= 0)
+			usage();
+		break;
+	case 'r':
+		arg = EARGF(usage());
+		if(!strictint(arg, &defmaxrounds) || defmaxrounds <= 0)
 			usage();
 		break;
 	default:

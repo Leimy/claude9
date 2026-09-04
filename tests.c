@@ -550,9 +550,28 @@ terrs(void)
 	ok(!overlimiterr("API error: overloaded"), "overlimiterr non-match");
 	ok(!overlimiterr(nil), "overlimiterr nil");
 	ok(toollimiterr("tool loop limit reached (20 rounds)"), "toollimiterr matches");
+	ok(toollimiterr("tool loop limit reached (60 rounds)"), "toollimiterr matches any cap");
 	ok(!toollimiterr("tool/advisor loop limit reached (20 rounds)"), "advisor cap is not auto-continuable");
 	ok(!toollimiterr("some other error"), "toollimiterr non-match");
 	ok(!toollimiterr(nil), "toollimiterr nil");
+	/*
+	 * The two wordings must stay distinguishable AND the plain
+	 * one must be what claudeconverse emits for an ordinary
+	 * capped tool loop -- an earlier revision emitted the
+	 * advisor wording unconditionally, so toollimiterr never
+	 * matched and auto-continue was silently dead.  Reproduce
+	 * both esmprint formats here so a wording edit in
+	 * claudeconverse that breaks the match fails this test.
+	 */
+	{
+		char *plain, *advisor;
+		plain = esmprint("tool loop limit reached (%d rounds)", Defmaxrounds);
+		advisor = esmprint("tool/advisor loop limit reached (%d rounds)", Defmaxrounds);
+		ok(toollimiterr(plain), "plain cap wording is auto-continuable");
+		ok(!toollimiterr(advisor), "advisor cap wording is not");
+		free(plain);
+		free(advisor);
+	}
 }
 
 /* --- claude.c: bounded model-facing file reads --- */
