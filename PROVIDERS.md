@@ -29,16 +29,32 @@ reasoning_effort:"none" to override the server-side default.
 Now implemented as a monotonic quirk ladder (Conv.reasonquirk:
 Reffort -> Romit -> Rnone -> Rdead), with sendonce allowing up
 to Maxquirks retries per round so the ladder can climb within
-a single prompt.  Tools stay in the request throughout (tools
-are load-bearing for this program; reasoning_effort is a
+a single prompt.  Astra models that reject "none" while listing
+"low" and "medium" were at first simply not retried: the
+preceding error says function tools cannot be combined with any
+reasoning_effort, so such a retry would be contradictory.  But
+that left gpt-6-astra with NO Chat Completions request that
+works (fifth live test), and the full first error had the answer
+all along -- "To use function tools, use /v1/responses or set
+reasoning_effort to 'none'" -- so the fix is a third provider,
+"responses" (responses.c), speaking the OpenAI Responses API, and
+openaiquirk now moves a session there (switchresponses) either as
+soon as the error names /v1/responses or when "none" fails; see
+"The Responses API" below.  Tools stay in the request throughout
+(tools are load-bearing for this program; reasoning_effort is a
 nice-to-have).  Regression tests: topenaiquirkreasoning
-(Thinkadaptive start, full ladder) and
-topenaiquirkreasoningoff (Thinkoff start, the live case,
-skips straight to "none").  README now documents providers,
-keys, provider/baseurl files, and claudetalk controls.  Still not
-done: live confirmation that "none" satisfies the gpt-5.6-sol
-endpoint, more live testing (tool rounds against real OpenAI and
-a compat server), and the gaps below.
+(Thinkadaptive start, full ladder ending in the switch, plus the
+refused-switch case), topenaiquirkreasoningoff (Thinkoff start,
+skips straight to "none", then the gpt-6-astra rejection of
+"none" switches), tswitchresponses (direct switch on the live
+wording, baseurl rewrite), tresponsesbuildreq/tresponsesstream/
+tresponsesquirk (the new provider), tstripforeign (anthropic
+side).  README now documents providers, keys, provider/baseurl
+files, and claudetalk controls.  Still not done: a live run of
+the responses provider against gpt-6-astra (the canned tests are
+built from the documented event shapes, not a captured
+transcript), more live testing (tool rounds against real OpenAI
+and a compat server), and the gaps below.
 Also fixed since: claudetalk's `/models` command used to dump the
 root `models` file unfiltered, which lists every provider with a
 configured key -- confusing once a session has actually picked a
@@ -84,10 +100,9 @@ local models to low-stakes, easily-verified tasks; tool-calling
 reliability varies a lot by local model and tools are load-
 bearing for this program).
 
-Last updated: after claudetalk /models provider-scoping and the
-README "independent knobs" clarification, plus the openai
-keyless-provider change for local/self-hosted (e.g. Ollama)
-servers.
+Last updated: after the gpt-6-astra live test added the
+"responses" provider (OpenAI Responses API) and the automatic
+Chat Completions -> Responses switch in openaiquirk.
 
 ## The reasoning_effort saga: server-side default reasoning
 
@@ -154,8 +169,145 @@ of burning one user prompt per rung.  Regression tests:
 topenaiquirkreasoning (Thinkadaptive start, walks the whole
 ladder) and topenaiquirkreasoningoff (Thinkoff start, skips
 straight to Rnone and asserts the retried request actually
-differs).  Still needs a live test to confirm the gpt-5.6-sol
-endpoint accepts "none".
+differs).
+
+## The Responses API: when no reasoning_effort works
+
+Fifth live test, from /dev/snarf, model gpt-6-astra:
+
+    openai!gpt-6-astra/16384> Hello
+    claude: openai: retrying after request-shape error: API error:
+    Function tools with reasoning_effort are not supported for
+    gpt-6-astra in /v1/chat/completions. To use function tool[s, ...]
+
+    [error: API error: Unsupported value: 'reasoning_effort' does
+    not support 'none' with this model. Supported values are:
+    'low', 'medium']
+
+The ladder did what it was designed to do -- Thinkoff start, so
+straight to Rnone -- and the server rejected "none" as not a
+value this model has.  The only other values, low and medium,
+are reasoning efforts, which the first error says cannot be
+combined with function tools.  So there is no Chat Completions
+request shape for this model at all; attempt 4 (the ladder) was
+correct but incomplete, and "retry with low" would have been
+wrong twice over.
+
+The full text of the first error, which the snarf truncated,
+names the way out: "To use function tools, use /v1/responses or
+set reasoning_effort to 'none'."  This is a deliberate OpenAI
+policy change starting around gpt-5.4 (public reports on the
+OpenAI developer forum and in LibreChat/Drupal/JetBrains issue
+trackers match the wording exactly): tool use on reasoning
+models is being steered onto the Responses API.  Hence the
+original "Chat Completions, not the Responses API" decision in
+the Goal section below no longer holds for these models, and
+the fix is a third provider rather than a fourth quirk rung.
+
+### responses.c, as built
+
+  Provider entry   name "responses", apiurl
+                   https://api.openai.com/v1/responses, no
+                   modelsurl (providerhasmodels() == 0: the
+                   openai entry already lists the same ids;
+                   claude9fs's modelstext skips it), headers
+                   shared with openai (openaiheaders; same key:
+                   provkey maps both names to $OPENAI_API_KEY).
+  responsesbuildreq
+                   model, max_output_tokens, instructions (the
+                   system prompt), store:false +
+                   include:["reasoning.encrypted_content"],
+                   reasoning:{effort, summary:"auto"} iff
+                   Conv.effort is set (no summary with "none"),
+                   input:[items] from the neutral history, tools
+                   as flat {type:function, name, description,
+                   parameters}.  Items: user text -> {role:user,
+                   content}; tool_result -> {type:
+                   function_call_output, call_id, output};
+                   assistant text -> {type:message, id,
+                   role:assistant, content:[{type:output_text,
+                   text, annotations:[]}]}; tool_use ->
+                   {type:function_call, id, call_id, name,
+                   arguments:"<json string>"}; reasoning block ->
+                   the stored reasoning item verbatim.
+  responsesreadstream
+                   SSE "data:" lines, dispatched on the JSON
+                   "type".  Streams response.output_text.delta
+                   to cb, and response.reasoning_summary_text.
+                   delta between [thinking] markers.  Collects
+                   complete items from response.output_item.done
+                   and prefers the terminal event's
+                   response.output when non-empty; usage from
+                   response.completed/incomplete (input_tokens,
+                   output_tokens, input_tokens_details.
+                   cached_tokens).  response.failed and error
+                   events fail the round; a stream with no
+                   terminal event is "ended unexpectedly", as
+                   with the other providers.  Stop reason:
+                   incomplete/max_output_tokens -> max_tokens;
+                   any function_call -> tool_use; else end_turn.
+  responsesquirk   three latching bits in Conv.respquirks, for
+                   compatible servers that implement only the
+                   core: Rqnoinclude (store/include rejected),
+                   Rqnosummary (reasoning.summary rejected),
+                   Rqnoreasonitems (server cannot pair replayed
+                   reasoning items with their following items,
+                   or refuses them: replay neither the items nor
+                   any item ids; the model re-reasons after each
+                   tool result).  claude9fs's resetquirks clears
+                   them on provider/model/baseurl change.
+
+### The neutral form grew two things
+
+Responses reasoning models bind each reasoning item to the
+item(s) that followed it in the same turn, and with store:false
+the client must hand the whole turn back -- reasoning item
+(encrypted), message, function_call -- with the server's own ids
+for the server to accept the function_call_output that follows.
+So responsesreadstream stores:
+
+  - a "reasoning" block: the Responses reasoning item verbatim
+    (id, summary, encrypted_content), the Responses counterpart
+    of Anthropic's signed thinking blocks;
+  - an "item_id" field on the text and tool_use blocks it
+    produces (msg_..., fc_...), alongside the neutral "id" of a
+    tool_use, which stays the call_id that tool results name.
+
+Other providers' builders must not send these.  openaibuildreq
+already ignored unknown block types and fields; anthropicbuildreq
+now runs stripforeign() over the neutral messages (drop reasoning
+blocks, jdel item_id, placeholder if a turn empties), the mirror
+of the two OpenAI builders skipping thinking blocks.  json.c
+gained jdel() and jcopy() for this.
+
+### The switch itself
+
+switchresponses() in openai.c: providerlookup("responses"),
+rewrite a Conv.baseurl ending in "/chat/completions" to
+".../responses" (the sibling path on OpenAI and on gateways that
+implement both), refuse any other baseurl (guessing would turn
+a clear server message into a 404), set Conv.prov, reset both
+providers' quirk state.  openaiquirk calls it first when the
+reasoning_effort complaint mentions "/v1/responses" -- one
+retry, straight to the right endpoint, reasoning kept -- and
+otherwise as the Rnone rung's last move before Rdead.
+sendonce() had to change too: it cached the Provider* before the
+retry loop, so after a switch it would have rebuilt the request
+with the OLD provider's buildreq and consulted the old quirk
+hook; it now re-resolves provof(c) on every attempt and logs a
+"switching to responses" line instead of "retrying" when the
+provider changed.  The switch is one-way: nothing moves a Conv
+back to Chat Completions, because the model that forced the move
+would force it again.  The session's provider file reads
+"responses" afterward; that is honest, not a bug.
+
+Caveat, stated plainly: the responses provider has not yet been
+run live.  The request and event shapes come from the API's
+documentation and public examples, and the quirk hook exists
+precisely because some detail (which parameters a given gateway
+accepts, whether a given model wants the reasoning items
+replayed) may differ in the field.  The first live run should
+be watched with claude9fs's stderr visible.
 
 Also fixed in claudetalk: the note-kill path taken when a
 prompt write fails before a round starts (see doprompt's
@@ -184,6 +336,10 @@ buys compatibility with lots of servers, not just OpenAI.
 
 Decision: support BOTH providers in one binary (not a hard
 swap).  Chat Completions, not the OpenAI Responses API.
+(Superseded in part: OpenAI's newer reasoning models refuse
+function tools on Chat Completions, so a third, "responses"
+provider was added later -- see "The Responses API" above.
+Chat Completions remains the compat-server format.)
 
 ## Where the provider-specific code lives today
 
@@ -450,8 +606,13 @@ File layout after the fan-out:
   claude.c      engine + anthropic provider (unchanged logic);
                 providers[] table has both entries; sendonce
                 honors Conv.baseurl over the provider default.
+  responses.c   OpenAI Responses API provider: responsesbuildreq,
+                responsesreadstream, responsesquirk (auth via
+                openaiheaders).  Added after the gpt-6-astra live
+                test; see "The Responses API" above.
   openai.c      chat-completions provider: openaiheaders,
-                openaibuildreq, openaireadstream, openaiquirk.
+                openaibuildreq, openaireadstream, openaiquirk,
+                switchresponses.
                 Neutral rawjson in and out.  Output cap is
                 max_completion_tokens by default (real OpenAI
                 rejects max_tokens on reasoning-era models);
@@ -496,12 +657,15 @@ Anthropic-only blocks and never advertises Advisor.
 
 ## Known gaps / next steps
 
-- No live test against openai.com itself or llama.cpp yet; the
-  two live quirks found so far (max_tokens naming,
-  reasoning_effort+tools) both came from a different
-  openai-compatible endpoint.  The SSE parser follows the spec;
-  reality may differ in small ways (e.g. servers that omit
-  usage, or send roles in deltas).
+- No live test against openai.com itself or llama.cpp yet.  Astra-style
+  compatible endpoints are now handled more conservatively: if they reject
+  the optional `stream_options` extension, the request is retried without it
+  and later rounds remember that shape; streamed reasoning is accepted under
+  either `delta.reasoning_content` or `delta.reasoning` and is displayed but
+  not replayed.  The reasoning_effort+tools fallback remains bounded and
+  tools-first.  These paths have canned regression coverage and compile
+  cleanly, but still need a live Astra confirmation.  Other reality may differ
+  in small ways (e.g. servers that omit usage, or send roles in deltas).
 - RESOLVED: request-shape quirks are reset when provider, model,
   or base URL changes, so learned state does not leak to a new
   endpoint configuration.  Whether an

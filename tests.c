@@ -1001,6 +1001,14 @@ topenaibuildreq(void)
 			"openai: include_usage true");
 	}
 
+	/* compatible servers may reject the optional stream_options extension */
+	c->nostreamopts = 1;
+	jsonfree(req);
+	req = openaibuildreq(c);
+	ok(jget(req, "stream_options") == nil,
+		"openai: stream_options omitted after compatibility quirk");
+	c->nostreamopts = 0;
+
 	/* reasoning_effort absent when thinkmode == Thinkoff */
 	ok(c->thinkmode == Thinkoff, "openai: default thinkmode is Thinkoff");
 	ok(jget(req, "reasoning_effort") == nil, "openai: reasoning_effort absent when Thinkoff");
@@ -1176,7 +1184,7 @@ topenaibuildreq(void)
 		jsonfree(req);
 	}
 
-	/* reasoning_effort present only in Thinkadaptive mode */
+	/* explicit effort maps to OpenAI reasoning_effort */
 	convclear(c);
 	convappend(c, msgnew(Muser, "hi", nil));
 	c->thinkmode = Thinkadaptive;
@@ -1191,17 +1199,19 @@ topenaibuildreq(void)
 		jsonfree(req);
 	}
 
-	/* back to Thinkoff -> reasoning_effort absent */
+	/* Thinkoff does not discard an explicitly configured effort. */
 	c->thinkmode = Thinkoff;
 	convclear(c);
 	convappend(c, msgnew(Muser, "hi", nil));
 	req = openaibuildreq(c);
 	ok(req != nil, "openai: thinkoff buildreq non-nil");
 	if(req != nil){
-		ok(jget(req, "reasoning_effort") == nil,
-			"openai: reasoning_effort absent after Thinkoff");
+		okstr(jstr(req, "reasoning_effort"), "high",
+			"openai: explicit effort remains after Thinkoff");
 		jsonfree(req);
 	}
+	free(c->effort);
+	c->effort = nil;
 
 	convfree(c);
 }
@@ -1224,6 +1234,19 @@ topenaiquirk(void)
 	ok(!openaiquirk(c, "API error: max_completion_tokens is too large"),
 		"quirk: value complaint ignored");
 	ok(c->oldmaxtok == 0, "quirk: flag untouched by non-matches");
+
+	/* Astra/compat server rejecting optional stream_options */
+	ok(openaiquirk(c,
+		"API error: Unrecognized request argument supplied: stream_options"),
+		"quirk: unrecognized stream_options retries without it");
+	ok(c->nostreamopts == 1, "quirk: nostreamopts set");
+	req = openaibuildreq(c);
+	ok(jget(req, "stream_options") == nil,
+		"quirk: stream_options absent after rejection");
+	jsonfree(req);
+	ok(!openaiquirk(c,
+		"API error: Unrecognized request argument supplied: stream_options"),
+		"quirk: stream_options fallback only retries once");
 
 	/* old compat server rejecting the modern field name */
 	ok(openaiquirk(c,
@@ -1312,10 +1335,40 @@ topenaiquirkreasoning(void)
 		"quirk reasoning: tools still present in Rnone");
 	jsonfree(req);
 
-	/* rung 3: even "none" rejected -> dead, no retry, field gone */
+	/*
+	 * rung 3: even "none" rejected -> no Chat Completions shape
+	 * works; move the conversation to the Responses API, which
+	 * takes tools and reasoning together.
+	 */
+	ok(openaiquirk(c, liveerr),
+		"quirk reasoning: third error retries on the responses provider");
+	ok(c->prov == providerlookup("responses"),
+		"quirk reasoning: provider switched to responses");
+	ok(c->baseurl == nil, "quirk reasoning: no baseurl invented");
+	ok(c->reasonquirk == Reffort && c->respquirks == 0,
+		"quirk reasoning: quirk state reset for the new endpoint");
+
+	/*
+	 * Same ladder, but on a session whose baseurl cannot be
+	 * rewritten: the switch is refused, the ladder dies, and the
+	 * error surfaces.
+	 */
+	convfree(c);
+	c = convnew("key", "gpt-5.6-sol", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->baseurl = estrdup("http://gateway.example/v1/weird-endpoint");
+	c->thinkmode = Thinkadaptive;
+	c->effort = estrdup("medium");
+	convappend(c, msgnew(Muser, "hi", nil));
+	ok(openaiquirk(c, liveerr), "quirk reasoning (odd baseurl): rung 1");
+	ok(openaiquirk(c, liveerr), "quirk reasoning (odd baseurl): rung 2");
 	ok(!openaiquirk(c, liveerr),
-		"quirk reasoning: third error gives up (no retry)");
-	ok(c->reasonquirk == Rdead, "quirk reasoning: state Rdead");
+		"quirk reasoning (odd baseurl): third error gives up (no retry)");
+	ok(c->reasonquirk == Rdead, "quirk reasoning (odd baseurl): state Rdead");
+	ok(c->prov == providerlookup("openai"),
+		"quirk reasoning (odd baseurl): provider unchanged");
+	okstr(c->baseurl, "http://gateway.example/v1/weird-endpoint",
+		"quirk reasoning (odd baseurl): baseurl unchanged");
 	req = openaibuildreq(c);
 	ok(jget(req, "reasoning_effort") == nil,
 		"quirk reasoning: field suppressed in Rdead");
@@ -1376,16 +1429,552 @@ topenaiquirkreasoningoff(void)
 		"quirk reasoning off: tools still present");
 	jsonfree(req);
 
-	/* if "none" is rejected too, give up rather than loop */
-	ok(!openaiquirk(c, liveerr),
-		"quirk reasoning off: second error gives up");
-	ok(c->reasonquirk == Rdead, "quirk reasoning off: state Rdead");
-	req = openaibuildreq(c);
-	ok(jget(req, "reasoning_effort") == nil,
-		"quirk reasoning off: field suppressed in Rdead");
+	/*
+	 * gpt-6-astra (live): "none" is not a valid value at all,
+	 * and low/medium would repeat the tools+reasoning conflict.
+	 * No Chat Completions request can satisfy this model, so
+	 * the retry has to be on the Responses API instead.
+	 */
+	ok(openaiquirk(c,
+		"API error: Unsupported value: 'reasoning_effort' does not support "
+		"'none' with this model. Supported values are: 'low', 'medium'"),
+		"quirk reasoning off: unsupported none retries on responses");
+	ok(c->prov == providerlookup("responses"),
+		"quirk reasoning off: provider switched to responses");
+	req = responsesbuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil && jget(req, "reasoning") == nil,
+		"quirk reasoning off: responses request carries no reasoning field");
+	ok(jget(req, "tools") != nil, "quirk reasoning off: tools still present");
 	jsonfree(req);
 
 	convfree(c);
+}
+
+/*
+ * --- openai.c: the live gpt-6-astra wording names /v1/responses
+ * outright.  That is taken up immediately -- one retry, on the
+ * right endpoint, with reasoning kept -- instead of burning
+ * rungs on "none".  A Chat Completions baseurl override is
+ * rewritten to its Responses sibling; any other override
+ * refuses the switch and falls back to the ladder.
+ */
+static void
+tswitchresponses(void)
+{
+	Conv *c;
+	char *astraerr;
+	int resp;
+
+	astraerr =
+		"API error: Function tools with reasoning_effort are not "
+		"supported for gpt-6-astra in /v1/chat/completions. To use "
+		"function tools, use /v1/responses or set reasoning_effort "
+		"to 'none'.";
+	resp = providerlookup("responses");
+	ok(resp >= 0, "switch: responses provider exists");
+	ok(!providerhasmodels(resp), "switch: responses lists no models of its own");
+	ok(providerhasmodels(providerlookup("openai")), "switch: openai lists models");
+
+	/* default endpoint: switch on the first complaint */
+	c = convnew("key", "gpt-6-astra", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->effort = estrdup("medium");
+	convappend(c, msgnew(Muser, "hi", nil));
+	ok(openaiquirk(c, astraerr), "switch: astra wording requests retry");
+	ok(c->prov == resp, "switch: provider is responses");
+	okstr(c->effort, "medium", "switch: effort preserved for the new provider");
+	ok(!switchresponses(c), "switch: already on responses -> no second switch");
+	/* sendonce now consults the responses hook, which ignores this wording */
+	ok(!responsesquirk(c, astraerr), "switch: responses quirk ignores the chat error");
+	ok(c->respquirks == 0, "switch: responses quirk state untouched");
+	convfree(c);
+
+	/* chat/completions baseurl is rewritten to /responses */
+	c = convnew("key", "gpt-6-astra", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->baseurl = estrdup("https://astra.example/v1/chat/completions");
+	convappend(c, msgnew(Muser, "hi", nil));
+	ok(openaiquirk(c, astraerr), "switch (baseurl): retry requested");
+	ok(c->prov == resp, "switch (baseurl): provider is responses");
+	okstr(c->baseurl, "https://astra.example/v1/responses",
+		"switch (baseurl): endpoint rewritten");
+	convfree(c);
+
+	/* unrecognizable baseurl: no switch, ladder instead */
+	c = convnew("key", "gpt-6-astra", 1234, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->baseurl = estrdup("https://astra.example/api/chat");
+	convappend(c, msgnew(Muser, "hi", nil));
+	ok(openaiquirk(c, astraerr), "switch (odd baseurl): ladder still retries");
+	ok(c->prov == providerlookup("openai"), "switch (odd baseurl): provider unchanged");
+	ok(c->reasonquirk == Rnone, "switch (odd baseurl): ladder advanced to Rnone");
+	okstr(c->baseurl, "https://astra.example/api/chat",
+		"switch (odd baseurl): baseurl untouched");
+	convfree(c);
+
+	/* direct switchresponses on a Conv already there is a no-op */
+	c = convnew("key", "gpt-6-astra", 1234, "sys", nil);
+	c->prov = resp;
+	ok(!switchresponses(c), "switch: no-op when already on responses");
+	convfree(c);
+}
+
+/* --- responses.c: request assembly --- */
+
+static void
+tresponsesbuildreq(void)
+{
+	Conv *c;
+	Json *req, *input, *item, *tools, *t, *inc, *reason, *parts, *st;
+	int i, nfc, nfco, nreason, nmsg;
+
+	c = convnew("key", "gpt-6-astra", 2048, "be terse", nil);
+	c->prov = providerlookup("responses");
+	convappend(c, msgnew(Muser, "hello", nil));
+	req = responsesbuildreq(c);
+	ok(req != nil, "responses: buildreq non-nil");
+	if(req == nil){
+		convfree(c);
+		return;
+	}
+	okstr(jstr(req, "model"), "gpt-6-astra", "responses: model");
+	ok(jint(req, "max_output_tokens") == 2048, "responses: max_output_tokens");
+	ok(jget(req, "max_completion_tokens") == nil && jget(req, "max_tokens") == nil,
+		"responses: no chat-completions token field");
+	okstr(jstr(req, "instructions"), "be terse", "responses: system prompt as instructions");
+	st = jget(req, "store");
+	ok(st != nil && st->type == Jbool && st->ival == 0, "responses: store false");
+	inc = jget(req, "include");
+	ok(inc != nil && inc->type == Jarray && inc->nitem == 1
+		&& strcmp(jidx(inc, 0)->str, "reasoning.encrypted_content") == 0,
+		"responses: include encrypted reasoning");
+	ok(jget(req, "reasoning") == nil, "responses: no reasoning object without effort");
+	ok(jget(req, "reasoning_effort") == nil, "responses: no chat-style reasoning_effort");
+	ok(jget(req, "stream_options") == nil, "responses: no stream_options");
+
+	input = jget(req, "input");
+	ok(input != nil && input->type == Jarray && input->nitem == 1,
+		"responses: one input item for one user message");
+	item = jidx(input, 0);
+	okstr(jstr(item, "role"), "user", "responses: user item role");
+	okstr(jstr(item, "content"), "hello", "responses: user item content");
+
+	tools = jget(req, "tools");
+	ok(tools != nil && tools->nitem == 9, "responses: 9 tools");
+	if(tools != nil && tools->nitem > 0){
+		t = jidx(tools, 0);
+		okstr(jstr(t, "type"), "function", "responses: tool type");
+		okstr(jstr(t, "name"), "create_file", "responses: tool name is top-level");
+		ok(jget(t, "function") == nil, "responses: tool not nested under function");
+		ok(jget(t, "parameters") != nil, "responses: tool parameters present");
+	}
+	jsonfree(req);
+
+	/* effort -> reasoning {effort, summary} */
+	c->effort = estrdup("medium");
+	req = responsesbuildreq(c);
+	reason = jget(req, "reasoning");
+	ok(reason != nil, "responses: reasoning object with effort");
+	okstr(jstr(reason, "effort"), "medium", "responses: reasoning.effort");
+	okstr(jstr(reason, "summary"), "auto", "responses: reasoning.summary auto");
+	jsonfree(req);
+	c->respquirks |= Rqnosummary;
+	req = responsesbuildreq(c);
+	ok(jget(jget(req, "reasoning"), "summary") == nil,
+		"responses: summary omitted after quirk");
+	jsonfree(req);
+	c->respquirks = 0;
+	free(c->effort);
+	c->effort = estrdup("none");
+	req = responsesbuildreq(c);
+	okstr(jstr(jget(req, "reasoning"), "effort"), "none", "responses: effort none passed through");
+	ok(jget(jget(req, "reasoning"), "summary") == nil,
+		"responses: no summary with effort none");
+	jsonfree(req);
+	free(c->effort);
+	c->effort = nil;
+
+	/*
+	 * A full tool round as stored by responsesreadstream:
+	 * reasoning item, text with item_id, function_call with
+	 * item_id, then the tool result and a follow-up prompt.
+	 */
+	convclear(c);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "Looking.",
+		"[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],"
+		"\"encrypted_content\":\"opaque\"},"
+		"{\"type\":\"text\",\"text\":\"Looking.\",\"item_id\":\"msg_1\"},"
+		"{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"read_file\","
+		"\"input\":{\"path\":\"/tmp/f\"},\"item_id\":\"fc_1\"}]"));
+	convappend(c, msgnew(Muser, "",
+		"[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\","
+		"\"content\":\"contents\"}]"));
+	convappend(c, msgnew(Muser, "thanks", nil));
+	req = responsesbuildreq(c);
+	input = jget(req, "input");
+	ok(input != nil && input->nitem == 6, "responses: replay item count");
+	if(input != nil && input->nitem == 6){
+		okstr(jstr(jidx(input, 0), "role"), "user", "responses: replay[0] user");
+		item = jidx(input, 1);
+		okstr(jstr(item, "type"), "reasoning", "responses: replay[1] reasoning");
+		okstr(jstr(item, "id"), "rs_1", "responses: reasoning id kept");
+		okstr(jstr(item, "encrypted_content"), "opaque", "responses: encrypted content kept");
+		item = jidx(input, 2);
+		okstr(jstr(item, "type"), "message", "responses: replay[2] message");
+		okstr(jstr(item, "role"), "assistant", "responses: assistant message role");
+		okstr(jstr(item, "id"), "msg_1", "responses: message item id replayed");
+		parts = jget(item, "content");
+		ok(parts != nil && parts->nitem == 1, "responses: one content part");
+		okstr(jstr(jidx(parts, 0), "type"), "output_text", "responses: output_text part");
+		okstr(jstr(jidx(parts, 0), "text"), "Looking.", "responses: part text");
+		item = jidx(input, 3);
+		okstr(jstr(item, "type"), "function_call", "responses: replay[3] function_call");
+		okstr(jstr(item, "id"), "fc_1", "responses: function_call item id");
+		okstr(jstr(item, "call_id"), "call_1", "responses: function_call call_id");
+		okstr(jstr(item, "name"), "read_file", "responses: function_call name");
+		{
+			Json *args;
+			args = jsonparse(jstr(item, "arguments") ? jstr(item, "arguments") : "");
+			ok(args != nil && args->type == Jobject, "responses: arguments is a JSON string");
+			okstr(jstr(args, "path"), "/tmp/f", "responses: arguments content");
+			jsonfree(args);
+		}
+		item = jidx(input, 4);
+		okstr(jstr(item, "type"), "function_call_output", "responses: replay[4] output");
+		okstr(jstr(item, "call_id"), "call_1", "responses: output call_id");
+		okstr(jstr(item, "output"), "contents", "responses: output text");
+		item = jidx(input, 5);
+		okstr(jstr(item, "role"), "user", "responses: replay[5] follow-up user");
+		okstr(jstr(item, "content"), "thanks", "responses: follow-up text");
+	}
+	jsonfree(req);
+
+	/* Rqnoreasonitems drops reasoning items and every item id */
+	c->respquirks |= Rqnoreasonitems;
+	req = responsesbuildreq(c);
+	input = jget(req, "input");
+	nfc = nfco = nreason = nmsg = 0;
+	for(i = 0; input != nil && i < input->nitem; i++){
+		char *ty;
+		item = jidx(input, i);
+		ty = jstr(item, "type");
+		if(ty == nil) continue;
+		if(strcmp(ty, "reasoning") == 0) nreason++;
+		if(strcmp(ty, "function_call") == 0){ nfc++; ok(jget(item, "id") == nil, "responses: fc id dropped"); }
+		if(strcmp(ty, "function_call_output") == 0) nfco++;
+		if(strcmp(ty, "message") == 0){ nmsg++; ok(jget(item, "id") == nil, "responses: msg id dropped"); }
+	}
+	ok(nreason == 0 && nfc == 1 && nfco == 1 && nmsg == 1,
+		"responses: no reasoning items after quirk, rest intact");
+	ok(input != nil && input->nitem == 5, "responses: item count after quirk");
+	jsonfree(req);
+	c->respquirks = 0;
+
+	/* Rqnoinclude drops store/include */
+	c->respquirks |= Rqnoinclude;
+	req = responsesbuildreq(c);
+	ok(jget(req, "store") == nil && jget(req, "include") == nil,
+		"responses: store/include omitted after quirk");
+	jsonfree(req);
+	c->respquirks = 0;
+
+	/* anthropic-only blocks are skipped, not sent */
+	convclear(c);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "a",
+		"[{\"type\":\"thinking\",\"thinking\":\"hmm\",\"signature\":\"sig\"},"
+		"{\"type\":\"text\",\"text\":\"a\"}]"));
+	req = responsesbuildreq(c);
+	input = jget(req, "input");
+	ok(input != nil && input->nitem == 2, "responses: thinking block skipped");
+	jsonfree(req);
+
+	convfree(c);
+}
+
+/* --- responses.c: quirk hook --- */
+
+static void
+tresponsesquirk(void)
+{
+	Conv *c;
+
+	c = convnew("key", "gpt-6-astra", 1234, "sys", nil);
+	c->prov = providerlookup("responses");
+
+	ok(!responsesquirk(c, nil), "responses quirk: nil ignored");
+	ok(!responsesquirk(c, "API error: overloaded"), "responses quirk: unrelated ignored");
+	ok(!responsesquirk(c,
+		"API error: Unsupported parameter: 'reasoning.effort' is not supported with this model"),
+		"responses quirk: effort rejection surfaces (user setting)");
+	ok(c->respquirks == 0, "responses quirk: state untouched by non-matches");
+
+	ok(responsesquirk(c, "API error: Unknown parameter: 'include'."),
+		"responses quirk: unknown include retries");
+	ok(c->respquirks & Rqnoinclude, "responses quirk: Rqnoinclude set");
+	ok(!responsesquirk(c, "API error: Unknown parameter: 'include'."),
+		"responses quirk: include only retried once");
+
+	ok(responsesquirk(c,
+		"API error: Unsupported parameter: 'reasoning.summary' is not supported with this model."),
+		"responses quirk: summary rejection retries");
+	ok(c->respquirks & Rqnosummary, "responses quirk: Rqnosummary set");
+
+	ok(responsesquirk(c,
+		"API error: Item 'rs_abc' of type 'reasoning' was provided without its required following item."),
+		"responses quirk: unpaired reasoning item retries");
+	ok(c->respquirks & Rqnoreasonitems, "responses quirk: Rqnoreasonitems set");
+	ok(!responsesquirk(c,
+		"API error: Item 'fc_abc' of type 'function_call' was provided without its required 'reasoning' item: 'rs_abc'."),
+		"responses quirk: reasoning-item errors are terminal once stripped");
+
+	convfree(c);
+}
+
+/* --- responses.c: stream parsing --- */
+
+static void
+tresponsesstream(void)
+{
+	char *path, *sse;
+	Biobuf *bp;
+	Usage u;
+	Reply *r;
+	Json *raw, *b;
+	ToolCall *tc;
+
+	/*
+	 * A reasoning model's tool round: reasoning item (with an
+	 * encrypted body and a streamed summary), a text message,
+	 * a function call with its arguments streamed in pieces,
+	 * then response.completed carrying the full output array
+	 * and usage.
+	 */
+	sse =
+		"event: response.created\n"
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n"
+		"\n"
+		"data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"Need the file.\"}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need the file.\"}],\"encrypted_content\":\"opaque\"}}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n"
+		"\n"
+		"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"Let me \"}\n"
+		"\n"
+		"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"look.\"}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Let me look.\",\"annotations\":[]}]}}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n"
+		"\n"
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"pa\"}\n"
+		"\n"
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"th\\\": \\\"/tmp/x\\\"}\"}\n"
+		"\n"
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"/tmp/x\\\"}\"}}\n"
+		"\n"
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\","
+		"\"output\":["
+		"{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need the file.\"}],\"encrypted_content\":\"opaque\"},"
+		"{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Let me look.\",\"annotations\":[]}]},"
+		"{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"/tmp/x\\\"}\"}"
+		"],"
+		"\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":15}}}\n"
+		"\n";
+
+	path = writetmpsse(sse);
+	ok(path != nil, "responses stream: temp file");
+	if(path == nil)
+		return;
+	bp = Bopen(path, OREAD);
+	memset(&u, 0, sizeof u);
+	r = responsesreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+
+	ok(r != nil, "responses stream: parsed");
+	if(r == nil)
+		return;
+	okstr(r->text, "Let me look.", "responses stream: text");
+	okstr(u.stop_reason, "tool_use", "responses stream: stop_reason tool_use");
+	ok(r->stopped == 0, "responses stream: stopped==0 with a function call");
+	ok(u.input_tokens == 10 && u.output_tokens == 5 && u.cache_read_input_tokens == 3,
+		"responses stream: usage mapped");
+
+	tc = r->tools;
+	ok(tc != nil, "responses stream: tool call present");
+	if(tc != nil){
+		okstr(tc->id, "call_1", "responses stream: tool call id is call_id");
+		okstr(tc->name, "read_file", "responses stream: tool name");
+		okstr(tc->args[0], "/tmp/x", "responses stream: tool arg parsed");
+		ok(tc->next == nil, "responses stream: exactly one tool call");
+	}
+
+	raw = jsonparse(r->rawjson);
+	ok(raw != nil && raw->type == Jarray && raw->nitem == 3, "responses stream: three neutral blocks");
+	if(raw != nil && raw->nitem == 3){
+		b = jidx(raw, 0);
+		okstr(jstr(b, "type"), "reasoning", "responses stream: block 0 reasoning");
+		okstr(jstr(b, "encrypted_content"), "opaque", "responses stream: reasoning kept verbatim");
+		b = jidx(raw, 1);
+		okstr(jstr(b, "type"), "text", "responses stream: block 1 text");
+		okstr(jstr(b, "text"), "Let me look.", "responses stream: text block text");
+		okstr(jstr(b, "item_id"), "msg_1", "responses stream: text block item_id");
+		b = jidx(raw, 2);
+		okstr(jstr(b, "type"), "tool_use", "responses stream: block 2 tool_use");
+		okstr(jstr(b, "id"), "call_1", "responses stream: tool_use id");
+		okstr(jstr(b, "item_id"), "fc_1", "responses stream: tool_use item_id");
+		okstr(jstr(jget(b, "input"), "path"), "/tmp/x", "responses stream: tool_use input");
+	}
+	jsonfree(raw);
+	replyfree(r);
+	free(u.stop_reason);
+	u.stop_reason = nil;
+
+	/* incomplete on max_output_tokens -> max_tokens; text only */
+	sse =
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Partial\"}]}}\n"
+		"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n";
+	path = writetmpsse(sse);
+	bp = Bopen(path, OREAD);
+	memset(&u, 0, sizeof u);
+	r = responsesreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	ok(r != nil, "responses stream: incomplete parsed");
+	if(r != nil){
+		okstr(r->text, "Partial", "responses stream: items kept when final output is empty");
+		okstr(u.stop_reason, "max_tokens", "responses stream: max_output_tokens -> max_tokens");
+		ok(r->stopped == 1, "responses stream: stopped on max_tokens");
+		ok(r->tools == nil, "responses stream: no tools");
+		replyfree(r);
+	}
+	free(u.stop_reason);
+	u.stop_reason = nil;
+
+	/* response.failed -> error */
+	sse = "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n";
+	path = writetmpsse(sse);
+	bp = Bopen(path, OREAD);
+	memset(&u, 0, sizeof u);
+	r = responsesreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	ok(r == nil, "responses stream: failed response returns nil");
+	{
+		char eb[ERRMAX];
+		rerrstr(eb, sizeof eb);
+		ok(strstr(eb, "boom") != nil, "responses stream: failure message in errstr");
+	}
+
+	/* error event -> error */
+	sse = "data: {\"type\":\"error\",\"code\":\"rate_limit\",\"message\":\"slow down\"}\n";
+	path = writetmpsse(sse);
+	bp = Bopen(path, OREAD);
+	r = responsesreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	ok(r == nil, "responses stream: error event returns nil");
+
+	/* truncated stream (no terminal event) -> error */
+	sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n";
+	path = writetmpsse(sse);
+	bp = Bopen(path, OREAD);
+	r = responsesreadstream(nil, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	ok(r == nil, "responses stream: truncated stream returns nil");
+}
+
+/*
+ * --- claude.c: the Anthropic builder strips what only the
+ * Responses provider understands, so a conversation begun on
+ * responses can continue on anthropic.
+ */
+static void
+tstripforeign(void)
+{
+	Conv *c;
+	Json *req, *msgs, *content, *b;
+
+	c = convnew("key", "claude-opus-4-8", 1000, "sys", nil);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "Looking.",
+		"[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"opaque\"},"
+		"{\"type\":\"text\",\"text\":\"Looking.\",\"item_id\":\"msg_1\"},"
+		"{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"read_file\","
+		"\"input\":{\"path\":\"/tmp/f\"},\"item_id\":\"fc_1\"}]"));
+	convappend(c, msgnew(Muser, "",
+		"[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"ok\"}]"));
+	req = anthropicbuildreq(c);
+	msgs = jget(req, "messages");
+	ok(msgs != nil && msgs->nitem == 3, "stripforeign: message count unchanged");
+	content = jget(jidx(msgs, 1), "content");
+	ok(content != nil && content->nitem == 2, "stripforeign: reasoning block dropped");
+	if(content != nil && content->nitem == 2){
+		b = jidx(content, 0);
+		okstr(jstr(b, "type"), "text", "stripforeign: text kept");
+		ok(jget(b, "item_id") == nil, "stripforeign: text item_id removed");
+		b = jidx(content, 1);
+		okstr(jstr(b, "type"), "tool_use", "stripforeign: tool_use kept");
+		ok(jget(b, "item_id") == nil, "stripforeign: tool_use item_id removed");
+		okstr(jstr(b, "id"), "call_1", "stripforeign: tool_use id intact");
+	}
+	jsonfree(req);
+
+	/* reasoning-only turn (corrupt snapshot) leaves a placeholder */
+	convclear(c);
+	convappend(c, msgnew(Muser, "q", nil));
+	convappend(c, msgnew(Massistant, "",
+		"[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}]"));
+	convappend(c, msgnew(Muser, "more", nil));
+	req = anthropicbuildreq(c);
+	content = jget(jidx(jget(req, "messages"), 1), "content");
+	ok(content != nil && content->nitem == 1, "stripforeign: placeholder for emptied turn");
+	okstr(jstr(jidx(content, 0), "type"), "text", "stripforeign: placeholder is text");
+	jsonfree(req);
+	convfree(c);
+}
+
+/* --- json.c: key deletion and deep copy --- */
+
+static void
+tjsondel(void)
+{
+	Json *o, *cp;
+	char *s;
+
+	o = jsonparse("{\"a\":1,\"b\":[1,2],\"c\":\"x\"}");
+	jdel(o, "b");
+	s = jsonstr(o);
+	okstr(s, "{\"a\":1,\"c\":\"x\"}", "jdel removes middle key, keeps order");
+	free(s);
+	jdel(o, "nosuch");
+	ok(o->nitem == 2, "jdel missing key is a no-op");
+	jdel(o, "a");
+	jdel(o, "c");
+	ok(o->nitem == 0, "jdel empties object");
+	jdel(nil, "a");
+	jsonfree(o);
+
+	o = jsonparse("{\"a\":[1,{\"b\":\"c\"}]}");
+	cp = jcopy(o);
+	jdel(o, "a");
+	s = jsonstr(cp);
+	okstr(s, "{\"a\":[1,{\"b\":\"c\"}]}", "jcopy is independent of the original");
+	free(s);
+	ok(jcopy(nil) == nil, "jcopy nil");
+	jsonfree(o);
+	jsonfree(cp);
 }
 
 /* write a string to a file for use as a canned SSE transcript */
@@ -1682,6 +2271,12 @@ threadmain(int argc, char **argv)
 	topenaiquirkreasoningoff();
 	topenaistream();
 	topenaistream2();
+	tswitchresponses();
+	tresponsesbuildreq();
+	tresponsesquirk();
+	tresponsesstream();
+	tstripforeign();
+	tjsondel();
 
 	if(nfail > 0){
 		fprint(2, "%d of %d tests FAILED\n", nfail, nrun);

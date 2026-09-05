@@ -68,10 +68,22 @@ struct Tooldef {
  * and a raw JSON snapshot of the assistant's content in the
  * NEUTRAL content-array form (see PROVIDERS.md): an array of
  * {text | thinking | redacted_thinking | tool_use |
- *  server_tool_use | advisor_tool_result} blocks in
+ *  server_tool_use | advisor_tool_result | reasoning} blocks in
  * the anthropic spelling.  Every provider's readstream must
  * emit rawjson in this form; every provider's buildreq must
  * accept it when replaying history.
+ *
+ * The last block type, and one extra field, come from the
+ * OpenAI Responses API (responses.c): a "reasoning" block is a
+ * Responses reasoning item stored verbatim (id, summary,
+ * encrypted_content), and text/tool_use blocks produced by that
+ * provider carry an "item_id" (the Responses item id) so the
+ * turn can be replayed with the ids the server expects next to
+ * its reasoning items.  These are the Responses counterpart of
+ * Anthropic's signed thinking blocks: meaningful only to the
+ * provider that produced them.  anthropicbuildreq strips both
+ * (stripforeign in claude.c); openaibuildreq ignores block
+ * types and fields it does not know, so it needs no change.
  */
 typedef struct Reply Reply;
 struct Reply {
@@ -138,9 +150,23 @@ void	replyfree(Reply *r);
  */
 Json*	neutralmessages(Conv *c);
 
-/* openai.c */
+/* openai.c: Chat Completions */
 int	openaiheaders(int fd, Conv *c);
 Json*	openaibuildreq(Conv *c);
 Reply*	openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 		void (*cb)(char*, void*), void *aux);
 int	openaiquirk(Conv *c, char *err);
+/*
+ * Move a Conv from the openai (Chat Completions) provider to the
+ * responses provider, rewriting a /chat/completions baseurl to
+ * /responses.  Returns 1 if the switch was made, 0 if it is not
+ * possible (no responses provider, already there, or a baseurl
+ * whose Responses endpoint cannot be inferred).
+ */
+int	switchresponses(Conv *c);
+
+/* responses.c: OpenAI Responses API (auth shared with openai.c) */
+Json*	responsesbuildreq(Conv *c);
+Reply*	responsesreadstream(Conv *c, Biobuf *bp, Usage *usage,
+		void (*cb)(char*, void*), void *aux);
+int	responsesquirk(Conv *c, char *err);

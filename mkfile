@@ -6,7 +6,7 @@ SKILLSDIR=$home/lib/claude9/skills
 
 TARG=claude9fs claudegraph
 
-COMMONO=claude.$O openai.$O json.$O
+COMMONO=claude.$O openai.$O responses.$O json.$O
 
 LIBVIEW=/usr/dave/work/libview/libview.a$O
 
@@ -27,8 +27,8 @@ $LIBVIEW:V:
 # Unit tests: build with "mk tests", then run ./tests yourself.
 # tests.c #includes claude.c to reach its static internals, so
 # it links with json.$O only (claude.$O would duplicate symbols).
-tests: tests.$O openai.$O json.$O
-	$LD $LDFLAGS -o $target tests.$O openai.$O json.$O
+tests: tests.$O openai.$O responses.$O json.$O
+	$LD $LDFLAGS -o $target tests.$O openai.$O responses.$O json.$O
 
 tests.$O: tests.c claude.c claude.h json.h claudeimpl.h
 	$CC $CFLAGS tests.c
@@ -36,8 +36,8 @@ tests.$O: tests.c claude.c claude.h json.h claudeimpl.h
 %.$O: %.c
 	$CC $CFLAGS $stem.c
 
-claude9fs.$O claude.$O openai.$O json.$O: claude.h json.h
-claude.$O openai.$O: claudeimpl.h
+claude9fs.$O claude.$O openai.$O responses.$O json.$O: claude.h json.h
+claude.$O openai.$O responses.$O: claudeimpl.h
 
 clean:V:
 	rm -f *.[$OS] claude9fs claudegraph tests

@@ -35,6 +35,7 @@ enum {
 	Qerror,
 	Qstream,
 	Qthinking,
+	Qeffort,
 	Qprovider,
 	Qbaseurl,
 	Qadvisor,
@@ -528,6 +529,7 @@ static char* rdconv(Session*);
 static char* rdmodel(Session*);
 static char* rdtokens(Session*);
 static char* rdthinking(Session*);
+static char* rdeffort(Session*);
 static char* rdsystem(Session*);
 static char* rdusage(Session*);
 static char* rderror(Session*);
@@ -537,6 +539,7 @@ static char* rdadvisor(Session*);
 static char* wrmodel(Session*, char*);
 static char* wrtokens(Session*, char*);
 static char* wrthinking(Session*, char*);
+static char* wreffort(Session*, char*);
 static char* wrsystem(Session*, char*);
 static char* wrprovider(Session*, char*);
 static char* wrbaseurl(Session*, char*);
@@ -559,6 +562,7 @@ static struct {
 	{ "error",	Qerror,		0444,	rderror,	nil },
 	{ "stream",	Qstream,	0444,	nil,		nil },
 	{ "thinking",	Qthinking,	0666,	rdthinking,	wrthinking },
+	{ "effort",	Qeffort,	0666,	rdeffort,	wreffort },
 	{ "provider",	Qprovider,	0666,	rdprovider,	wrprovider },
 	{ "baseurl",	Qbaseurl,	0666,	rdbaseurl,	wrbaseurl },
 	{ "advisor",	Qadvisor,	0666,	rdadvisor,	wradvisor },
@@ -832,7 +836,9 @@ static void
 resetquirks(Conv *c)
 {
 	c->oldmaxtok = 0;
+	c->nostreamopts = 0;
 	c->reasonquirk = Reffort;
+	c->respquirks = 0;
 }
 
 /*
@@ -850,7 +856,8 @@ provkey(int prov)
 	name = providername(prov);
 	if(strcmp(name, "anthropic") == 0)
 		return apikey != nil ? apikey : "";
-	if(strcmp(name, "openai") == 0)
+	/* openai and responses: two wire formats, one account */
+	if(strcmp(name, "openai") == 0 || strcmp(name, "responses") == 0)
 		return openaikey != nil ? openaikey : "";
 	return "";
 }
@@ -889,7 +896,7 @@ wrprovider(Session *s, char *data)
 
 	prov = providerlookup(data);
 	if(prov < 0)
-		return "unknown provider (anthropic or openai)";
+		return "unknown provider (anthropic, openai, or responses)";
 	key = provkey(prov);
 	if(provneedskey(prov) && key[0] == '\0')
 		return "no API key for provider in environment";
@@ -1037,6 +1044,7 @@ rdctl(Session *s)
 		"autocontinue %d\n"
 		"maxrounds %d\n"
 		"thinking %s\n"
+		"effort %s\n"
 		"provider %s\n"
 		"baseurl %s\n"
 		"advisor %s\n",
@@ -1051,6 +1059,7 @@ rdctl(Session *s)
 		s->autocont,
 		s->conv->maxrounds > 0 ? s->conv->maxrounds : Defmaxrounds,
 		think,
+		s->conv->effort != nil ? s->conv->effort : "default",
 		providername(s->conv->prov),
 		s->conv->baseurl != nil ? s->conv->baseurl : "-",
 		advisor);
@@ -1087,6 +1096,35 @@ static char*
 rdthinking(Session *s)
 {
 	return thinkingtext(s->conv);
+}
+
+static char*
+rdeffort(Session *s)
+{
+	return estrdup(s->conv->effort != nil ? s->conv->effort : "default");
+}
+
+static char*
+wreffort(Session *s, char *data)
+{
+	Conv *c;
+
+	c = s->conv;
+	if(strcmp(data, "default") == 0 || strcmp(data, "-") == 0){
+		free(c->effort);
+		c->effort = nil;
+		resetquirks(c);
+		return nil;
+	}
+	if(strcmp(data, "none") != 0 && strcmp(data, "low") != 0
+	&& strcmp(data, "medium") != 0 && strcmp(data, "high") != 0)
+		return "effort must be default, none, low, medium, or high";
+	/* Anthropic only emits effort while thinking is adaptive;
+	 * OpenAI emits an explicit effort independently. */
+	free(c->effort);
+	c->effort = estrdup(data);
+	resetquirks(c);
+	return nil;
 }
 
 static char*
@@ -1317,6 +1355,12 @@ modelstext(Req *r)
 	fmtstrinit(&f);
 	any = 0;
 	for(i = 0; i < providercount(); i++){
+		/*
+		 * responses shares openai's models; listing it too
+		 * would print every id twice.
+		 */
+		if(!providerhasmodels(i))
+			continue;
 		key = provkey(i);
 		if(key == nil || key[0] == '\0')
 			continue;
@@ -2162,7 +2206,7 @@ threadmain(int argc, char **argv)
 	openaikey = getenv("OPENAI_API_KEY");
 	defprov = providerlookup(defprovname);
 	if(defprov < 0){
-		fprint(2, "unknown provider %s (anthropic or openai)\n", defprovname);
+		fprint(2, "unknown provider %s (anthropic, openai, or responses)\n", defprovname);
 		threadexitsall("bad provider");
 	}
 	key = provkey(defprov);
@@ -2189,7 +2233,8 @@ threadmain(int argc, char **argv)
 	 * vice versa) fails every request out of the box.
 	 */
 	if(defmodel == nil){
-		if(strcmp(providername(defprov), "openai") == 0)
+		if(strcmp(providername(defprov), "openai") == 0
+		|| strcmp(providername(defprov), "responses") == 0)
 			defmodel = "gpt-4o";
 		else
 			defmodel = "claude-opus-4-8";

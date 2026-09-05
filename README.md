@@ -1,8 +1,8 @@
 # claude9
 
 A multi-provider AI coding client for 9front, exposed as a 9P
-filesystem.  It supports the Anthropic Messages API and OpenAI Chat
-Completions-compatible APIs.
+filesystem.  It supports the Anthropic Messages API, OpenAI Chat
+Completions-compatible APIs, and the OpenAI Responses API.
 
 claude9 consists of three user-facing components:
 
@@ -180,12 +180,12 @@ Flags:
 	-s srvname     post to /srv with this name
 	-m mtpt        mount point (default: /mnt/claude)
 	-M model       default model (provider-specific default when omitted)
-	-P provider    default provider: anthropic or openai (default: anthropic)
+	-P provider    default provider: anthropic, openai, or responses (default: anthropic)
 	-t maxtokens   positive default max tokens per round (default: 16384)
 	-r maxrounds   default tool-loop round cap per prompt (default: 20; see Tool Use)
 
 When `-M` is omitted, the default model is `claude-opus-4-8` for
-Anthropic and `gpt-4o` for OpenAI.
+Anthropic and `gpt-4o` for OpenAI (both `openai` and `responses`).
 
 claude9fs serves a 9P filesystem where each model conversation is
 a named directory.  Reading `clone` allocates a new session and
@@ -209,9 +209,10 @@ unavailable).
 			model     read/write the model name
 			tokens    read/write max output tokens per round
 			thinking  read/write extended thinking setting (0 = off)
+			effort    read/write reasoning effort (default/none/low/medium/high)
 			system    read/write the system prompt
-			provider  read/write provider (anthropic or openai)
-			baseurl   read/write chat endpoint override (- clears it)
+			provider  read/write provider (anthropic, openai, or responses)
+			baseurl   read/write endpoint override (- clears it)
 			advisor   Anthropic server-side advisor setting
 			usage     read token usage statistics
 			error     read last error message
@@ -236,6 +237,7 @@ New sessions start with:
 	baseurl       provider default
 	tokens        16384             (override with -t)
 	thinking      off
+	effort        default
 	advisor       off
 	autocontinue  off
 	maxrounds     20                (override with -r)
@@ -262,14 +264,16 @@ to turn.
 
 ### Providers and endpoints
 
-Each session has a `provider` file containing `anthropic` or
-`openai`.  Switching it selects the matching API key from the
-server environment.  Switching to `anthropic` fails if
-`$ANTHROPIC_API_KEY` was not available when claude9fs started, since
-Anthropic has no keyless mode.  Switching to `openai` succeeds even
-with no `$OPENAI_API_KEY` set -- see "Local and self-hosted servers"
-below.  Switching provider does not change the model name; set
-`model` too when moving between provider model namespaces.
+Each session has a `provider` file containing `anthropic`, `openai`,
+or `responses`.  Switching it selects the matching API key from the
+server environment (`openai` and `responses` share `$OPENAI_API_KEY`;
+they are two wire formats for the same account).  Switching to
+`anthropic` fails if `$ANTHROPIC_API_KEY` was not available when
+claude9fs started, since Anthropic has no keyless mode.  Switching to
+`openai` or `responses` succeeds even with no `$OPENAI_API_KEY` set --
+see "Local and self-hosted servers" below.  Switching provider does
+not change the model name; set `model` too when moving between
+provider model namespaces.
 
 The `baseurl` file overrides the selected provider's chat endpoint.
 Write an empty string or `-` to return to the provider default.  This
@@ -352,6 +356,58 @@ reset when provider, model, or base URL changes.  Conversation history
 uses a neutral internal form, so switching providers mid-session is
 supported; provider-specific thinking blocks may not carry equivalent
 meaning across that switch.
+
+#### The `responses` provider (OpenAI Responses API)
+
+OpenAI's newer reasoning models (observed live: `gpt-5.6-*`,
+`gpt-6-astra`) refuse function tools on `/v1/chat/completions`
+whenever reasoning is in effect, with an error like:
+
+	Function tools with reasoning_effort are not supported for
+	gpt-6-astra in /v1/chat/completions. To use function tools,
+	use /v1/responses or set reasoning_effort to 'none'.
+
+The server applies a default reasoning effort even when the request
+carries none, so leaving the field out changes nothing; and some of
+these models (gpt-6-astra) do not accept `none` at all -- only `low`
+and `medium`.  On Chat Completions there is then no request that
+satisfies the model, and since the tools are the whole point of this
+program, claude9fs does what the server asks: it speaks the Responses
+API.
+
+The `responses` provider is that wire format.  It uses the same key
+and the same model names as `openai`, keeps tools *and* reasoning
+together (so `effort` works on these models instead of having to be
+turned off), streams reasoning summaries between `[thinking]`
+markers when the model provides them, and stores nothing server-side
+(`store: false`; the whole conversation is replayed each round as
+with the other providers).
+
+You rarely need to select it by hand.  A session on `openai` that
+receives the error above **moves itself to `responses` and retries
+within the same prompt**, with a note on claude9fs's stderr; the
+session's `provider` file reads `responses` from then on and `ctl`
+shows it.  A `baseurl` override ending in `/chat/completions` is
+rewritten to the sibling `/responses` endpoint as part of the move;
+any other override is left alone, the switch is refused, and the
+server's error is reported so you can set `baseurl` and `provider`
+yourself.  The switch is one-way: nothing moves a session back to
+Chat Completions, because the model that forced the move would just
+force it again.  To start there directly:
+
+	echo responses > /mnt/claude/$n/provider
+	echo gpt-6-astra > /mnt/claude/$n/model
+	echo medium > /mnt/claude/$n/effort       # optional
+
+The root `models` file lists these models once, under `openai:`;
+`responses` has no model-list endpoint of its own, and claudetalk's
+`/models` on a `responses` session shows the `openai` section for
+that reason.  Compatible servers that implement only
+the core of the Responses API are handled the same way as Chat
+Completions quirks: if the server rejects `include`/`store`,
+`reasoning.summary`, or replayed reasoning items, the offending part
+is dropped and the request retried, and the learned shape sticks
+until provider, model, or base URL changes.
 
 ### Anthropic Advisor
 
@@ -549,11 +605,27 @@ session's `error` file; fix the setting (or write `0`) and
 resend.  Switching models mid-session does not adjust the
 thinking setting automatically.
 
-The effort word in adaptive mode is passed through to
-`output_config.effort` verbatim (e.g. `low`, `medium`,
-`high`); omit it to let the model decide.  It must be one
-whitespace-free word.  Model names likewise must be non-empty
-and contain no whitespace.
+The separate `effort` file provides a convenient provider-neutral
+reasoning-effort control:
+
+	echo low > /mnt/claude/$n/effort
+	cat /mnt/claude/$n/effort
+	echo default > /mnt/claude/$n/effort
+
+It accepts `default`, `none`, `low`, `medium`, or `high`.
+`default` (also writable as `-`) clears the explicit value. For
+the `openai` provider an explicit value is sent as
+`reasoning_effort`, and for `responses` as `reasoning.effort`,
+independently of the `thinking` mode. For Anthropic it is sent
+as `output_config.effort` only when `thinking` is adaptive.  Not
+every model accepts every value (gpt-6-astra, for one, rejects
+`none`); a rejected value fails the round cleanly with the
+server's explanation in the `error` file. The older `adaptive <effort>` syntax on
+the `thinking` file remains supported and updates this same
+setting. Changing effort resets any request-shape workaround
+learned for the previous value.
+
+Model names must be non-empty and contain no whitespace.
 
 In budget mode the API requires 1024 <= budget < max_tokens,
 because thinking tokens spend from the same per-round output
@@ -907,7 +979,7 @@ Flags:
 	-d        detach on exit: leave the session alive for later reattachment
 	-g        open claudegraph in a new window
 	-M model  default model (passed through to claude9fs)
-	-P name   default provider: anthropic or openai
+	-P name   default provider: anthropic, openai, or responses
 	-t n      positive default max tokens (passed through to claude9fs)
 	-K dir    skills directory (passed through to claude9fs)
 	-n path   name-server path (passed through to claude9fs)
@@ -934,7 +1006,7 @@ file in the background while writing to `prompt`.
 	/model         show current model
 	/model <name>  switch model
 	/provider      show current provider
-	/provider <p>  switch provider (anthropic or openai)
+	/provider <p>  switch provider (anthropic, openai, or responses)
 	/baseurl       show endpoint override
 	/baseurl <url> set endpoint override; '-' clears it
 	/advisor       show Anthropic advisor setting
@@ -945,6 +1017,8 @@ file in the background while writing to `prompt`.
 	/thinking      show extended thinking setting
 	/thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)
 	/thinking adaptive [effort]  adaptive mode (fable)
+	/effort        show explicit reasoning effort
+	/effort <level> set default, none, low, medium, or high
 	/clear         clear conversation
 	/compact [n]   drop old exchanges, keeping the n most recent (default 4)
 	/status        show session info
@@ -1029,6 +1103,7 @@ can also drive them from rc without claudetalk:
 
 	claude.c       conversation engine, tools, webfs transport, Anthropic provider
 	openai.c       OpenAI Chat Completions-compatible provider
+	responses.c    OpenAI Responses API provider
 	claude.h       shared public data structures and declarations
 	claudeimpl.h   internal provider/tool interfaces
 	json.c/json.h  JSON parser, serializer, and types

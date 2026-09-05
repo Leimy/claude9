@@ -43,6 +43,8 @@ Json*	jobject(void);
 void	jappend(Json *arr, Json *val);
 void	jinsert(Json *arr, int i, Json *val);
 void	jset(Json *obj, char *name, Json *val);
+void	jdel(Json *obj, char *name);	/* remove a key; no-op if absent */
+Json*	jcopy(Json *j);		/* deep copy; nil if j is nil */
 
 /* output */
 char*	jsonstr(Json *j);

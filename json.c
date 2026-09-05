@@ -586,6 +586,51 @@ jset(Json *obj, char *name, Json *val)
 	obj->nitem++;
 }
 
+/*
+ * Remove name from obj, if present.  Object key order is
+ * preserved for the remaining members.
+ */
+void
+jdel(Json *obj, char *name)
+{
+	int i;
+
+	if(obj == nil || obj->type != Jobject)
+		return;
+	for(i = 0; i < obj->nitem; i++){
+		if(strcmp(obj->names[i], name) == 0){
+			free(obj->names[i]);
+			jsonfree(obj->items[i]);
+			memmove(obj->names + i, obj->names + i + 1,
+				(obj->nitem - i - 1) * sizeof(char*));
+			memmove(obj->items + i, obj->items + i + 1,
+				(obj->nitem - i - 1) * sizeof(Json*));
+			obj->nitem--;
+			return;
+		}
+	}
+}
+
+/*
+ * Deep copy via the serializer: every Json this library can
+ * build round-trips through jsonstr/jsonparse exactly, and
+ * copies are rare (replaying a stored content block into a
+ * request), so this beats a second recursive walk to maintain.
+ */
+Json*
+jcopy(Json *j)
+{
+	char *s;
+	Json *n;
+
+	if(j == nil)
+		return nil;
+	s = jsonstr(j);
+	n = jsonparse(s);
+	free(s);
+	return n;
+}
+
 /* JSON serialization using Fmt */
 
 /*

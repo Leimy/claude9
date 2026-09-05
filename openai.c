@@ -48,8 +48,10 @@ openaiheaders(int fd, Conv *c)
  * return 1 to have sendonce rebuild and resend (up to
  * Maxquirks retries per round; see sendonce in claude.c).
  *
- * Two known cases so far: the output-token field name, and
- * reasoning_effort colliding with function tools (see below).
+ * Three known cases so far: the output-token field name, the
+ * optional stream_options extension, and reasoning_effort
+ * colliding with function tools (see below; that one can end in
+ * a switch to the responses provider).
  *
  * Case 1: the output-token field name.  We send
  * max_completion_tokens by default (see openaibuildreq); an
@@ -84,13 +86,30 @@ openaiquirk(Conv *c, char *err)
 		return 1;
 	}
 	/*
-	 * Some models (observed: a gpt-5.x variant) reject
-	 * function tools when reasoning is in effect, e.g.
-	 * "Function tools with reasoning_effort are not supported
-	 * for <model> in /v1/chat/completions.  To use function
-	 * tools, do not set reasoning_effort" (exact wording may
-	 * vary by server).  Tools are load-bearing for this
-	 * program, so the fix is always on the reasoning side.
+	 * stream_options is an OpenAI extension, not part of the
+	 * common Chat Completions subset.  Astra and several local
+	 * compatible servers stream correctly but reject this field.
+	 * Usage is optional, so retry once without it and remember
+	 * that shape for later rounds.
+	 */
+	if(!c->nostreamopts && strstr(err, "stream_options") != nil
+	&& (strstr(err, "not supported") != nil
+	 || strstr(err, "nsupported") != nil
+	 || strstr(err, "nrecognized") != nil
+	 || strstr(err, "nknown") != nil
+	 || strstr(err, "not permitted") != nil)){
+		c->nostreamopts = 1;
+		return 1;
+	}
+	/*
+	 * Newer OpenAI reasoning models reject function tools when
+	 * reasoning is in effect: "Function tools with
+	 * reasoning_effort are not supported for <model> in
+	 * /v1/chat/completions.  To use function tools, use
+	 * /v1/responses or set reasoning_effort to 'none'" (older
+	 * wording just says "do not set reasoning_effort").  Tools
+	 * are load-bearing for this program, so the fix is always
+	 * on the reasoning side.
 	 *
 	 * The catch (learned live, the hard way): "not set" is
 	 * judged server-side, not by what we sent.  A fresh
@@ -98,12 +117,22 @@ openaiquirk(Conv *c, char *err)
 	 * this rejection, which means the server applies a DEFAULT
 	 * reasoning effort for the model when the field is absent.
 	 * Omitting the field therefore cannot fix that case; the
-	 * only way to turn reasoning off is to send an explicit
-	 * reasoning_effort "none" overriding the default.
+	 * only Chat Completions way to turn reasoning off is an
+	 * explicit reasoning_effort "none".  And the second catch
+	 * (also live, gpt-6-astra): some models do not accept
+	 * "none" at all -- "'reasoning_effort' does not support
+	 * 'none' with this model. Supported values are: 'low',
+	 * 'medium'" -- so on Chat Completions there is NO value
+	 * that satisfies both constraints, and the only way out is
+	 * the endpoint the server itself names: /v1/responses.
 	 *
-	 * So instead of a single omit-latch, walk a monotonic
-	 * ladder (Conv.reasonquirk, see claude.h), one rung per
-	 * complaint:
+	 * Hence two moves.  Whenever the complaint names the
+	 * Responses API, take it up on that immediately
+	 * (switchresponses; the responses provider keeps both tools
+	 * and reasoning, so this is the better shape anyway, not
+	 * just a fallback).  Otherwise walk the monotonic Chat
+	 * Completions ladder (Conv.reasonquirk, see claude.h), one
+	 * rung per complaint:
 	 *
 	 *   Reffort  and we sent an effort value -> Romit:
 	 *            drop the field, retry (maybe the server has
@@ -113,17 +142,21 @@ openaiquirk(Conv *c, char *err)
 	 *            must be on; send "none", retry.
 	 *   Romit    (absence still rejected) -> Rnone: send
 	 *            "none", retry.
-	 *   Rnone    (even "none" rejected) -> Rdead: suppress the
-	 *            field and give up; this model+server really
-	 *            cannot do tools, and the error should surface.
+	 *   Rnone    (even "none" rejected) -> switch to the
+	 *            responses provider if possible; else Rdead:
+	 *            suppress the field and give up, letting the
+	 *            error surface.
 	 *   Rdead    terminal; never retry on this error again.
 	 *
 	 * Monotonic means it terminates: at most three retries over
-	 * the life of a Conv, no ping-pong.
+	 * the life of a Conv, no ping-pong.  The provider switch is
+	 * one-way too (the responses provider has no path back).
 	 */
 	if(strstr(err, "reasoning_effort") != nil
 	&& (strstr(err, "not supported") != nil
 	 || strstr(err, "nsupported") != nil)){
+		if(strstr(err, "/v1/responses") != nil && switchresponses(c))
+			return 1;
 		switch(c->reasonquirk){
 		case Reffort:
 			if(c->thinkmode == Thinkadaptive
@@ -138,11 +171,54 @@ openaiquirk(Conv *c, char *err)
 			return 1;
 		case Rnone:
 			c->reasonquirk = Rdead;
-			return 0;
+			return switchresponses(c);
 		}
 		return 0;	/* Rdead */
 	}
 	return 0;
+}
+
+/*
+ * Move the conversation from Chat Completions to the Responses
+ * API (see the reasoning_effort case in openaiquirk).  The
+ * providers share the key and auth header, so only the vtable
+ * index and the endpoint change.  A baseurl override that names
+ * a Chat Completions endpoint ("<prefix>/chat/completions") is
+ * rewritten to the sibling "<prefix>/responses", which is where
+ * OpenAI and the compatible gateways that implement both APIs
+ * put it; any other override is left alone and the switch is
+ * refused, since guessing an endpoint would only turn a clear
+ * server message into a confusing 404.  Both providers' quirk
+ * states are reset: what the old endpoint wanted says nothing
+ * about the new one.
+ */
+int
+switchresponses(Conv *c)
+{
+	char *u, *nu, *tail;
+	int prov, n, tn;
+
+	prov = providerlookup("responses");
+	if(prov < 0 || c->prov == prov)
+		return 0;
+	if(c->baseurl != nil && c->baseurl[0] != '\0'){
+		u = c->baseurl;
+		tail = "/chat/completions";
+		n = strlen(u);
+		tn = strlen(tail);
+		if(n <= tn || strcmp(u + n - tn, tail) != 0)
+			return 0;
+		/* byte copy: fmt's %.*s precision counts runes, not bytes */
+		nu = emalloc(n - tn + strlen("/responses") + 1);
+		memmove(nu, u, n - tn);
+		strcpy(nu + n - tn, "/responses");
+		free(u);
+		c->baseurl = nu;
+	}
+	c->prov = prov;
+	c->reasonquirk = Reffort;
+	c->respquirks = 0;
+	return 1;
 }
 
 /*
@@ -333,10 +409,16 @@ openaibuildreq(Conv *c)
 	else
 		jset(req, "max_completion_tokens", jintval(c->maxtokens));
 
-	/* request usage in the final chunk */
-	streamopts = jobject();
-	jset(streamopts, "include_usage", jbool(1));
-	jset(req, "stream_options", streamopts);
+	/*
+	 * Request usage in the final chunk where supported.  This
+	 * extension is optional on compatible endpoints; openaiquirk
+	 * retries without it if Astra (or another server) rejects it.
+	 */
+	if(!c->nostreamopts){
+		streamopts = jobject();
+		jset(streamopts, "include_usage", jbool(1));
+		jset(req, "stream_options", streamopts);
+	}
 
 	/*
 	 * Thinkadaptive: map effort to reasoning_effort.
@@ -348,11 +430,12 @@ openaibuildreq(Conv *c)
 	 * "none" -- required when the server applies a default
 	 * reasoning effort for the model even though we never sent
 	 * the field -- and Romit/Rdead suppress the field entirely.
+	 * A model that accepts neither ends up on the responses
+	 * provider instead, which never calls this function.
 	 */
 	if(c->reasonquirk == Rnone)
 		jset(req, "reasoning_effort", jstring("none"));
 	else if(c->reasonquirk == Reffort
-	&& c->thinkmode == Thinkadaptive
 	&& c->effort != nil && c->effort[0] != '\0')
 		jset(req, "reasoning_effort", jstring(c->effort));
 
@@ -616,13 +699,25 @@ openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 			continue;
 		}
 
-		/* delta.content: text fragment */
+		/* delta.content: visible text fragment */
 		s = jstr(delta, "content");
 		if(s != nil && s[0] != '\0'){
 			sbappend(&textbuf, s, strlen(s));
 			if(cb != nil)
 				cb(s, aux);
 		}
+
+		/*
+		 * Compatible reasoning models use either
+		 * reasoning_content or reasoning.  Show it in the live
+		 * stream, but do not put it in replayable history: unlike
+		 * Anthropic thinking blocks it has no portable signature.
+		 */
+		s = jstr(delta, "reasoning_content");
+		if(s == nil)
+			s = jstr(delta, "reasoning");
+		if(s != nil && s[0] != '\0' && cb != nil)
+			cb(s, aux);
 
 		/* delta.tool_calls: array of per-index fragments */
 		tcarr = jget(delta, "tool_calls");

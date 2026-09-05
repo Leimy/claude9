@@ -31,8 +31,26 @@ enum {
 	Romit,		/* effort value rejected with tools: omit the field */
 	Rnone,		/* absence also rejected (server default reasoning):
 			 * send explicit reasoning_effort "none" */
-	Rdead,		/* even "none" rejected: suppress the field and
+	Rdead,		/* "none" also rejected and no Responses API
+			 * fallback was possible: suppress the field and
 			 * let errors surface; terminal */
+};
+
+/*
+ * OpenAI Responses API request-shape quirks (Conv.respquirks, a
+ * bitmask advanced by responsesquirk in responses.c).  Each bit
+ * turns off one optional part of the request after the server
+ * rejects it, so the responses provider degrades gracefully on
+ * compatible servers that implement only the core of the API.
+ */
+enum {
+	Rqnoinclude = 1<<0,	/* server rejects store:false +
+				 * include:["reasoning.encrypted_content"]:
+				 * omit both (server-side state instead) */
+	Rqnosummary = 1<<1,	/* server rejects reasoning.summary: omit it
+				 * (no streamed thinking text) */
+	Rqnoreasonitems = 1<<2,	/* server rejects replayed reasoning items
+				 * or item ids: replay neither */
 };
 
 enum {
@@ -70,6 +88,9 @@ struct Conv {
 			 * instead of "max_completion_tokens"; set
 			 * automatically when the server complains
 			 * (see openaiquirk) */
+	int nostreamopts;	/* openai quirk: compatible server rejects
+				 * stream_options; omit it after the first
+				 * such rejection (usage may be absent) */
 	int reasonquirk;	/* openai quirk ladder state (Reffort,
 				 * Romit, Rnone, Rdead; see the enum
 				 * above): how to spell -- or not spell
@@ -78,7 +99,14 @@ struct Conv {
 				 * load-bearing, so the fix is always on
 				 * the reasoning side, never dropping
 				 * tools.  Advanced automatically by
-				 * openaiquirk as the server complains. */
+				 * openaiquirk as the server complains;
+				 * when no spelling works, openaiquirk
+				 * moves the Conv to the responses
+				 * provider instead (see switchresponses
+				 * in openai.c). */
+	int respquirks;	/* responses provider quirk bits (Rqnoinclude,
+			 * ...; see the enum above), set automatically by
+			 * responsesquirk as the server complains */
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
 	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
 	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
@@ -209,6 +237,14 @@ char*	fetchmodels(int prov, char *apikey);	/* model ids, one per line */
 int	providerlookup(char *name);
 char*	providername(int prov);
 int	providercount(void);	/* valid indexes are 0..providercount()-1 */
+/*
+ * True if the provider has a model-list endpoint of its own.
+ * The responses provider is a second wire format for the same
+ * OpenAI models the openai provider already lists, so it has
+ * none; a caller enumerating providers for a models listing
+ * should skip it rather than print the same ids twice.
+ */
+int	providerhasmodels(int prov);
 
 /* emalloc wrappers: succeed or sysfatal */
 void*	emalloc(ulong n);

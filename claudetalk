@@ -13,11 +13,14 @@
 #   -d            detach on exit: leave the session alive
 #   -g            also pop up a claudegraph window on the session graph
 #   -M model      default model for claude9fs
-#   -P provider   default provider for claude9fs (anthropic or openai;
-#                 anthropic needs $ANTHROPIC_API_KEY -- it has no keyless
-#                 mode.  openai's $OPENAI_API_KEY is optional: a session
-#                 can point openai at a keyless local/self-hosted server
-#                 instead, e.g. Ollama, via /baseurl)
+#   -P provider   default provider for claude9fs (anthropic, openai, or
+#                 responses; anthropic needs $ANTHROPIC_API_KEY -- it has
+#                 no keyless mode.  openai's $OPENAI_API_KEY is optional:
+#                 a session can point openai at a keyless local/self-hosted
+#                 server instead, e.g. Ollama, via /baseurl.  responses is
+#                 the OpenAI Responses API on the same key: what newer
+#                 OpenAI reasoning models need for tool use; a session on
+#                 openai moves there by itself when the server insists)
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
@@ -179,7 +182,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /effort [level] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -250,6 +253,10 @@ fn docmd {
 		curprov=`{cat $sess/provider >[2]/dev/null}
 		if(~ $#curprov 0)
 			curprov=anthropic
+		# responses is the same account and model catalog as
+		# openai, listed once under openai's heading.
+		if(~ $curprov responses)
+			curprov=openai
 		which=$curprov
 		if(! ~ $#* 0)
 			which=$1
@@ -301,6 +308,10 @@ fn docmd {
 		shift
 		setget $sess/thinking thinking $*
 	}
+	if not if(~ $cmd /effort){
+		shift
+		setget $sess/effort effort $*
+	}
 	if not if(~ $cmd /status){
 		cat $sess/ctl >[1=2]
 	}
@@ -311,15 +322,19 @@ fn docmd {
 		echo 'commands:' >[1=2]
 		echo '  /sessions      list live sessions' >[1=2]
 		echo '  /models        list models for the current provider' >[1=2]
-		echo '  /models <p>    list models for provider <p> (anthropic or openai)' >[1=2]
+		echo '  /models <p>    list models for provider <p> (anthropic or openai;' >[1=2]
+		echo '                 responses uses the openai list)' >[1=2]
 		echo '  /models all    list models for every provider with a key configured' >[1=2]
 		echo '  /model         show current model' >[1=2]
 		echo '  /model <name>  switch model' >[1=2]
 		echo '  /provider      show current provider' >[1=2]
-		echo '  /provider <p>  switch provider: anthropic (needs its API key) or' >[1=2]
+		echo '  /provider <p>  switch provider: anthropic (needs its API key),' >[1=2]
 		echo '                 openai (key optional -- fine for a keyless local' >[1=2]
-		echo '                 server via /baseurl, e.g. Ollama); switch /model too' >[1=2]
-		echo '                 - model names are per-provider' >[1=2]
+		echo '                 server via /baseurl, e.g. Ollama), or responses' >[1=2]
+		echo '                 (OpenAI Responses API, same key; needed for tools' >[1=2]
+		echo '                 on newer OpenAI reasoning models -- openai switches' >[1=2]
+		echo '                 to it automatically when the server insists);' >[1=2]
+		echo '                 switch /model too - model names are per-provider' >[1=2]
 		echo '  /baseurl       show endpoint URL override' >[1=2]
 		echo '  /baseurl <url> point an openai-compatible server (llama.cpp, vllm, ...)' >[1=2]
 		echo '  /baseurl -     clear the override (back to provider default)' >[1=2]
@@ -331,6 +346,8 @@ fn docmd {
 		echo '  /thinking      show extended thinking setting' >[1=2]
 		echo '  /thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)' >[1=2]
 		echo '  /thinking adaptive [effort]  adaptive mode (fable; effort e.g. low/medium/high)' >[1=2]
+		echo '  /effort        show explicit reasoning effort' >[1=2]
+		echo '  /effort <level> set default, none, low, medium, or high' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /compact [n]   drop old exchanges, keep n recent (default 4)' >[1=2]
 		echo '  /status        show session info' >[1=2]

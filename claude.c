@@ -95,6 +95,20 @@ static Provider providers[] = {
 	  openaibuildreq,
 	  openaireadstream,
 	  openaiquirk },
+	/*
+	 * Same models, same key, different wire format: the
+	 * Responses API, which OpenAI's newer reasoning models
+	 * require for function tools (see responses.c).  No models
+	 * endpoint of its own -- the openai entry already lists
+	 * them (providerhasmodels).
+	 */
+	{ "responses",
+	  "https://api.openai.com/v1/responses",
+	  nil,
+	  openaiheaders,
+	  responsesbuildreq,
+	  responsesreadstream,
+	  responsesquirk },
 };
 
 int
@@ -122,6 +136,14 @@ int
 providercount(void)
 {
 	return nelem(providers);
+}
+
+int
+providerhasmodels(int prov)
+{
+	if(prov < 0 || prov >= nelem(providers))
+		return 0;
+	return providers[prov].modelsurl != nil;
 }
 
 /*
@@ -1122,6 +1144,57 @@ neutralmessages(Conv *c)
 	return msgs;
 }
 
+/*
+ * Remove what the Anthropic API would reject from a neutral
+ * messages array produced (in part) by the OpenAI Responses
+ * provider: "reasoning" blocks (Responses reasoning items, the
+ * counterpart of our thinking blocks, meaningless here) and the
+ * "item_id" field Responses text/tool_use blocks carry (an
+ * unknown field in an Anthropic content block is an error).
+ * See the neutral-form note in claudeimpl.h.  This is the
+ * mirror image of openai.c/responses.c skipping thinking blocks
+ * on their side, so a conversation can move between providers.
+ *
+ * An assistant turn cannot consist of reasoning alone (the
+ * model always emits a message or a call after it), but a
+ * corrupt snapshot might; the API rejects an empty content
+ * array, so leave a placeholder in that case.
+ */
+static void
+stripforeign(Json *msgs)
+{
+	Json *msg, *content, *block;
+	char *btype;
+	int i, j, keep;
+
+	if(msgs == nil || msgs->type != Jarray)
+		return;
+	for(i = 0; i < msgs->nitem; i++){
+		msg = msgs->items[i];
+		content = jget(msg, "content");
+		if(content == nil || content->type != Jarray)
+			continue;
+		keep = 0;
+		for(j = 0; j < content->nitem; j++){
+			block = content->items[j];
+			btype = jstr(block, "type");
+			if(btype != nil && strcmp(btype, "reasoning") == 0){
+				jsonfree(block);
+				continue;
+			}
+			jdel(block, "item_id");
+			content->items[keep++] = block;
+		}
+		content->nitem = keep;
+		if(keep == 0){
+			block = jobject();
+			jset(block, "type", jstring("text"));
+			jset(block, "text", jstring("(no text)"));
+			jappend(content, block);
+		}
+	}
+}
+
 static Json*
 anthropicbuildreq(Conv *c)
 {
@@ -1180,6 +1253,7 @@ anthropicbuildreq(Conv *c)
 	jset(req, "tools", mktools(c));
 
 	msgs = neutralmessages(c);
+	stripforeign(msgs);
 
 	if(msgs->nitem > 0){
 		msg = jidx(msgs, msgs->nitem - 1);
@@ -3188,6 +3262,12 @@ enum {
  * whose errors toggle a flag back and forth) from retrying
  * forever; well-behaved quirk state machines are monotonic and
  * stop asking on their own.
+ *
+ * The provider is re-resolved on every attempt because a quirk
+ * hook may change it: openaiquirk moves a Conv to the responses
+ * provider when a model refuses function tools on Chat
+ * Completions (switchresponses), and the retry must then use
+ * the new provider's builder, reader, endpoint, and quirk hook.
  */
 static Reply*
 sendonce(Conv *c, Usage *usage,
@@ -3198,8 +3278,8 @@ sendonce(Conv *c, Usage *usage,
 	char errbuf[ERRMAX];
 	int try;
 
-	p = provof(c);
 	for(try = 0;; try++){
+		p = provof(c);
 		r = sendonce1(c, usage, cb, aux);
 		if(r != nil)
 			return r;
@@ -3210,8 +3290,12 @@ sendonce(Conv *c, Usage *usage,
 			werrstr("%s", errbuf);	/* quirk may have clobbered errstr */
 			return nil;
 		}
-		fprint(2, "claude: %s: retrying after request-shape error: %s\n",
-			p->name, errbuf);
+		if(provof(c) != p)
+			fprint(2, "claude: %s: switching to %s after request-shape error: %s\n",
+				p->name, provof(c)->name, errbuf);
+		else
+			fprint(2, "claude: %s: retrying after request-shape error: %s\n",
+				p->name, errbuf);
 	}
 }
 
@@ -3408,6 +3492,10 @@ fetchmodels(int prov, char *apikey)
 		return nil;
 	}
 	p = &providers[prov];
+	if(p->modelsurl == nil){
+		werrstr("provider %s has no models endpoint", p->name);
+		return nil;
+	}
 	{
 		Conv c;
 		memset(&c, 0, sizeof c);
