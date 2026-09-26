@@ -24,6 +24,27 @@
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
+#
+# Cost display: after every prompt claudetalk prints what that
+# prompt consumed (summed over its whole tool loop), running
+# session totals, and the conversation size that every request
+# resends; the prompt shows that size too, e.g. "model/16384 [180K]> ".
+# Once the history passes $CLAUDEWARNBYTES bytes (default 100000;
+# 0 disables) it suggests /compact, and again at each further
+# multiple.  Dollar estimates come from two tables claudetalk
+# rebuilds in the background (at most daily): prices.anthropic,
+# scraped from Anthropic's pricing page, and prices.litellm, from
+# LiteLLM's community-maintained JSON on GitHub (OpenAI and
+# Anthropic models).  CLAUDEPRICEFETCH=0 turns fetching off.  A
+# hand-written file, $CLAUDEPRICES or else $home/lib/claude9/prices,
+# is consulted first, then prices.anthropic, then prices.litellm.
+# All three use one model per line:
+#   model  input  output  [cachewrite  cacheread]
+# in US dollars per million tokens.  Omitted cache prices default to
+# 1.25x and 0.1x input -- wrong for some models (Opus 5.5 reads at
+# 0.05x), so give all five.  An entry also matches the same id with
+# a -YYYYMMDD or -YYYY-MM-DD snapshot suffix.  Lines whose first
+# field matches no model id (e.g. starting with #) are ignored.
 
 rfork e
 
@@ -188,6 +209,461 @@ if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
 echo '' >[1=2]
 
+# Cost accounting.  The usage file reports only the most recent
+# prompt; claudetalk keeps session totals itself.  rc has no
+# arithmetic, so every number lives in an rc variable as a decimal
+# string and all math is done in awk.
+#
+# Quoting rule for every awk -v below: pass 'name='^$"var, never
+# 'name='$var.  $"var flattens a list to exactly one word and turns
+# an empty list into '' -- without it an empty variable is an rc
+# "null list in concatenation" error, and a multi-word one becomes
+# several arguments.  Awk program text is single-quoted, so it must
+# not contain a single quote anywhere, not even in a message.
+#
+# Normalized counts, in this order everywhere:
+#   uncached input, cache writes, cache reads, output
+acct_u=(0 0 0 0)	# last prompt
+acct_tot=(0 0 0 0)	# this claudetalk run
+acct_cost=0		# dollars, over priced prompts only
+acct_rcost=-		# last prompt dollars, - if unpriced
+acct_nprompt=0
+acct_npriced=0
+
+warnbytes=100000
+if(! ~ $#CLAUDEWARNBYTES 0){
+	# normalized through awk so "00" disables just like "0"
+	ok=`{echo $"CLAUDEWARNBYTES | awk '/^[0-9]+$/ {printf "%.0f\n", $1 + 0}'}
+	if(~ $#ok 1)
+		warnbytes=$ok
+	if not
+		echo 'ignoring non-numeric $CLAUDEWARNBYTES: '$"CLAUDEWARNBYTES >[1=2]
+}
+nextwarn=$warnbytes
+
+if(! ~ $#CLAUDEPRICES 0)
+	pricefile=$"CLAUDEPRICES
+if not
+	pricefile=$home/lib/claude9/prices
+
+# Automatically fetched price tables, refreshed at most daily in
+# the background.  Lookup order: the hand-written $pricefile,
+# then Anthropic's own page (authoritative for Claude), then
+# LiteLLM's community-maintained table (covers OpenAI too, and
+# backs up the Anthropic scrape if that page changes layout).
+anthprices=$home/lib/claude9/prices.anthropic
+anthurl=https://platform.claude.com/docs/en/about-claude/pricing
+litellmprices=$home/lib/claude9/prices.litellm
+litellmurl=https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+
+# Fetch Anthropic's pricing page and rebuild $anthprices from its
+# model table.  Meant to run in the background: it only speaks up
+# on failure, and never replaces a good table with a bad one.
+#
+# The page's markup is not something we control or can rely on,
+# so the parse is deliberately markup-agnostic: strip every tag,
+# split the remaining text on "$", and look for a model name
+# followed by exactly five consecutive "N / MTok" cells --
+# input, output, 5m cache write, 1h cache write, cache hit.  Only
+# the main pricing table has five-price rows (the batch and fast
+# mode tables have two).  The name is the LAST "Claude Name N.N"
+# before the prices, so navigation text listing models does not
+# leak in.  "Claude Opus 4.8" becomes the id claude-opus-4-8.
+# The 5m write price is kept because that is the cache claude9fs
+# uses (cache_control ephemeral, no ttl).
+fn fetchanthropic {
+	pf_tmp=$anthprices.new.$pid
+	mkdir -p $home/lib/claude9 >[2]/dev/null
+	if(! hget $anthurl > $pf_tmp.html >[2]/dev/null)
+		echo 'price fetch failed ('$anthurl'); keeping old prices' >[1=2]
+	if not {
+		# Awk fails (exit 1) unless at least three rows parse.
+		if(awk '
+			function price(s) {
+				if(!match(s, /^[0-9]+(\.[0-9]+)? *\/ *MTok/))
+					return 0
+				pv = substr(s, 1, RLENGTH)
+				sub(/ *\/.*/, "", pv)
+				ptail = substr(s, RLENGTH + 1)
+				return 1
+			}
+			{ text = text " " $0 }
+			END {
+				gsub(/<[^>]*>/, "", text)
+				gsub(/&nbsp;|&#160;/, " ", text)
+				gsub(/[ \t\r]+/, " ", text)
+				n = split(text, seg, "$")
+				nrow = 0
+				for(j = 1; j + 5 <= n; j++){
+					ok = 1
+					for(k = 1; k <= 5; k++){
+						if(!price(seg[j + k])){
+							ok = 0
+							break
+						}
+						v[k] = pv
+						if(k < 5 && ptail !~ /^ *$/){
+							ok = 0
+							break
+						}
+					}
+					if(!ok)
+						continue
+					s = seg[j]
+					if(price(s))
+						s = ptail
+					last = ""
+					while(match(s, /Claude [A-Z][a-z]+ [0-9]+(\.[0-9]+)?/)){
+						last = substr(s, RSTART, RLENGTH)
+						s = substr(s, RSTART + RLENGTH)
+					}
+					if(last == "")
+						continue
+					id = tolower(last)
+					gsub(/[ .]/, "-", id)
+					if(id in seen)
+						continue
+					seen[id] = 1
+					printf "%s %s %s %s %s\n", id, v[1], v[2], v[3], v[5]
+					nrow++
+				}
+				if(nrow < 3)
+					exit 1
+			}' $pf_tmp.html > $pf_tmp.rows >[2]/dev/null){
+			{
+				echo '# fetched automatically by claudetalk from '$anthurl
+				echo '# model input output cachewrite(5m) cacheread, US$ per million tokens'
+				echo '# regenerated daily; put overrides in '$pricefile
+				cat $pf_tmp.rows
+			} > $pf_tmp
+			cp $pf_tmp $anthprices
+		}
+		if not
+			echo 'price fetch: could not parse '$anthurl' (layout changed?); keeping old prices' >[1=2]
+	}
+	rm -f $pf_tmp $pf_tmp.html $pf_tmp.rows
+}
+
+# Fetch LiteLLM's price table and rebuild $litellmprices from its
+# openai and anthropic entries.  Background use, like
+# fetchanthropic: silent on success, never replaces a good table
+# with a bad one.
+#
+# The file is pretty-printed JSON, parsed line by line rather
+# than as JSON: an entry opens with a 4-space-indented
+#     "model-id": {
+# its fields sit at exactly 8 spaces, and it closes with a
+# 4-space "}".  Matching exact field names at exactly 8 spaces
+# skips nested objects (search_context_cost_per_query, metadata)
+# and the tiered variants (_above_200k_tokens, _priority,
+# _batches, _above_1hr) -- only the base per-token prices are
+# wanted.  Prices are $/token, often in scientific notation
+# (2.5e-06); they are scaled to $/Mtok here.  Kept: entries
+# whose litellm_provider is openai or anthropic (not the azure,
+# bedrock, or other resellers' copies) and whose mode is chat or
+# responses.  A missing cache read price becomes the input price
+# (no discount assumed); a missing cache write price becomes
+# 1.25x input for anthropic, 0 for openai (which never bills
+# cache writes).
+fn fetchlitellm {
+	pf_tmp=$litellmprices.new.$pid
+	mkdir -p $home/lib/claude9 >[2]/dev/null
+	if(! hget $litellmurl > $pf_tmp.json >[2]/dev/null)
+		echo 'price fetch failed ('$litellmurl'); keeping old prices' >[1=2]
+	if not {
+		# Awk fails (exit 1) unless at least ten entries parse.
+		if(awk '
+			function val(s) {
+				sub(/\r$/, "", s)
+				sub(/^ *"[^"]*": */, "", s)
+				sub(/,$/, "", s)
+				gsub(/"/, "", s)
+				return s
+			}
+			function mtok(x) {
+				return sprintf("%.6g", x * 1000000)
+			}
+			function emit(   id) {
+				if(prov != "openai" && prov != "anthropic")
+					return
+				if(mode != "" && mode != "chat" && mode != "responses")
+					return
+				if(inp == "" || outp == "")
+					return
+				id = key
+				sub(/^(openai|anthropic)\//, "", id)
+				if(id in seen)
+					return
+				seen[id] = 1
+				if(cr == "")
+					cr = inp
+				if(cw == ""){
+					if(prov == "anthropic")
+						cw = inp * 1.25
+					else
+						cw = 0
+				}
+				printf "%s %s %s %s %s\n", id, mtok(inp), mtok(outp), mtok(cw), mtok(cr)
+				nent++
+			}
+			/^    "[^"]*": \{/ {
+				key = $0
+				sub(/^    "/, "", key)
+				sub(/": \{.*/, "", key)
+				prov = ""
+				mode = ""
+				inp = ""
+				outp = ""
+				cw = ""
+				cr = ""
+				inentry = 1
+				next
+			}
+			!inentry { next }
+			/^    \}/ {
+				emit()
+				inentry = 0
+				next
+			}
+			/^        "litellm_provider": / { prov = val($0); next }
+			/^        "mode": / { mode = val($0); next }
+			/^        "input_cost_per_token": / { inp = val($0); next }
+			/^        "output_cost_per_token": / { outp = val($0); next }
+			/^        "cache_creation_input_token_cost": / { cw = val($0); next }
+			/^        "cache_read_input_token_cost": / { cr = val($0); next }
+			END {
+				if(nent < 10)
+					exit 1
+			}' $pf_tmp.json > $pf_tmp.rows >[2]/dev/null){
+			{
+				echo '# fetched automatically by claudetalk from '$litellmurl
+				echo '# (LiteLLM, community-maintained; openai and anthropic entries only)'
+				echo '# model input output cachewrite(5m) cacheread, US$ per million tokens'
+				echo '# regenerated daily; put overrides in '$pricefile
+				cat $pf_tmp.rows
+			} > $pf_tmp
+			cp $pf_tmp $litellmprices
+		}
+		if not
+			echo 'price fetch: could not parse '$litellmurl'; keeping old prices' >[1=2]
+	}
+	rm -f $pf_tmp $pf_tmp.json $pf_tmp.rows
+}
+
+# Set pf_stale to 1 if file $1 is missing or over a day old.
+fn pricesage {
+	pf_stale=1
+	pf_file=$1
+	if(test -s $pf_file){
+		pf_now=`{date -n}
+		# mtime prints "seconds name": take only the first word,
+		# or the -v argument below would split in two.
+		pf_mt=`{mtime $pf_file}
+		if(! ~ $#pf_mt 0){
+			pf_mt=$pf_mt(1)
+			pf_stale=`{awk -v 'now='^$"pf_now -v 'mt='^$"pf_mt 'BEGIN {
+				s = 0
+				if(now - mt > 86400)
+					s = 1
+				print s
+			}'}
+		}
+	}
+}
+
+if(test -r $pricefile)
+	echo 'prices: '$pricefile' (hand-written, takes precedence)' >[1=2]
+if(! ~ $"CLAUDEPRICEFETCH 0){
+	pricesage $anthprices
+	if(~ $pf_stale 1){
+		echo 'prices: refreshing '$anthprices' in the background' >[1=2]
+		fetchanthropic &
+	}
+	pricesage $litellmprices
+	if(~ $pf_stale 1){
+		echo 'prices: refreshing '$litellmprices' in the background' >[1=2]
+		fetchlitellm &
+	}
+}
+
+# Set ctx_bytes, ctx_exch, and ctx_h (bytes, human-readable) from
+# ctl.  Always leaves three usable words, even if the ctl read
+# fails (session hung up elsewhere, or an old server).
+fn ctxstat {
+	ctx=`{awk '
+		$1 == "bytes" { b = $2 }
+		$1 == "exchanges" { e = $2 }
+		END {
+			b += 0
+			e += 0
+			if(b >= 1000000)
+				h = sprintf("%.1fM", b / 1000000)
+			else if(b >= 1000)
+				h = sprintf("%.0fK", b / 1000)
+			else
+				h = sprintf("%d", b)
+			printf "%.0f %d %s\n", b, e, h
+		}' $sess/ctl >[2]/dev/null}
+	if(! ~ $#ctx 3)
+		ctx=(0 0 '?')
+	ctx_bytes=$ctx(1)
+	ctx_exch=$ctx(2)
+	ctx_h=$ctx(3)
+}
+
+# Re-arm the /compact nudge at the next multiple of warnbytes
+# above the current size (after /compact or /clear shrinks it).
+fn warnreset {
+	ctxstat
+	nextwarn=`{awk -v 'b='^$"ctx_bytes -v 'w='^$"warnbytes 'BEGIN {
+		if(w <= 0)
+			print 0
+		else
+			printf "%.0f\n", (int(b / w) + 1) * w
+	}'}
+	if(! ~ $#nextwarn 1)
+		nextwarn=$warnbytes
+}
+
+# Print last-prompt and session lines, plus the context size.
+fn acctreport {
+	ctxstat
+	awk -v 'u='^$"acct_u -v 'tot='^$"acct_tot -v 'rcost='^$"acct_rcost -v 'cost='^$"acct_cost -v 'np='^$"acct_nprompt -v 'npriced='^$"acct_npriced -v 'ctx='^$"ctx_h -v 'exch='^$"ctx_exch '
+		function hs(n) {
+			if(n >= 1000000)
+				return sprintf("%.1fM", n / 1000000)
+			if(n >= 1000)
+				return sprintf("%.1fK", n / 1000)
+			return sprintf("%d", n)
+		}
+		function usd(c) {
+			if(c >= 1)
+				return sprintf("$%.2f", c)
+			return sprintf("$%.4f", c)
+		}
+		function fmtline(label, v, c,    all, s) {
+			all = v[1] + v[2] + v[3]
+			s = sprintf("%s in %s", label, hs(all))
+			if(all > 0)
+				s = s sprintf(" (%d%% cache hits)", 100 * v[3] / all)
+			s = s sprintf(", out %s", hs(v[4]))
+			if(c != "")
+				s = s ", ~" c
+			return s
+		}
+		BEGIN {
+			split(u, x, " ")
+			split(tot, t, " ")
+			if(np > 0){
+				rc = ""
+				if(rcost != "-")
+					rc = usd(rcost)
+				sc = ""
+				if(npriced > 0){
+					sc = usd(cost)
+					if(npriced < np)
+						sc = sc sprintf(" (+%d unpriced)", np - npriced)
+				}
+				print fmtline("last prompt:", x, rc)
+				print fmtline("session:    ", t, sc) sprintf(" over %d prompt%s", np, np == 1 ? "" : "s")
+			}
+			print "context:      " ctx " bytes, " exch " exchanges, resent with every request"
+		}' >[1=2]
+}
+
+# Fold the usage file into the session totals, report, and nudge
+# toward /compact when the history has grown past the threshold.
+fn acctround {
+	# Anthropic input_tokens excludes cached tokens; OpenAI
+	# (openai and responses alike) includes cache reads in it
+	# and has no cache writes.
+	acct_u=`{awk -v 'prov='^$"curprov '
+		{ v[$1] = $2 }
+		END {
+			i = v["input_tokens"] + 0
+			w = v["cache_creation_input_tokens"] + 0
+			r = v["cache_read_input_tokens"] + 0
+			o = v["output_tokens"] + 0
+			if(prov != "anthropic"){
+				i -= r
+				if(i < 0)
+					i = 0
+				w = 0
+			}
+			printf "%.0f %.0f %.0f %.0f\n", i, w, r, o
+		}' $sess/usage >[2]/dev/null}
+	if(! ~ $#acct_u 4)
+		acct_u=(0 0 0 0)
+
+	# prices: input output cachewrite cacheread, $/Mtok.
+	# Files in precedence order (first match wins): hand-written,
+	# Anthropic's page, LiteLLM.  An entry matches the model id
+	# exactly, or the id minus a snapshot date suffix, -YYYYMMDD
+	# (Anthropic: claude-haiku-4-5 prices claude-haiku-4-5-20251001)
+	# or -YYYY-MM-DD (OpenAI: gpt-4o prices gpt-4o-2024-08-06);
+	# never a looser prefix, which would let claude-opus-5 price an
+	# unknown claude-opus-5-6.  Only readable files are passed:
+	# awk with no file arguments would read the terminal and hang.
+	acct_pfiles=()
+	for(acct_f in $pricefile $anthprices $litellmprices){
+		if(test -r $acct_f)
+			acct_pfiles=($acct_pfiles $acct_f)
+	}
+	acct_price=()
+	if(! ~ $#acct_pfiles 0){
+		acct_price=`{awk -v 'm='^$"curmodel '
+			function hit(k,    rest) {
+				if(k == m)
+					return 1
+				if(substr(m, 1, length(k)) != k)
+					return 0
+				rest = substr(m, length(k) + 1)
+				if(rest ~ /^-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/)
+					return 1
+				return rest ~ /^-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/
+			}
+			NF >= 3 && hit($1) {
+				w = (NF >= 4) ? $4 : $2 * 1.25
+				r = (NF >= 5) ? $5 : $2 * 0.1
+				print $2, $3, w, r
+				exit
+			}' $acct_pfiles >[2]/dev/null}
+	}
+
+	acct_new=`{awk -v 'tot='^$"acct_tot -v 'u='^$"acct_u -v 'cost='^$"acct_cost -v 'price='^$"acct_price 'BEGIN {
+		split(tot, t, " ")
+		split(u, x, " ")
+		for(k = 1; k <= 4; k++)
+			printf "%.0f ", t[k] + x[k]
+		if(split(price, p, " ") == 4){
+			c = (x[1] * p[1] + x[2] * p[3] + x[3] * p[4] + x[4] * p[2]) / 1000000
+			printf "%.6f %.6f\n", cost + c, c
+		} else
+			printf "%.6f -\n", cost
+	}'}
+	if(~ $#acct_new 6){
+		acct_tot=$acct_new(1 2 3 4)
+		acct_cost=$acct_new(5)
+		acct_rcost=$acct_new(6)
+	}
+	if not
+		acct_rcost=-
+	acct_nprompt=`{awk -v 'n='^$"acct_nprompt 'BEGIN { print n + 1 }'}
+	if(! ~ $acct_rcost -)
+		acct_npriced=`{awk -v 'n='^$"acct_npriced 'BEGIN { print n + 1 }'}
+
+	# Rule off the accounting from the reply above it (not in
+	# acctreport: /usage prints that on its own, needing no rule).
+	echo '----------------------------------------' >[1=2]
+	acctreport
+	if(! ~ $warnbytes 0){
+		if(test $ctx_bytes -ge $nextwarn){
+			echo '*** context is '$ctx_h' bytes ('$ctx_exch' exchanges), resent with every request -- consider /compact ***' >[1=2]
+			warnreset
+		}
+	}
+}
+
 fn setget {
 	file=$1
 	label=$2
@@ -205,6 +681,7 @@ fn docmd {
 	if(~ $cmd /clear){
 		echo clear > $sess/ctl
 		echo 'cleared' >[1=2]
+		warnreset
 	}
 	if not if(~ $cmd /detach){
 		detach=1
@@ -221,6 +698,7 @@ fn docmd {
 		after=`{awk '/^exchanges/{print $2}' $sess/ctl}
 		bytes=`{awk '/^bytes/{print $2}' $sess/ctl}
 		echo 'compacted: '$before' -> '$after' exchanges ('$bytes' input bytes)' >[1=2]
+		warnreset
 	}
 	if not if(~ $cmd /sessions){
 		# Sessions are the directories under $mnt; the root
@@ -317,6 +795,7 @@ fn docmd {
 	}
 	if not if(~ $cmd /usage){
 		cat $sess/usage >[1=2]
+		acctreport
 	}
 	if not if(~ $cmd /help){
 		echo 'commands:' >[1=2]
@@ -351,7 +830,15 @@ fn docmd {
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /compact [n]   drop old exchanges, keep n recent (default 4)' >[1=2]
 		echo '  /status        show session info' >[1=2]
-		echo '  /usage         show token usage' >[1=2]
+		echo '  /usage         show raw token usage of the last prompt, plus' >[1=2]
+		echo '                 session totals and context size' >[1=2]
+		echo '  (after each prompt: tokens in/out, cache hit rate, and ~$ if' >[1=2]
+		echo '   the model is in '$pricefile',' >[1=2]
+		echo '   '$anthprices', or '$litellmprices' (checked in that' >[1=2]
+		echo '   order); [NK]> in the prompt is the' >[1=2]
+		echo '   history resent with every request.  Past $CLAUDEWARNBYTES' >[1=2]
+		echo '   ('$warnbytes') a /compact nudge appears.  Expect a low cache' >[1=2]
+		echo '   hit rate on the first prompt after /compact: the prefix changed.)' >[1=2]
 		echo '  /autocontinue [n]  auto-continue on max_tokens (default 3)' >[1=2]
 		echo '  /noautocontinue   disable auto-continue' >[1=2]
 		echo '  /maxrounds [n]  tool-loop round cap per prompt (default 20; no n = default)' >[1=2]
@@ -424,10 +911,13 @@ while(){
 		curprov=anthropic
 	# Show the provider in the prompt only when it is not the
 	# house default; dial-string style, provider!model/tokens.
+	# [size] is the history every request resends (see ctxstat;
+	# ctx_h is always one word, so the concatenation is safe).
+	ctxstat
 	if(~ $curprov anthropic)
-		prompt=$curmodel/$curtokens'> '
+		prompt=$curmodel/$curtokens' ['$ctx_h']> '
 	if not
-		prompt=$curprov'!'$curmodel/$curtokens'> '
+		prompt=$curprov'!'$curmodel/$curtokens' ['$ctx_h']> '
 	echo -n $prompt >[1=2]
 
 	cat > $msgfile
@@ -453,7 +943,7 @@ while(){
 		if(cat $msgfile > $sess/prompt){
 			wait $cpid
 			echo '' >[1=2]
-			cat $sess/usage >[1=2]
+			acctround
 		}
 		if not {
 			# The prompt write can fail before a round ever
@@ -471,6 +961,14 @@ while(){
 			wait $cpid
 			echo 'error:' >[1=2]
 			cat $sess/error >[1=2]
+			# A round that failed partway still billed its
+			# tokens, and doprompt publishes them to usage.
+			# A "session busy" refusal never started a round,
+			# and usage still belongs to whoever is busy, so
+			# skip accounting while the session is busy.
+			busy=`{awk '$1 == "busy" {print $2}' $sess/ctl >[2]/dev/null}
+			if(! ~ $"busy 1)
+				acctround
 		}
 		echo '' >[1=2]
 	}
