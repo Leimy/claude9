@@ -24,6 +24,7 @@ enum {
 	Qmodels,
 	Qgraph,
 	Qgraphlive,
+	Qnew,
 	Qsess,
 	Qctl,
 	Qprompt,
@@ -229,6 +230,7 @@ readskills(char *dir)
 
 static void freesession(Session*);
 static char* provkey(int);
+static char newusage[];
 
 /*
  * Strict decimal parser for control-file numeric settings
@@ -349,11 +351,18 @@ genname(void)
 /*
  * Create a session and link it onto the global list.
  * Returns with one reference held for the caller.
+ *
+ * want == nil (the clone file): the name comes from namefs,
+ * or falls back to the integer id on collision or failure.
+ * want != nil (the new file): the caller chose the name, and a
+ * collision is an error -- returns nil having created nothing,
+ * so the caller's later writes cannot land on somebody else's
+ * session of that name.
  */
 static Session*
-newsession(void)
+newsession(char *want)
 {
-	Session *s;
+	Session *s, *dup;
 	char *name, *skills;
 	char buf[32];
 
@@ -367,22 +376,27 @@ newsession(void)
 	 * sessionlk: genname blocks on file I/O, and a hung name
 	 * server must not wedge the whole fs.
 	 */
-	name = genname();
+	name = want != nil ? estrdup(want) : genname();
 
 	s = emallocz(sizeof *s, 1);
 	qlock(&sessionlk);
-	s->id = nextsid++;
-	s->ref = 1;
 	if(name != nil){
-		Session *dup;
 		for(dup = sessions; dup != nil; dup = dup->next)
 			if(strcmp(dup->name, name) == 0)
 				break;
 		if(dup != nil){
 			free(name);
 			name = nil;
+			if(want != nil){
+				qunlock(&sessionlk);
+				free(s);
+				free(skills);
+				return nil;
+			}
 		}
 	}
+	s->id = nextsid++;
+	s->ref = 1;
 	if(name == nil){
 		snprint(buf, sizeof buf, "%d", s->id);
 		name = estrdup(buf);
@@ -574,11 +588,13 @@ static struct {
 static struct {
 	char *name;
 	int type;
+	int mode;
 } rootfiles[] = {
-	{ "clone",	Qclone },
-	{ "models",	Qmodels },
-	{ "graph",	Qgraph },
-	{ "graphlive",	Qgraphlive },
+	{ "clone",	Qclone,		0444 },
+	{ "models",	Qmodels,	0444 },
+	{ "graph",	Qgraph,		0444 },
+	{ "graphlive",	Qgraphlive,	0444 },
+	{ "new",	Qnew,		0666 },
 };
 
 static void
@@ -603,7 +619,7 @@ rootgen(int i, Dir *d, void *v)
 	USED(v);
 	if(i < nelem(rootfiles)){
 		filldir(d, (Qid){rootfiles[i].type, 0, QTFILE},
-			rootfiles[i].name, 0444);
+			rootfiles[i].name, rootfiles[i].mode);
 		return 0;
 	}
 	i -= nelem(rootfiles);
@@ -1304,7 +1320,7 @@ fsstat(Req *r)
 	}
 	for(i = 0; i < nelem(rootfiles); i++){
 		if(path == rootfiles[i].type){
-			filldir(&r->d, r->fid->qid, rootfiles[i].name, 0444);
+			filldir(&r->d, r->fid->qid, rootfiles[i].name, rootfiles[i].mode);
 			respond(r, nil);
 			return;
 		}
@@ -1700,7 +1716,7 @@ fsread(Req *r)
 			srvrelease(&clsrv);
 			qlock(&clonelk);
 			if(fa->clone == nil)
-				fa->clone = newsession();
+				fa->clone = newsession(nil);
 			qunlock(&clonelk);
 			srvacquire(&clsrv);
 		}
@@ -1714,6 +1730,12 @@ fsread(Req *r)
 		srvrelease(&clsrv);
 		modelstext(r);
 		srvacquire(&clsrv);
+		return;
+	}
+
+	if(path == Qnew){
+		readstr(r, newusage);
+		respond(r, nil);
 		return;
 	}
 
@@ -1865,6 +1887,219 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 	} else
 		return "unknown ctl command";
 	return nil;
+}
+
+/*
+ * The root "new" file: create a fully configured session in
+ * one write, or create nothing.
+ *
+ * Wiring a sub-agent through clone is one read to learn the
+ * name and then one write per setting -- seven or eight tool
+ * rounds for a local-model session, each a full request from
+ * the coordinating model, and the session sits on the default
+ * (cloud) provider and model between them.  A half-applied
+ * configuration therefore does not merely misbehave: it sends
+ * the prompt to the wrong, expensive place.  This file makes
+ * creation atomic from the caller's view: the spec is parsed
+ * and its integers validated before any session exists, the
+ * remaining settings are applied through the same wr and ctl
+ * handlers the individual files use, and any failure deletes
+ * the session and returns that handler's error.  The caller
+ * chooses the name, so no read-back is needed to find the
+ * session afterward.
+ *
+ * Spec format: one "key value" per line.  name is required;
+ * everything else is optional and defaults exactly as a clone
+ * does.  system, if present, must be last: its value is the
+ * rest of the write, newlines included.  Reading the file
+ * returns this key list.
+ */
+static char newusage[] =
+	"write one 'key value' per line to create a session:\n"
+	"  name NAME            required; no whitespace or '/', not in use\n"
+	"  parent NAME          graph label (see ctl parent)\n"
+	"  provider P           anthropic | openai | responses\n"
+	"  baseurl URL          endpoint override, or - for the provider default\n"
+	"  model ID\n"
+	"  tokens N             max output tokens\n"
+	"  thinking SPEC        0 | off | <budget> | adaptive [effort]\n"
+	"  effort E             default | none | low | medium | high\n"
+	"  maxrounds N          tool-loop round cap per prompt\n"
+	"  autocontinue N       auto 'Continue.' rounds; 0 = off\n"
+	"  system TEXT          must be last; TEXT runs to the end of the write\n"
+	"On any error nothing is created.  Then write the session's prompt file.\n";
+
+typedef struct Newspec Newspec;
+struct Newspec {
+	char *name, *parent, *provider, *baseurl, *model, *tokens,
+	     *thinking, *effort, *system;
+	int maxrounds;		/* 0 = default */
+	int autocont;		/* -1 = not given */
+};
+
+static int
+badname(char *name)
+{
+	char *p;
+	int i;
+
+	if(name == nil || name[0] == '\0')
+		return 1;
+	for(p = name; *p != '\0'; p++)
+		if(*p == '/' || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			return 1;
+	for(i = 0; i < nelem(rootfiles); i++)
+		if(strcmp(name, rootfiles[i].name) == 0)
+			return 1;
+	return 0;
+}
+
+/*
+ * Parse the spec in place (data is our own copy).  Values are
+ * pointers into data; nothing is allocated.  Returns nil or a
+ * static error string.
+ */
+static char*
+parsenew(char *data, Newspec *sp)
+{
+	char *line, *next, *key, *val;
+	int n;
+
+	memset(sp, 0, sizeof *sp);
+	sp->autocont = -1;
+	for(line = data; line != nil; line = next){
+		next = strchr(line, '\n');
+		if(next != nil)
+			*next++ = '\0';
+		while(*line == ' ' || *line == '\t')
+			line++;
+		if(*line == '\0')
+			continue;
+		key = line;
+		val = line;
+		while(*val != '\0' && *val != ' ' && *val != '\t')
+			val++;
+		if(*val != '\0')
+			*val++ = '\0';
+		while(*val == ' ' || *val == '\t')
+			val++;
+		if(strcmp(key, "system") == 0){
+			/* rest of the write, newlines restored */
+			if(next != nil)
+				next[-1] = '\n';
+			sp->system = val;
+			break;
+		}
+		if(strcmp(key, "name") == 0)
+			sp->name = val;
+		else if(strcmp(key, "parent") == 0)
+			sp->parent = val;
+		else if(strcmp(key, "provider") == 0)
+			sp->provider = val;
+		else if(strcmp(key, "baseurl") == 0)
+			sp->baseurl = val;
+		else if(strcmp(key, "model") == 0)
+			sp->model = val;
+		else if(strcmp(key, "tokens") == 0)
+			sp->tokens = val;
+		else if(strcmp(key, "thinking") == 0)
+			sp->thinking = val;
+		else if(strcmp(key, "effort") == 0)
+			sp->effort = val;
+		else if(strcmp(key, "maxrounds") == 0){
+			if(!strictint(val, &n) || n < 1)
+				return "maxrounds: count must be a positive integer";
+			sp->maxrounds = n;
+		}else if(strcmp(key, "autocontinue") == 0){
+			if(!strictint(val, &n) || n < 0)
+				return "autocontinue: invalid count";
+			sp->autocont = n;
+		}else
+			return "new: unknown key (read the new file for the list)";
+	}
+	if(badname(sp->name))
+		return "new: name is required and must be one word without '/'";
+	return nil;
+}
+
+/*
+ * Apply the spec to a fresh session.  Called with s->lk held.
+ * Order matters in two places: provider before model (a model
+ * write does not depend on it today, but provider resets the
+ * request quirks), and tokens before thinking (wrthinking's
+ * budget check reads maxtokens).
+ */
+static char*
+applynew(Session *s, Newspec *sp)
+{
+	char *err;
+
+	if(sp->provider != nil && (err = wrprovider(s, sp->provider)) != nil)
+		return err;
+	if(sp->baseurl != nil && (err = wrbaseurl(s, sp->baseurl)) != nil)
+		return err;
+	if(sp->model != nil && (err = wrmodel(s, sp->model)) != nil)
+		return err;
+	if(sp->tokens != nil && (err = wrtokens(s, sp->tokens)) != nil)
+		return err;
+	if(sp->thinking != nil && (err = wrthinking(s, sp->thinking)) != nil)
+		return err;
+	if(sp->effort != nil && (err = wreffort(s, sp->effort)) != nil)
+		return err;
+	if(sp->maxrounds != 0)
+		s->conv->maxrounds = sp->maxrounds;
+	if(sp->autocont >= 0)
+		s->autocont = sp->autocont;
+	if(sp->parent != nil && sp->parent[0] != '\0' && strcmp(sp->parent, "-") != 0){
+		free(s->parent);
+		s->parent = estrdup(sp->parent);
+	}
+	if(sp->system != nil && (err = wrsystem(s, sp->system)) != nil)
+		return err;
+	return nil;
+}
+
+/*
+ * Write to the root new file.  Takes ownership of data.  No
+ * srvrelease: with a caller-chosen name newsession never
+ * touches namefs, and nothing here blocks on the network.
+ */
+static void
+donew(Req *r, char *data)
+{
+	Newspec sp;
+	Session *s;
+	char *err;
+	int sid;
+
+	err = parsenew(data, &sp);
+	if(err != nil){
+		free(data);
+		respond(r, err);
+		return;
+	}
+	s = newsession(sp.name);
+	if(s == nil){
+		free(data);
+		respond(r, "new: session name already in use");
+		return;
+	}
+	sid = s->id;
+	qlock(&s->lk);
+	err = applynew(s, &sp);
+	qunlock(&s->lk);
+	free(data);
+	if(err != nil){
+		/* leave no half-configured session behind */
+		delsession(sid);
+		sessput(s);
+		respond(r, err);
+		return;
+	}
+	bumpgraph();
+	sessput(s);
+	r->ofcall.count = r->ifcall.count;
+	respond(r, nil);
 }
 
 /*
@@ -2051,18 +2286,34 @@ fswrite(Req *r)
 	type = QTYPE(path);
 	sid = QSID(path);
 
-	s = sessget(sid);
-	if(s == nil){
-		respond(r, "session gone");
-		return;
-	}
-
 	count = r->ifcall.count;
 	data = emalloc(count + 1);
 	memmove(data, r->ifcall.data, count);
 	data[count] = '\0';
 	while(count > 0 && (data[count-1] == '\n' || data[count-1] == '\r'))
 		data[--count] = '\0';
+
+	/*
+	 * Root files share sid 0 with session 0 (see the qid
+	 * comment at the top), so they must be recognized before
+	 * any session lookup.  new is the only writable one.
+	 */
+	if(path < Qsess){
+		if(path == Qnew)
+			donew(r, data);
+		else{
+			free(data);
+			respond(r, "permission denied");
+		}
+		return;
+	}
+
+	s = sessget(sid);
+	if(s == nil){
+		free(data);
+		respond(r, "session gone");
+		return;
+	}
 
 	switch(type){
 	case Qprompt:

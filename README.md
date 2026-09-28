@@ -201,6 +201,9 @@ unavailable).
 		              session; terminates with EOF (see Session Graph)
 		graphlive     same summary, but a blocking long-poll for live
 		              viewers (see Session Graph)
+		new           write a spec to create a named, fully configured
+		              session in one write (see Creating a Session);
+		              read for the key list
 		<n>/          session directory
 			ctl       read for session info; write commands
 			prompt    write a message; read the last final reply
@@ -216,6 +219,42 @@ unavailable).
 			advisor   Anthropic server-side advisor setting
 			usage     read token usage statistics
 			error     read last error message
+
+### Creating a Session in One Write
+
+`clone` hands out a session with default settings and a generated
+name; configuring it is then one write per setting, each a
+separate round trip -- and for a model driving a sub-agent, a
+separate tool call and API request.  The root `new` file does
+the whole job atomically.  Write one `key value` per line:
+
+	echo 'name coder-1
+	parent mysession
+	provider openai
+	baseurl http://localhost:8080/v1/chat/completions
+	model qwen-coder
+	tokens 32768
+	maxrounds 25
+	system You are a careful C programmer.' > /mnt/claudesub/new
+
+`name` is required and is the session's directory name (one word,
+no `/`, not a root file name, not already in use).  Every other key
+is optional and defaults exactly as a cloned session does:
+`parent`, `provider`, `baseurl`, `model`, `tokens`, `thinking`,
+`effort`, `maxrounds`, `autocontinue`, and `system`, which must be
+last because its value is the rest of the write, newlines included.
+Reading `new` returns this list.
+
+The write either creates the session fully configured or creates
+nothing: integers are checked before anything exists, the remaining
+keys are applied through the same handlers the per-session files
+use (so every invariant and error message is the same), and a
+failure part-way deletes the session and returns that error.  This
+matters because a fresh session sits on the default provider and
+model -- cloud Opus, typically -- until it is configured; there is
+no window in which a half-configured session could send a prompt to
+the wrong place.  Because the caller chooses the name, no read-back
+is needed: write `new`, then write `<name>/prompt`.
 
 ### Session Commands (write to ctl)
 
@@ -1088,6 +1127,12 @@ can also drive them from rc without claudetalk:
 
 	# Create a session
 	n=`{cat /mnt/claude/clone}
+
+	# ...or create a named, configured one in a single write
+	echo 'name quick
+	model claude-haiku-4-5-20251001
+	maxrounds 10' > /mnt/claude/new
+	n=quick
 
 	# Send a message and read the reply
 	echo 'hello' > /mnt/claude/$n/prompt

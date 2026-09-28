@@ -76,7 +76,39 @@ delete strays with `create_file /mnt/acme/<id>/ctl "delete\n"`.
 
 ### 2. Create a sub-agent session
 
-Read `clone` on the **sub-agent** claude9fs mount:
+**Preferred: one write to `new`.**  The root `new` file creates a
+fully configured session in a single write, or creates nothing.
+You choose the name, so there is no read-back, and `parent` and
+every setting from steps 2-3 go in the same write:
+
+    create_file /mnt/claudesub/new "name coder-1
+    parent my-session-name
+    model claude-sonnet-5
+    maxrounds 60
+    autocontinue 3
+    system You are a concise implementer."
+
+Keys (read `/mnt/claudesub/new` for the live list): `name`
+(required; one word, no `/`, not in use), `parent`, `provider`,
+`baseurl`, `model`, `tokens`, `thinking`, `effort`, `maxrounds`,
+`autocontinue`, and `system`, which must be last because its value
+runs to the end of the write, newlines included.  Anything omitted
+defaults exactly as a `clone` does.  The integers are validated
+before the session exists; the rest is applied through the same
+handlers the individual files use, and any failure deletes the
+session and returns that error -- so a session either exists fully
+configured or not at all, and there is never a half-configured
+session sitting on the default (cloud, Opus) provider and model.
+This is the fix for the "config files written in one batch reverted
+to Opus" hazard: with `new` there are no separate config writes to
+reorder.  A local-model session is then exactly four tool calls
+end to end: `new`, `prompt`, read `prompt`, `hangup`.
+
+Then skip to step 4.  Steps 2 (clone) and 3 below remain valid and
+are what `new` is built on; use them when you need to reconfigure
+a session that already exists.
+
+**Alternative: clone.**  Read `clone` on the **sub-agent** claude9fs mount:
 
     read_file /mnt/claudesub/clone   -->  "dizzy-monkey"
 
@@ -168,9 +200,43 @@ Hang up the sub-agent session:
 
     create_file /mnt/claudesub/dizzy-monkey/ctl "hangup"
 
+## Local models: one at a time
+
+Sub-agents on the local inference server (provider `openai`,
+`baseurl` pointing at the llama.cpp host -- see
+`/usr/dave/local_models.md` for the endpoint, the model ids, and
+which model suits which task) are cheap in money but bound by the
+machine: **it runs one large local model at a time.**  Two local
+sessions prompted concurrently, on different models or even the
+same one, thrash or fail; nothing in claude9fs prevents it, so the
+rule is yours to keep:
+
+- Never have two local sessions with a prompt in flight at once.
+  Write one local session's `prompt`, let the write return, read
+  the result, and hang it up (`ctl hangup`) before creating or
+  prompting another.  Do not batch two local `prompt` writes in
+  one reply.
+- Cloud sessions (Anthropic, or `openai` at the real endpoint)
+  have no such limit; one local session may run alongside any
+  number of cloud sessions.  The parallel fan-out below is for
+  cloud sub-agents, or for a single local one among cloud ones.
+- Because a local session sits on the default (cloud) model until
+  configured, always create it with a single `new` write that
+  includes `provider`, `baseurl`, and `model` together (step 2),
+  never by clone-then-configure.
+
+This is a rule, not a mechanism, by choice: the limit belongs to
+the inference server, which claude9fs cannot recognize from a
+`baseurl`.  If it gets broken in practice, the planned fix is an
+opt-in per-`baseurl` prompt gate in claude9fs that queues the
+second local prompt behind the first (so the pattern degrades to
+sequential instead of failing) -- see the maintenance note at the
+end of this file before adding it.
+
 ## Running several sub-agents in parallel
 
-Multiple sub-agent sessions genuinely run concurrently: the
+Cloud sub-agents only, or at most one local one among them (see
+the section above).  Multiple sub-agent sessions genuinely run concurrently: the
 claude9fs process serving them executes a turn's tool calls in
 parallel (one Plan 9 process per call) whenever a single model
 turn issues more than one tool_use block.  In practice this
@@ -180,11 +246,13 @@ reply -- not one at a time, waiting for each to return before
 starting the next -- and they will actually run at the same
 time instead of queuing up.
 
-    read_file /mnt/claudesub/clone   -->  "0"
-    read_file /mnt/claudesub/clone   -->  "1"
-    read_file /mnt/claudesub/clone   -->  "2"
-    (configure each: model, system)
-    (issue all three prompt writes together, in one reply)
+    create_file /mnt/claudesub/new "name w0\nparent me\nmodel ...\n..."
+    create_file /mnt/claudesub/new "name w1\nparent me\nmodel ...\n..."
+    create_file /mnt/claudesub/new "name w2\nparent me\nmodel ...\n..."
+    (all three `new` writes in one reply; they share a path, so
+     the round serializes them, which costs nothing -- creation
+     does no network I/O.  Then all three prompt writes in the
+     next reply, which do run in parallel.)
 
 If sub-agent work still seems to serialize even when you batch
 the calls this way, that is a bug worth noticing and reporting,
@@ -434,6 +502,12 @@ Read `/mnt/claudesub/models` (or `/mnt/claude/models`) for the
 live list rather than trusting this table; writing an unknown
 name to `model` is accepted and only fails at the first prompt.
 
+Local models (llama.cpp on the home server) never appear in
+`models`; their ids, endpoint, and the task each is good for are
+in `/usr/dave/local_models.md`, which is the authority for
+routing between local and cloud.  One local model runs at a
+time (see "Local models: one at a time" above).
+
 ## Security note: mk is not a shell
 
 The `mk` tool exists only for checking whether code compiles.
@@ -463,4 +537,12 @@ commands (`handlectl`).  Edit the copy under
 the change survives a redeploy; then propagate it to whatever
 deployed skills directory is actually in use (check the skill
 list in your own system prompt for the path it was loaded
-from).
+from); `mk install` there does both.
+
+Session creation lives in `claude9fs.c`: `newsession` (clone and
+`new` share it), `parsenew`/`applynew`/`donew` for the `new`
+file, and the per-file `wr*` setters `applynew` reuses.  If the
+one-local-model rule ever needs enforcing, the place is
+`doprompt` (the prompt round itself): gate it on a lock keyed by
+`s->conv->baseurl`, opt-in per session via a `new` key, so a
+second local prompt queues instead of thrashing the server.
