@@ -69,6 +69,7 @@ struct Session {
 	int closed;	/* session destroyed; guarded by streamlk */
 	/* auto-continue on max_tokens or tool-loop round cap */
 	int autocont;	/* max auto-continue rounds; 0 = disabled */
+	int gated;	/* serialize prompts with other gated sessions on the same baseurl; guarded by lk */
 	Session *next;
 };
 
@@ -106,6 +107,44 @@ static char *namepath = "/mnt/names/name";
 static Session *sessions;
 static int nextsid;
 static QLock sessionlk;
+
+/*
+ * Prompt gates.  A session with gated set takes the gate for its
+ * baseurl for the whole of a prompt round (doprompt), so two gated
+ * sessions aimed at the same server -- typically a local llama.cpp
+ * that can run only one large model at a time -- queue instead of
+ * thrashing it.  Gates are keyed by baseurl string, created on
+ * first use and never freed (there are only a handful of urls).
+ * gateslk guards only the list and is a leaf lock.
+ */
+typedef struct Gate Gate;
+struct Gate {
+	char *url;
+	QLock lk;
+	Gate *next;
+};
+
+static Gate *gates;
+static QLock gateslk;
+
+static Gate*
+gateget(char *url)
+{
+	Gate *g;
+
+	qlock(&gateslk);
+	for(g = gates; g != nil; g = g->next)
+		if(strcmp(g->url, url) == 0)
+			break;
+	if(g == nil){
+		g = emallocz(sizeof *g, 1);
+		g->url = estrdup(url);
+		g->next = gates;
+		gates = g;
+	}
+	qunlock(&gateslk);
+	return g;
+}
 
 /*
  * Serializes session allocation on clone reads.  The Qclone
@@ -1063,7 +1102,8 @@ rdctl(Session *s)
 		"effort %s\n"
 		"provider %s\n"
 		"baseurl %s\n"
-		"advisor %s\n",
+		"advisor %s\n"
+		"gate %d\n",
 		s->name,
 		s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
 		s->conv->model,
@@ -1078,7 +1118,8 @@ rdctl(Session *s)
 		s->conv->effort != nil ? s->conv->effort : "default",
 		providername(s->conv->prov),
 		s->conv->baseurl != nil ? s->conv->baseurl : "-",
-		advisor);
+		advisor,
+		s->gated);
 	free(think);
 	free(advisor);
 	return text;
@@ -1848,6 +1889,17 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		free(s->parent);
 		s->parent = (*v != '\0' && strcmp(v, "-") != 0) ? estrdup(v) : nil;
 		bumpgraph();
+	} else if(strncmp(cmd, "gate", 4) == 0
+	&& (cmd[4] == '\0' || cmd[4] == ' ')){
+		char *v;
+		v = cmd + 4;
+		while(*v == ' ') v++;
+		if(*v == '\0' || strcmp(v, "on") == 0)
+			s->gated = 1;
+		else if(strcmp(v, "off") == 0)
+			s->gated = 0;
+		else
+			return "gate: expected on or off";
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangupp = 1;
 	} else if(strcmp(cmd, "reloadskills") == 0){
@@ -1926,6 +1978,7 @@ static char newusage[] =
 	"  effort E             default | none | low | medium | high\n"
 	"  maxrounds N          tool-loop round cap per prompt\n"
 	"  autocontinue N       auto 'Continue.' rounds; 0 = off\n"
+	"  gate on|off          queue prompts behind other gated sessions on the same baseurl\n"
 	"  system TEXT          must be last; TEXT runs to the end of the write\n"
 	"On any error nothing is created.  Then write the session's prompt file.\n";
 
@@ -1935,6 +1988,7 @@ struct Newspec {
 	     *thinking, *effort, *system;
 	int maxrounds;		/* 0 = default */
 	int autocont;		/* -1 = not given */
+	int gate;		/* -1 = not given */
 };
 
 static int
@@ -1967,6 +2021,7 @@ parsenew(char *data, Newspec *sp)
 
 	memset(sp, 0, sizeof *sp);
 	sp->autocont = -1;
+	sp->gate = -1;
 	for(line = data; line != nil; line = next){
 		next = strchr(line, '\n');
 		if(next != nil)
@@ -2014,6 +2069,13 @@ parsenew(char *data, Newspec *sp)
 			if(!strictint(val, &n) || n < 0)
 				return "autocontinue: invalid count";
 			sp->autocont = n;
+		}else if(strcmp(key, "gate") == 0){
+			if(strcmp(val, "on") == 0)
+				sp->gate = 1;
+			else if(strcmp(val, "off") == 0)
+				sp->gate = 0;
+			else
+				return "gate: expected on or off";
 		}else
 			return "new: unknown key (read the new file for the list)";
 	}
@@ -2050,6 +2112,8 @@ applynew(Session *s, Newspec *sp)
 		s->conv->maxrounds = sp->maxrounds;
 	if(sp->autocont >= 0)
 		s->autocont = sp->autocont;
+	if(sp->gate >= 0)
+		s->gated = sp->gate;
 	if(sp->parent != nil && sp->parent[0] != '\0' && strcmp(sp->parent, "-") != 0){
 		free(s->parent);
 		s->parent = estrdup(sp->parent);
@@ -2131,6 +2195,7 @@ doprompt(Req *r, Session *s, char *data)
 {
 	char *reply, *err;
 	int autocont, round, ok;
+	Gate *gate;
 	Usage u;
 	Fmt f;
 
@@ -2148,6 +2213,9 @@ doprompt(Req *r, Session *s, char *data)
 	convappend(s->conv, msgnew(Muser, data, nil));
 	free(data);
 	autocont = s->autocont;
+	gate = nil;
+	if(s->gated && s->conv->baseurl != nil)
+		gate = gateget(s->conv->baseurl);
 	qunlock(&s->lk);
 	bumpgraph();
 
@@ -2156,6 +2224,10 @@ doprompt(Req *r, Session *s, char *data)
 	fmtstrinit(&f);
 	ok = 0;
 	err = nil;
+
+	/* gated: wait our turn behind other gated sessions on this baseurl */
+	if(gate != nil)
+		qlock(&gate->lk);
 
 	for(round = 0; ; round++){
 		reply = claudeconverse(s->conv, &u, streamcb, s, &err);
@@ -2212,8 +2284,33 @@ doprompt(Req *r, Session *s, char *data)
 		u.stop_reason = nil;
 	}
 
+	if(gate != nil)
+		qunlock(&gate->lk);
+
 	streamfinish(s);
 	reply = fmtstrflush(&f);
+
+	/*
+	 * Make the published stop_reason tell the truth about how
+	 * the prompt ended.  A round that failed outright (API
+	 * error such as an exhausted credit balance, HTTP failure,
+	 * dropped connection, context overflow) never sets a stop
+	 * reason of its own, so u.stop_reason is either nil (shown
+	 * as "none") or STALE: the previous successful round's
+	 * value, typically "tool_use", which reads as if the loop
+	 * had merely been capped.  Report "error" instead; the
+	 * details are in the error file.  The round-cap errors
+	 * ("tool loop limit reached", "tool/advisor loop limit
+	 * reached") are not failures: their stop_reason is the
+	 * last round's real one (tool_use / pause_turn) and is
+	 * left alone.
+	 */
+	if(err != nil || !ok){
+		if(err == nil || strstr(err, "loop limit reached") == nil){
+			free(u.stop_reason);
+			u.stop_reason = estrdup("error");
+		}
+	}
 
 	qlock(&s->lk);
 	s->busy = 0;

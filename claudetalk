@@ -571,6 +571,44 @@ fn acctreport {
 		}' >[1=2]
 }
 
+# Say how the last prompt ended: the usage file's stop_reason,
+# with a plain-language gloss for the ones that mean "something
+# ran out", plus the error file if $1 is 1.  The error file is
+# not only for failures: a prompt that stopped at the tool-loop
+# round cap (or lost a later round after some text arrived)
+# still succeeds as a write, so nothing else would tell you.
+# Callers that have already printed the error (a failed prompt
+# write) pass no argument, to avoid saying it twice.
+#   end_turn    the model finished on its own
+#   max_tokens  output cut off at the per-round token cap
+#   tool_use    still calling tools when the round cap hit
+#   pause_turn  advisor pause when the round cap hit
+#   error       the round failed (out of credit, rate limit,
+#               context overflow, connection lost, ...)
+fn stopreport {
+	sr=`{awk '$1 == "stop_reason" { print $2 }' $sess/usage >[2]/dev/null}
+	if(~ $#sr 0)
+		sr=none
+	sr=$sr(1)
+	switch($sr){
+	case max_tokens
+		echo 'stop: max_tokens -- reply cut off at the output token limit (see /tokens, /autocontinue)' >[1=2]
+	case tool_use
+		echo 'stop: tool_use -- still calling tools when the round cap hit (see /maxrounds, /autocontinue)' >[1=2]
+	case pause_turn
+		echo 'stop: pause_turn -- advisor pause when the round cap hit (see /maxrounds)' >[1=2]
+	case error
+		echo 'stop: error -- the request failed, see the error message' >[1=2]
+	case *
+		echo 'stop: '$sr >[1=2]
+	}
+	if(~ $1 1){
+		serr=`{cat $sess/error >[2]/dev/null}
+		if(! ~ $#serr 0)
+			echo 'error: '$"serr >[1=2]
+	}
+}
+
 # Fold the usage file into the session totals, report, and nudge
 # toward /compact when the history has grown past the threshold.
 fn acctround {
@@ -796,6 +834,7 @@ fn docmd {
 	if not if(~ $cmd /usage){
 		cat $sess/usage >[1=2]
 		acctreport
+		stopreport 1
 	}
 	if not if(~ $cmd /help){
 		echo 'commands:' >[1=2]
@@ -944,6 +983,7 @@ while(){
 			wait $cpid
 			echo '' >[1=2]
 			acctround
+			stopreport 1
 		}
 		if not {
 			# The prompt write can fail before a round ever
@@ -967,8 +1007,10 @@ while(){
 			# and usage still belongs to whoever is busy, so
 			# skip accounting while the session is busy.
 			busy=`{awk '$1 == "busy" {print $2}' $sess/ctl >[2]/dev/null}
-			if(! ~ $"busy 1)
+			if(! ~ $"busy 1){
 				acctround
+				stopreport
+			}
 		}
 		echo '' >[1=2]
 	}

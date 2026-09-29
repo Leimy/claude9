@@ -91,7 +91,8 @@ every setting from steps 2-3 go in the same write:
 Keys (read `/mnt/claudesub/new` for the live list): `name`
 (required; one word, no `/`, not in use), `parent`, `provider`,
 `baseurl`, `model`, `tokens`, `thinking`, `effort`, `maxrounds`,
-`autocontinue`, and `system`, which must be last because its value
+`autocontinue`, `gate` (`on`|`off`, see "Local models"), and
+`system`, which must be last because its value
 runs to the end of the write, newlines included.  Anything omitted
 defaults exactly as a `clone` does.  The integers are validated
 before the session exists; the rest is applied through the same
@@ -225,13 +226,19 @@ rule is yours to keep:
   includes `provider`, `baseurl`, and `model` together (step 2),
   never by clone-then-configure.
 
-This is a rule, not a mechanism, by choice: the limit belongs to
+The rule is still yours to keep by default: the limit belongs to
 the inference server, which claude9fs cannot recognize from a
-`baseurl`.  If it gets broken in practice, the planned fix is an
-opt-in per-`baseurl` prompt gate in claude9fs that queues the
-second local prompt behind the first (so the pattern degrades to
-sequential instead of failing) -- see the maintenance note at the
-end of this file before adding it.
+`baseurl`.  As a safety net there is an opt-in per-`baseurl`
+prompt gate: add `gate on` to the `new` write (or write `gate on`
+to a session's `ctl`) and that session's prompt rounds take a lock
+keyed by its `baseurl`, so a second gated prompt to the same
+baseurl waits for the first instead of thrashing the server.  The
+session shows `busy 1` while queued; `ctl` reports `gate 0|1`.
+Ungated sessions and sessions without a `baseurl` are unaffected.
+Set `gate on` on every local session you create.  It only takes
+effect on a claude9fs built after this change (`mk install`, then
+restart the servers), and it does not replace the one-at-a-time
+habit: a queued prompt still occupies a tool call until it runs.
 
 ## Running several sub-agents in parallel
 
@@ -542,7 +549,8 @@ from); `mk install` there does both.
 Session creation lives in `claude9fs.c`: `newsession` (clone and
 `new` share it), `parsenew`/`applynew`/`donew` for the `new`
 file, and the per-file `wr*` setters `applynew` reuses.  If the
-one-local-model rule ever needs enforcing, the place is
-`doprompt` (the prompt round itself): gate it on a lock keyed by
-`s->conv->baseurl`, opt-in per session via a `new` key, so a
-second local prompt queues instead of thrashing the server.
+one-local-model rule needs changing, the mechanism is the `Gate`
+list and `gateget` near the top of `claude9fs.c`: `doprompt` takes
+`gate->lk` (keyed by `s->conv->baseurl`) around the round loop when
+`s->gated` is set.  The `gate` key is handled in `parsenew`/
+`applynew` and the ctl command in `handlectl`.

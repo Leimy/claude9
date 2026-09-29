@@ -241,8 +241,8 @@ the whole job atomically.  Write one `key value` per line:
 no `/`, not a root file name, not already in use).  Every other key
 is optional and defaults exactly as a cloned session does:
 `parent`, `provider`, `baseurl`, `model`, `tokens`, `thinking`,
-`effort`, `maxrounds`, `autocontinue`, and `system`, which must be
-last because its value is the rest of the write, newlines included.
+`effort`, `maxrounds`, `autocontinue`, `gate` (`on` or `off`; see
+Prompt Gate), and `system`, which must be last because its value is the rest of the write, newlines included.
 Reading `new` returns this list.
 
 The write either creates the session fully configured or creates
@@ -265,6 +265,8 @@ is needed: write `new`, then write `<name>/prompt`.
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
 	maxrounds [n]      set the per-prompt tool-loop round cap; no n restores the default
+	gate [on|off]      queue this session's prompts behind other gated sessions
+	                   with the same baseurl; bare "gate" means on (see Prompt Gate)
 	reloadskills       re-read the skills directory (see Skills)
 
 ### Defaults
@@ -280,6 +282,7 @@ New sessions start with:
 	advisor       off
 	autocontinue  off
 	maxrounds     20                (override with -r)
+	gate          off
 
 The defaults are chosen to interlock: 16384 output tokens per
 round is enough that ordinary coding work never hits the cap,
@@ -470,6 +473,49 @@ claudetalk exposes the same setting as `/advisor`. Advisor tokens are
 reported by Anthropic separately in `usage.iterations`; the current
 `usage` file continues to show the executor's top-level totals only.
 
+### Prompt Gate
+
+A local inference server (llama.cpp, for one) typically runs one
+large model at a time, and two sessions prompting it concurrently
+thrash or fail.  claude9fs cannot recognize such a server from its
+`baseurl`, so the protection is opt-in per session: write `gate on`
+to `ctl` (or `gate on` in the `new` spec).  A gated session takes a
+lock keyed by the exact `baseurl` string for the whole of a prompt
+(all its rounds), so a second gated prompt to the same `baseurl`
+waits for the first.  A queued session shows `busy 1`.  `ctl` reports
+`gate 0` or `gate 1` as its last line.  Sessions that are not gated,
+or that have no `baseurl` override, are unaffected.
+
+	echo 'gate on' > /mnt/claudesub/local-1/ctl
+	echo 'gate off' > /mnt/claudesub/local-1/ctl
+
+The key is the literal string: `http://x/v1` and `http://x/v1/` are
+different gates.  Waiters are served in lock order, which is not
+guaranteed to be FIFO.  A queued prompt still occupies its caller's
+write until it runs.
+
+Known limitations:
+
+- The gate only serializes gated sessions.  It cannot know that a
+  server is single-model, so every session that talks to it must
+  be gated; one ungated session bypasses it.
+- The key is the exact `baseurl` string, not the host.  Two spellings
+  of the same server are two gates, and nothing normalizes them.
+- It has had one live test: two gated sessions on the same baseurl,
+  prompted in parallel, ran strictly one after the other.  Busy state
+  while queued was not observed during that run.
+- Hanging up a session while its prompt is queued behind the gate is
+  untested.  The prompt path holds a session reference, so it should
+  be safe, but a crash or wedge there would be a bug.  (It is hard to
+  test from a tool loop: a sub-agent cannot reach its own server's
+  files, and a hangup issued alongside the prompts races the prompts
+  and usually lands first.  Do it from a shell while a queued prompt
+  is waiting.)
+- The gate is a plain QLock: no timeout and no queue limit.  Whether
+  a Tflush (interrupt) cancels a queued wait has not been checked.
+- It affects only claude9fs prompts.  Anything else using the same
+  server is not covered.
+
 ### Tool Use
 
 When you write to `prompt`, claude9fs runs the full tool loop:
@@ -568,6 +614,34 @@ when the cap is reached.  Directories are rejected in favor of
 `list_directory`.  The cap bounds memory and history growth, but it
 cannot prevent an arbitrary special file from blocking before it
 produces data.
+
+### How a Prompt Ended: `stop_reason`
+
+The `usage` file's `stop_reason` line says why the last prompt
+stopped, using Anthropic's names for every provider:
+
+	end_turn    the model finished on its own
+	max_tokens  output cut off at the per-round `tokens` cap
+	tool_use    still calling tools when the `maxrounds` cap hit
+	            (`error` reads `tool loop limit reached`)
+	pause_turn  Anthropic advisor pause at the round cap
+	            (`error` reads `tool/advisor loop limit reached`)
+	error       the round failed outright: exhausted credit,
+	            rate limit, context overflow, dropped
+	            connection, ...  The `error` file has the text.
+	none        no prompt has run since the session was
+	            created or cleared
+
+With autocontinue the value is the final round's; earlier
+truncations that were continued past are not recorded.  A failed
+prompt reports `error` rather than a stale value from an earlier
+round of the same prompt.
+
+claudetalk prints a `stop:` line after every prompt, with a
+short explanation for the values above that mean something ran
+out, followed by the `error` file's text when there is any --
+including for prompts that hit the round cap, which succeed as
+writes and so used to pass without comment.
 
 ### Streaming
 
