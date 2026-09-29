@@ -25,6 +25,19 @@
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
 #
+# Interrupting: DEL used to hang up the session and exit.  It now
+# cancels the reply in progress and returns to the prompt with the
+# session intact and the conversation resumable; at the input prompt
+# it discards the message being typed.  To leave, use /quit or ^D on
+# an empty line.  Pressing DEL a second time before the turn ends
+# gives up (hanging up the session unless -d or /detach), which is
+# the escape hatch if the server is too old to cancel.  Cancelling
+# needs a claude9fs built from the same tree; restart the servers
+# (rm /srv/claude /srv/claudesub) after mk install.  The cut-off
+# round's output tokens are usually not reported by the provider
+# (input and cache tokens sometimes are), so the cost lines for a
+# cancelled prompt undercount.
+#
 # Cost display: after every prompt claudetalk prints what that
 # prompt consumed (summed over its whole tool loop), running
 # session totals, and the conversation size that every request
@@ -204,7 +217,7 @@ curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
 echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /effort [level] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
-echo 'type message, end with ^D to send, DEL to interrupt' >[1=2]
+echo 'type message, end with ^D to send.  DEL cancels a reply in progress (or discards what you are typing); /quit or ^D on an empty line exits' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
 echo '' >[1=2]
@@ -583,6 +596,7 @@ fn acctreport {
 #   max_tokens  output cut off at the per-round token cap
 #   tool_use    still calling tools when the round cap hit
 #   pause_turn  advisor pause when the round cap hit
+#   cancelled   you pressed DEL (or something wrote "cancel" to ctl)
 #   error       the round failed (out of credit, rate limit,
 #               context overflow, connection lost, ...)
 fn stopreport {
@@ -597,6 +611,8 @@ fn stopreport {
 		echo 'stop: tool_use -- still calling tools when the round cap hit (see /maxrounds, /autocontinue)' >[1=2]
 	case pause_turn
 		echo 'stop: pause_turn -- advisor pause when the round cap hit (see /maxrounds)' >[1=2]
+	case cancelled
+		echo 'stop: cancelled -- stopped by DEL; usage above is partial (output tokens of the cut-off round are usually not reported)' >[1=2]
 	case error
 		echo 'stop: error -- the request failed, see the error message' >[1=2]
 	case *
@@ -884,7 +900,13 @@ fn docmd {
 		echo '  /reloadskills  re-read the skills directory (all sessions)' >[1=2]
 		echo '  /graph         open a claudegraph window on all live sessions' >[1=2]
 		echo '  /detach        keep session alive on exit' >[1=2]
-		echo '  /quit          exit' >[1=2]
+		echo '  /quit          exit (so does ^D on an empty line)' >[1=2]
+		echo '  DEL            while a reply is running: cancel it (the session' >[1=2]
+		echo '                 stays up and you get the prompt back); at the' >[1=2]
+		echo '                 input prompt: discard the message being typed.' >[1=2]
+		echo '                 It no longer exits.  DEL again before the turn' >[1=2]
+		echo '                 ends means the cancel did not take (old claude9fs?):' >[1=2]
+		echo '                 leave, hanging up unless /detach.' >[1=2]
 	}
 	if not if(~ $cmd /autocontinue /ac){
 		shift
@@ -933,13 +955,35 @@ fn sigexit {
 	teardown
 	cleanup
 }
+# DEL no longer ends the session.  rio sends "interrupt" to the
+# window's whole note group, so it also kills whichever child is in
+# the foreground: the cat writing the prompt (claude9fs sees that
+# write flushed and cancels the reply) or the cat reading your
+# input (the message being typed is discarded).  All the handler
+# has to do is remember that it happened -- $intr is tested where
+# each of those cats returns, and reset at the top of every turn.
+#
+# A second DEL before the turn is over means the first did not
+# work (typically: claude9fs is an old build that cannot cancel,
+# so the write stays blocked until the model finishes).  That is
+# the one case where the old behavior is still wanted: give up,
+# hanging up the session unless -d/detach, as DEL used to.
+intr=()
 fn sigint {
-	teardown
-	cleanup
-	exit interrupt
+	intr=($intr x)
+	if(! ~ $#intr 1){
+		echo '' >[1=2]
+		echo 'second interrupt: leaving' >[1=2]
+		teardown
+		cleanup
+		exit interrupt
+	}
 }
 
-while(){
+# rc has no break: the loop runs until a quit/EOF path sets done=1.
+done=0
+while(~ $done 0){
+	intr=()
 	curmodel=`{cat $sess/model}
 	curtokens=`{cat $sess/tokens}
 	curprov=`{cat $sess/provider >[2]/dev/null}
@@ -960,59 +1004,82 @@ while(){
 	echo -n $prompt >[1=2]
 
 	cat > $msgfile
-	if(! test -s $msgfile)
-		break
-
-	# read first line for command detection
-	first=`{sed 1q $msgfile}
-	if(~ $#first 0)
-		break
-	cmd=$first(1)
-
-	if(~ $cmd /quit /exit)
-		break
-
-	if(~ $cmd /*)
-		docmd $first
-	if not {
-		# Start the streaming reader first so it is blocked in
-		# open() before we write the prompt.
-		cat $sess/stream &
-		cpid=$apid
-		if(cat $msgfile > $sess/prompt){
-			wait $cpid
-			echo '' >[1=2]
-			acctround
-			stopreport 1
-		}
-		if not {
-			# The prompt write can fail before a round ever
-			# starts (e.g. 'session busy'), leaving the
-			# stream reader latched on an idle session,
-			# waiting for a round that will never come.
-			# Kill it so wait does not hang; the resulting
-			# Tflush is handled cleanly by claude9fs.
-			# The stream reader may already have exited by
-			# now.  Test for its note file before writing it;
-			# redirecting the write is not enough on rc because
-			# a failed redirection is diagnosed by the shell.
-			if(test -e /proc/$cpid/note)
-				echo kill > /proc/$cpid/note
-			wait $cpid
-			echo 'error:' >[1=2]
-			cat $sess/error >[1=2]
-			# A round that failed partway still billed its
-			# tokens, and doprompt publishes them to usage.
-			# A "session busy" refusal never started a round,
-			# and usage still belongs to whoever is busy, so
-			# skip accounting while the session is busy.
-			busy=`{awk '$1 == "busy" {print $2}' $sess/ctl >[2]/dev/null}
-			if(! ~ $"busy 1){
-				acctround
-				stopreport
-			}
-		}
+	if(! ~ $#intr 0){
+		# DEL at the input prompt: throw away what was typed and
+		# ask again.  Ending the session takes /quit, or ^D on an
+		# empty line -- never a single DEL.
 		echo '' >[1=2]
+		echo '(input discarded)' >[1=2]
+	}
+	if not if(! test -s $msgfile)
+		done=1		# ^D on an empty line
+	if not {
+		# read first line for command detection
+		first=`{sed 1q $msgfile}
+		if(~ $#first 0)
+			done=1
+		if not {
+		cmd=$first(1)
+
+		if(~ $cmd /quit /exit)
+			done=1
+		if not if(~ $cmd /*)
+			docmd $first
+		if not {
+			# Start the streaming reader first so it is blocked in
+			# open() before we write the prompt.
+			cat $sess/stream &
+			cpid=$apid
+			if(cat $msgfile > $sess/prompt){
+				wait $cpid
+				echo '' >[1=2]
+				acctround
+				stopreport 1
+			}
+			if not {
+				# The prompt write failed.  Two very different
+				# reasons:
+				#
+				# DEL while the reply was running: the note killed
+				# the cat above, its write was flushed, and claude9fs
+				# turned that flush into a cancel.  The reader is
+				# left alone -- it is about to see the round end, and
+				# killing it now could lose the "[cancelled]" marker.
+				#
+				# Anything else, e.g. 'session busy': no round ever
+				# started, so the stream reader is latched on an idle
+				# session, waiting for a round that will never come.
+				# Kill it so wait does not hang; the resulting
+				# Tflush is handled cleanly by claude9fs.  It may
+				# already have exited; test for its note file before
+				# writing it, since redirecting the write is not
+				# enough on rc (a failed redirection is diagnosed by
+				# the shell).
+				if(~ $#intr 0){
+					if(test -e /proc/$cpid/note)
+						echo kill > /proc/$cpid/note
+				}
+				wait $cpid
+				if(~ $#intr 0){
+					echo 'error:' >[1=2]
+					cat $sess/error >[1=2]
+				}
+				if not
+					echo '[cancelled]' >[1=2]
+				# A round that failed or was cancelled partway still
+				# billed its tokens, and doprompt publishes them to
+				# usage.  A "session busy" refusal never started a
+				# round, and usage still belongs to whoever is busy,
+				# so skip accounting while the session is busy.
+				busy=`{awk '$1 == "busy" {print $2}' $sess/ctl >[2]/dev/null}
+				if(! ~ $"busy 1){
+					acctround
+					stopreport
+				}
+			}
+			echo '' >[1=2]
+		}
+		}
 	}
 }
 

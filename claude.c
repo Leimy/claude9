@@ -1291,19 +1291,31 @@ writeall(int fd, char *buf, long len)
 static void
 weberror(char *webdir)
 {
-	char *path, *ebody, *emsg;
+	char *path, *ebody, *emsg, orig[ERRMAX];
 	Json *ej;
 	int fd;
 
+	/*
+	 * Remember why the body open failed: the errorbody open and
+	 * read below overwrite errstr, and a connection that never got
+	 * an HTTP reply (refused, unreachable, wrong port) has an empty
+	 * errorbody, which must not replace the real reason.
+	 */
+	rerrstr(orig, sizeof orig);
 	path = esmprint("%s/errorbody", webdir);
 	fd = open(path, OREAD);
 	free(path);
-	if(fd < 0)
+	if(fd < 0){
+		werrstr("%s", orig);
 		return;	/* keep errstr from the failed body open */
+	}
 	ebody = readfile(fd);
 	close(fd);
-	if(ebody == nil)
+	if(ebody == nil || ebody[0] == '\0'){
+		free(ebody);
+		werrstr("%s", orig);
 		return;
+	}
 	ej = jsonparse(ebody);
 	emsg = jstr(jget(ej, "error"), "message");
 	if(emsg != nil)
@@ -1385,7 +1397,15 @@ webhttp(Provider *p, Conv *c, char *url, char *postbody, int stream, int *clonef
 	fd = open(path, OREAD);
 	free(path);
 	if(fd < 0){
-		weberror(webdir);
+		/*
+		 * Opening body blocks until the response headers
+		 * arrive, so a cancel usually lands right here.  The
+		 * request is still in flight, and errorbody would
+		 * block until it finishes: skip it, and let the
+		 * caller report the cancel.
+		 */
+		if(!cancelled(c))
+			weberror(webdir);
 		goto err;
 	}
 	free(webdir);
@@ -2503,6 +2523,14 @@ exectool(Conv *c, ToolCall *tc)
 	char *path;
 	int fd;
 
+	/*
+	 * Once a prompt is cancelled, no further tool starts.  The
+	 * call still gets a result: every tool_use needs a
+	 * tool_result or the conversation is left malformed.
+	 */
+	if(cancelled(c))
+		return estrdup("not executed: " Cancelmsg);
+
 	path = tc->args[0];
 	switch(tc->type){
 	case Acreate:
@@ -3138,14 +3166,13 @@ anthropicreadstream(Conv *c, Biobuf *bp, Usage *usage,
 	int nblocks;
 	Reply *r;
 
-	USED(c);
 	memset(blocks, 0, sizeof blocks);
 	nblocks = 0;
 	stopreason = nil;
 	done = 0;
 	err = 0;
 
-	while(!done && (line = Brdstr(bp, '\n', 1)) != nil){
+	while(!done && !cancelled(c) && (line = Brdstr(bp, '\n', 1)) != nil){
 		if(strncmp(line, "data:", 5) != 0){
 			free(line);
 			continue;
@@ -3164,10 +3191,16 @@ anthropicreadstream(Conv *c, Biobuf *bp, Usage *usage,
 	 * The SSE stream must end with a message_stop event.  If it
 	 * just stops (connection drop, webfs hiccup), the response
 	 * is incomplete: treat it as an error rather than passing
-	 * off partial blocks as a finished turn.
+	 * off partial blocks as a finished turn.  A cancel also ends
+	 * the loop early (or breaks the blocked read with
+	 * "interrupted"), and must be reported as one, not as a lost
+	 * connection.
 	 */
 	if(!done && !err){
-		werrstr("response stream ended unexpectedly (connection lost?)");
+		if(cancelled(c))
+			werrstr(Cancelmsg);
+		else
+			werrstr("response stream ended unexpectedly (connection lost?)");
 		err = 1;
 	}
 
@@ -3279,10 +3312,24 @@ sendonce(Conv *c, Usage *usage,
 	int try;
 
 	for(try = 0;; try++){
+		if(cancelled(c)){
+			werrstr(Cancelmsg);
+			return nil;
+		}
 		p = provof(c);
 		r = sendonce1(c, usage, cb, aux);
 		if(r != nil)
 			return r;
+		/*
+		 * A cancelled round fails with whatever the interrupted
+		 * call left in errstr ("interrupted"); say what really
+		 * happened, and never let a quirk hook mistake it for a
+		 * request-shape complaint.
+		 */
+		if(cancelled(c)){
+			werrstr(Cancelmsg);
+			return nil;
+		}
 		if(p->quirk == nil || try >= Maxquirks)
 			return nil;
 		rerrstr(errbuf, sizeof errbuf);
@@ -3312,11 +3359,51 @@ sendonce(Conv *c, Usage *usage,
 int
 overlimiterr(char *err)
 {
+	static char *pat[] = {
+		/* Anthropic: "prompt is too long: N tokens > M maximum" */
+		"prompt is too long",
+		/* OpenAI chat completions and vLLM:
+		 * "This model's maximum context length is N tokens ..." */
+		"maximum context length",
+		/* OpenAI error code, present in some bodies without the prose */
+		"context_length_exceeded",
+		/* OpenAI Responses: "Your input exceeds the context window
+		 * of this model." */
+		"exceeds the context window",
+		/* older wording; kept for servers that still say it */
+		"exceed the context",
+		/* llama.cpp server (HTTP 400): "the request exceeds the
+		 * available context size, try increasing it", error type
+		 * "exceed_context_size_error" */
+		"exceeds the available context size",
+		"exceed_context_size",
+	};
+	int i;
+
 	if(err == nil)
 		return 0;
-	return strstr(err, "prompt is too long") != nil
-		|| strstr(err, "exceed the context") != nil
-		|| strstr(err, "maximum context length") != nil;
+	for(i = 0; i < nelem(pat); i++)
+		if(strstr(err, pat[i]) != nil)
+			return 1;
+	return 0;
+}
+
+/*
+ * The text stored in a session's error file (and returned to a
+ * failed prompt write) for a context-overflow error: the raw
+ * error followed by the way out.  Kept here, not inline in
+ * doprompt, so the advice is testable without a 9P server; see
+ * tests.c.  Caller frees.
+ */
+char*
+overlimitmsg(char *err)
+{
+	return esmprint("%s\n"
+		"context window exceeded; this session is wedged "
+		"until history shrinks.  Drop old exchanges with "
+		"'echo compact > ctl' (optionally 'compact N' to "
+		"keep N recent exchanges) and resend, or 'echo clear "
+		"> ctl' to start fresh.", err != nil ? err : "");
 }
 
 /*
@@ -3345,6 +3432,20 @@ toollimiterr(char *err)
 	return strstr(err, "tool loop limit reached") != nil;
 }
 
+int
+cancelled(Conv *c)
+{
+	return c != nil && c->cancel;
+}
+
+int
+cancelerr(char *err)
+{
+	if(err == nil)
+		return 0;
+	return strstr(err, Cancelmsg) != nil;
+}
+
 char*
 claudeconverse(Conv *c, Usage *usage,
 	void (*cb)(char*, void*), void *aux, char **errp)
@@ -3368,20 +3469,40 @@ claudeconverse(Conv *c, Usage *usage,
 	lastpaused = 0;
 
 	for(round = 0; round < maxrounds; round++){
+		/*
+		 * Cancelled between rounds (typically while tools were
+		 * running).  The conversation ends on the tool_results
+		 * just appended, so it is well-formed and resumable, the
+		 * same state the round-cap exit leaves.
+		 */
+		if(c->cancel){
+			if(errp != nil)
+				*errp = estrdup(Cancelmsg);
+			if(cb != nil)
+				cb("\n[cancelled]\n", aux);
+			return fmtstrflush(&f);
+		}
 		r = sendonce(c, usage, cb, aux);
 		if(r == nil){
 			/*
 			 * Surface the failure even when we have
 			 * partial text from earlier rounds: the
 			 * stream gets a marker and the caller gets
-			 * the error string via errp.
+			 * the error string via errp.  The failed round
+			 * appends nothing, so history stays well-formed
+			 * (it ends on the user turn that started the
+			 * round); a cancelled round's partial text was
+			 * streamed but is not kept.
 			 */
 			rerrstr(errbuf, sizeof errbuf);
 			if(errp != nil)
 				*errp = estrdup(errbuf);
 			if(cb != nil){
-				snprint(marker, sizeof marker,
-					"\n[error: %s]\n", errbuf);
+				if(cancelerr(errbuf))
+					snprint(marker, sizeof marker, "\n[cancelled]\n");
+				else
+					snprint(marker, sizeof marker,
+						"\n[error: %s]\n", errbuf);
 				cb(marker, aux);
 			}
 			alltext = fmtstrflush(&f);

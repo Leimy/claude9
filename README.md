@@ -206,7 +206,8 @@ unavailable).
 		              read for the key list
 		<n>/          session directory
 			ctl       read for session info; write commands
-			prompt    write a message; read the last final reply
+			prompt    write a message; read the last final reply.
+			          Interrupting the write cancels the prompt.
 			stream    read incremental text deltas of current round
 			conv      read full conversation history
 			model     read/write the model name
@@ -261,7 +262,9 @@ is needed: write `new`, then write `<name>/prompt`.
 	clear              clear conversation history and usage counters
 	compact [n]        drop old exchanges, keeping the n most recent (default 4)
 	parent <name>      label this session as spawned by session <name> (see Session Graph)
-	hangup             destroy the session
+	cancel             stop the prompt in flight (see Cancelling a Prompt);
+	                   an error if nothing is running
+	hangup             destroy the session, cancelling any prompt in flight
 	autocontinue [n]   enable auto-continue (default n=3)
 	noautocontinue     disable auto-continue
 	maxrounds [n]      set the per-prompt tool-loop round cap; no n restores the default
@@ -490,9 +493,9 @@ or that have no `baseurl` override, are unaffected.
 	echo 'gate off' > /mnt/claudesub/local-1/ctl
 
 The key is the literal string: `http://x/v1` and `http://x/v1/` are
-different gates.  Waiters are served in lock order, which is not
-guaranteed to be FIFO.  A queued prompt still occupies its caller's
-write until it runs.
+different gates.  Waiters are served in no guaranteed order, which
+is not necessarily FIFO.  A queued prompt still occupies its caller's
+write until it runs or is cancelled (see Cancelling a Prompt).
 
 Known limitations:
 
@@ -504,15 +507,20 @@ Known limitations:
 - It has had one live test: two gated sessions on the same baseurl,
   prompted in parallel, ran strictly one after the other.  Busy state
   while queued was not observed during that run.
-- Hanging up a session while its prompt is queued behind the gate is
-  untested.  The prompt path holds a session reference, so it should
-  be safe, but a crash or wedge there would be a bug.  (It is hard to
-  test from a tool loop: a sub-agent cannot reach its own server's
-  files, and a hangup issued alongside the prompts races the prompts
-  and usually lands first.  Do it from a shell while a queued prompt
-  is waiting.)
-- The gate is a plain QLock: no timeout and no queue limit.  Whether
-  a Tflush (interrupt) cancels a queued wait has not been checked.
+- A queued prompt can be cancelled: interrupting its write, `cancel`,
+  or `hangup` wakes it, and it fails with `prompt cancelled while
+  queued` without ever starting a model run.  The gate is a flag and
+  a `Rendez`, not a bare lock, precisely so that a waiter can be
+  woken.  None of these paths has been exercised against a live
+  server.  (Hard to test from a tool loop: a sub-agent cannot reach
+  its own server's files, and a cancel or hangup issued alongside the
+  prompts races the prompts and usually lands first.  Do it from a
+  shell while a queued prompt is waiting.)
+- There is no timeout and no queue limit: a queued prompt waits for
+  as long as the prompt ahead of it runs, unless cancelled.
+- The gate is held across all auto-continue rounds of a prompt, and
+  it is chosen when the prompt starts: `gate on|off` written to ctl
+  takes effect from the next prompt, not for one already queued.
 - It affects only claude9fs prompts.  Anything else using the same
   server is not covered.
 
@@ -626,6 +634,8 @@ stopped, using Anthropic's names for every provider:
 	            (`error` reads `tool loop limit reached`)
 	pause_turn  Anthropic advisor pause at the round cap
 	            (`error` reads `tool/advisor loop limit reached`)
+	cancelled   the prompt was stopped on request (`error` reads
+	            `prompt cancelled`; see Cancelling a Prompt)
 	error       the round failed outright: exhausted credit,
 	            rate limit, context overflow, dropped
 	            connection, ...  The `error` file has the text.
@@ -642,6 +652,93 @@ short explanation for the values above that mean something ran
 out, followed by the `error` file's text when there is any --
 including for prompts that hit the round cap, which succeed as
 writes and so used to pass without comment.
+
+### Cancelling a Prompt
+
+A prompt that is running -- or queued behind the Prompt Gate -- can
+be stopped without destroying the session.  There are three ways,
+and they all end the same way:
+
+- **Interrupt the write to `prompt`.**  This is the ordinary Plan 9
+  way: DEL in a terminal, killing the `cat` that is writing, or any
+  client aborting its write.  The kernel sends a `Tflush` for the
+  write; claude9fs treats that as a request to stop the round.  It
+  is the only method that needs no cooperation from the client, and
+  it is what claudetalk's DEL relies on.
+- **Write `cancel` to `ctl`.**  For a client that is not itself
+  blocked in the write -- for example an editor with a Stop button,
+  or a second window.  It is an error (`cancel: no prompt in
+  flight`) if the session is idle.
+- **Write `hangup` to `ctl`.**  Nobody can read the result of a
+  session that is going away, so hangup now cancels its round too.
+
+What a cancel does:
+
+- The request being read from the provider is abandoned.  claude9fs
+  closes the response, which makes webfs drop the connection; the
+  provider stops generating.  A read blocked in webfs is interrupted
+  immediately (`threadint`) rather than at the next chunk.
+- A prompt still queued behind the gate is woken and never starts.
+- No further tool call starts.  Any tool the model had already
+  requested in that turn is answered with `not executed: prompt
+  cancelled`, so every `tool_use` still has its `tool_result`.
+- Auto-continue does not fire.
+- The writer's own write fails with the error `prompt cancelled`
+  (and a queued one with `prompt cancelled while queued`).  `error`
+  reads the same, and `usage` reports `stop_reason cancelled`.
+- The session stays up.  The conversation is well-formed and
+  resumable: the cancelled round appended nothing, so history ends
+  on the turn that started it, or on the last tool results.  Write
+  another prompt to carry on; a fresh prompt clears the cancel.
+- Text produced by *earlier rounds of that prompt* is kept and
+  readable from `prompt`.  The round that was cut off is not: its
+  text was streamed to `stream` readers as it arrived and is not
+  kept, so the next prompt does not show the model what it had
+  half-said.
+
+Limitations, stated plainly:
+
+- **Cost.**  Providers do not report usage for a round that is cut
+  off, so `usage` and claudetalk's cost lines undercount a
+  cancelled prompt.  Stopping generation early still saves money;
+  the provider bills for what it generated before it noticed the
+  disconnect.  Verify against your provider's usage page if it
+  matters.
+- **The connection drops lazily.**  webfs notices a closed response
+  when the next chunk arrives from the provider, not before.
+  Streams normally send often enough that this is a moment.  A
+  server that is silent for a long time -- llama.cpp evaluating a
+  very large prompt before its first token -- keeps working until it
+  has something to send.  claude9fs has already returned by then;
+  only the server's own work continues.
+- **Tools already running are not interrupted, in general.**  A
+  turn's tool calls run on the session's worker thread when there is
+  one call, and that thread is interrupted, so a sub-agent's prompt
+  (itself a write to another session's `prompt`) is flushed and
+  cancelled in turn.  When there are several calls in one turn they
+  run on their own threads, which are not interrupted, and a `mk`
+  or `man` child process is not killed: the round stops after the
+  call finishes, and a long build is left to finish or be killed by
+  hand (`echo kill > /proc/N/note`).
+- **A cancel at the very start can be missed.**  A flush that
+  arrives between the write being dispatched and claude9fs
+  registering it finds nothing to cancel, and the flush waits for
+  the round to finish, as it did before cancelling existed.  The
+  window is a few microseconds.
+- **`cancel` takes effect at the next checkpoint** (each line of the
+  stream, each round, each tool) if the interrupt arrives while the
+  worker is not blocked.  It is prompt in practice, but it is not a
+  hard real-time stop.
+- **A server that predates this feature ignores all of the above.**
+  Its flush waits for the round to finish.  Restart claude9fs after
+  `mk install` (`rm /srv/claude /srv/claudesub`, then run
+  claudetalk).
+- **Not covered by the automated tests:** the 9P paths (flush,
+  `ctl`, hangup, the gate wake) and the `threadint` interrupt
+  itself, because they need a running server and a live or fake
+  provider.  `mk tests` covers the library half: every stream
+  reader, `sendonce`, `claudeconverse` and tool execution each
+  refuse to proceed once the flag is set, without any network.
 
 ### Streaming
 
@@ -1142,11 +1239,64 @@ file in the background while writing to `prompt`.
 	/reloadskills  re-read the skills directory (all live sessions)
 	/graph         open claudegraph in a new window
 	/detach        keep session alive on exit (can reattach later)
+	DEL            cancel the running reply / discard typed input; it no
+	               longer exits (see "DEL, /quit, and leaving")
 	/help          show command list
-	/quit          exit
+	/quit          exit (so does ^D on an empty line)
 
-Messages are entered as text and sent with `^D`.  Press DEL
-to interrupt.
+Messages are entered as text and sent with `^D`.
+
+### DEL, `/quit`, and leaving  (behavior change)
+
+**DEL no longer ends the session.**  In earlier versions DEL hung
+up the session and exited claudetalk, and it did not actually stop
+the model: the reply kept running on the server with nobody
+reading it.  DEL now does what an interrupt is supposed to do:
+
+	when                          DEL does
+	----------------------------  -----------------------------------
+	a reply is running            cancels it; you get the prompt back,
+	                              the session and conversation intact
+	you are typing a message      discards what you typed and prompts
+	                              again
+	any other time (a /command)   interrupts the command; you get the
+	                              prompt back
+
+To leave, use **`/quit`** (or `/exit`), or **`^D` on an empty line**.
+Neither changed.  Whether the session is destroyed on exit is still
+controlled by `-d` and `/detach`, exactly as before.
+
+After a cancelled reply claudetalk prints `[cancelled]`, the usage
+for the part that ran (it undercounts; see Cancelling a Prompt), and
+`stop: cancelled`.  The conversation is resumable: just type the next
+message.  The text the model had produced in the round you cut off is
+shown on screen but is not kept, so it will not see it next turn --
+say so in your next message if it matters.
+
+**A second DEL leaves.**  If you press DEL again before the turn is
+over, claudetalk assumes the first one did not take and gives up the
+old way: it prints `second interrupt: leaving`, hangs up the session
+(unless detached) and exits.  This is the escape hatch for the one
+case where cancelling cannot work -- a claude9fs that predates this
+feature, whose write stays blocked until the model finishes.  You
+will recognise that case by DEL doing nothing visible; press it
+again to get out, then restart the servers so the new claude9fs is
+used:
+
+	rm /srv/claude /srv/claudesub
+	claudetalk
+
+The counter resets at the start of every turn, so a DEL at the input
+prompt followed by another DEL at the next prompt does not leave; only
+two in one turn do.
+
+If you have muscle memory for DEL-to-quit, or scripts that send it,
+adjust them: use `/quit`, or DEL twice.
+
+Cancelling also works from outside claudetalk: `echo cancel >
+/mnt/claude/$n/ctl` stops whatever session `$n` is running, and
+interrupting any client's write to `prompt` does the same.  See
+Cancelling a Prompt above for exactly what is and is not stopped.
 
 ### Resumable Sessions
 

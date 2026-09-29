@@ -46,6 +46,7 @@ enum {
 #define QSID(path)		((int)((path)>>8))
 #define QTYPE(path)		((int)((path)&0xff))
 
+typedef struct Gate Gate;
 typedef struct Session Session;
 struct Session {
 	int id;
@@ -70,6 +71,14 @@ struct Session {
 	/* auto-continue on max_tokens or tool-loop round cap */
 	int autocont;	/* max auto-continue rounds; 0 = disabled */
 	int gated;	/* serialize prompts with other gated sessions on the same baseurl; guarded by lk */
+	/*
+	 * Cancellation (see cancellocked).  All guarded by lk, and
+	 * valid only while busy: doprompt sets them when it marks the
+	 * session busy and clears them when it finishes.
+	 */
+	Req *promptreq;	/* the prompt write in flight; lets a Tflush find its session's round */
+	int wtid;	/* libthread id of the thread running that write, for threadint */
+	Gate *waitgate;	/* gate this prompt may be queued on, or nil */
 	Session *next;
 };
 
@@ -116,11 +125,24 @@ static QLock sessionlk;
  * thrashing it.  Gates are keyed by baseurl string, created on
  * first use and never freed (there are only a handful of urls).
  * gateslk guards only the list and is a leaf lock.
+ *
+ * The gate is a held flag plus a Rendez under lk, not a bare
+ * QLock held for the whole round, because a queued prompt must be
+ * cancellable.  A blocked qlock cannot be woken early: libc's
+ * qlock retries its rendezvous when it is broken, so neither
+ * threadint nor a flush gets a waiter out.  With rsleep the
+ * waiter re-tests its session's cancel flag on every wakeup, and
+ * cancellocked wakes the gate it is queued on.
+ *
+ * Lock order: Session.lk, then Gate.lk.  gateenter takes only
+ * Gate.lk and reads the cancel flag without Session.lk, so the
+ * two never nest the other way.
  */
-typedef struct Gate Gate;
 struct Gate {
 	char *url;
 	QLock lk;
+	Rendez rz;
+	int held;	/* some prompt is running against this baseurl; guarded by lk */
 	Gate *next;
 };
 
@@ -139,11 +161,103 @@ gateget(char *url)
 	if(g == nil){
 		g = emallocz(sizeof *g, 1);
 		g->url = estrdup(url);
+		g->rz.l = &g->lk;
 		g->next = gates;
 		gates = g;
 	}
 	qunlock(&gateslk);
 	return g;
+}
+
+/*
+ * Wait for g to be free and take it.  Returns 1 with the gate
+ * held, or 0 (gate not held) if s was cancelled while queued or
+ * before it got here -- a cancelled prompt must not start a model
+ * run, even if the gate happens to be free.
+ */
+static int
+gateenter(Gate *g, Session *s)
+{
+	qlock(&g->lk);
+	while(g->held && !s->conv->cancel)
+		rsleep(&g->rz);
+	if(s->conv->cancel){
+		qunlock(&g->lk);
+		return 0;
+	}
+	g->held = 1;
+	qunlock(&g->lk);
+	return 1;
+}
+
+static void
+gateleave(Gate *g)
+{
+	qlock(&g->lk);
+	g->held = 0;
+	/* wake all: a woken waiter may be cancelled and decline the gate */
+	rwakeupall(&g->rz);
+	qunlock(&g->lk);
+}
+
+/*
+ * Ask the prompt round in flight on s to stop.  Caller holds
+ * s->lk.  Returns 1 if there was a round to cancel, 0 if s is
+ * idle (an idle cancel must do nothing: the flag is cleared at the
+ * start of each prompt, but a flag left set would still be seen by
+ * anything reading it in between).
+ *
+ * Three things are needed, because a round can be in three
+ * states.  The flag alone stops it at its next checkpoint
+ * (stream readers test it every line, sendonce and
+ * claudeconverse between rounds, exectool before each tool).  A
+ * threadint on the worker breaks a read blocked in webfs so the
+ * checkpoint is reached now instead of at the next chunk; note
+ * that it only helps a thread that is blocked, and a stray one is
+ * absorbed by whatever it next blocks on -- harmless while the
+ * round is being torn down, which is why wtid is cleared under
+ * lk before doprompt responds.  And a wake of the gate breaks a
+ * prompt still queued.
+ *
+ * Tool worker threads (runtools, several calls in one turn) are
+ * not interrupted; a single tool runs on the worker thread itself
+ * and is.  A long mk is left to finish or be killed by hand.
+ */
+static int
+cancellocked(Session *s)
+{
+	Gate *g;
+
+	if(!s->busy)
+		return 0;
+	s->conv->cancel = 1;
+	if(s->wtid != 0)
+		threadint(s->wtid);
+	g = s->waitgate;
+	if(g != nil){
+		qlock(&g->lk);
+		rwakeupall(&g->rz);
+		qunlock(&g->lk);
+	}
+	return 1;
+}
+
+/*
+ * Cancel s's round; if only is non-nil, only when the round in
+ * flight is that particular prompt write (a Tflush must not
+ * cancel some other client's prompt).
+ */
+static int
+cancelprompt(Session *s, Req *only)
+{
+	int n;
+
+	n = 0;
+	qlock(&s->lk);
+	if(only == nil || s->promptreq == only)
+		n = cancellocked(s);
+	qunlock(&s->lk);
+	return n;
 }
 
 /*
@@ -1638,10 +1752,15 @@ graphread(Req *r, Faux *fa, int live)
  * Tflush: if the flushed request is a stream or graph read
  * blocked in streamread/graphread, mark it and wake the
  * sleeper; it responds to the old request with "interrupted".
- * For anything else (e.g. an in-flight prompt write, which
- * cannot be cancelled mid-API call) we just respond to the
- * flush; lib9p delays the Rflush until the old request's
- * response is sent.
+ * A prompt write is cancelled (cancelprompt); it responds to
+ * itself shortly after, with "prompt cancelled".  For anything
+ * else we just respond to the flush; lib9p delays the Rflush
+ * until the old request's response is sent.
+ *
+ * A flush that arrives in the instant between the write being
+ * dispatched and doprompt registering it (promptreq) finds
+ * nothing to cancel and degrades to the old behavior: the Rflush
+ * waits for the round to end.
  */
 static void
 fsflush(Req *r)
@@ -1675,6 +1794,21 @@ fsflush(Req *r)
 					rwakeupall(&graphrz);
 				}
 				qunlock(&graphlk);
+			}
+		} else if(QTYPE(path) == Qprompt && old->ifcall.type == Twrite){
+			/*
+			 * The client gave up on its prompt write (DEL in a
+			 * terminal, a killed cat): that is a request to stop
+			 * the round.  Cancelling it makes doprompt respond
+			 * soon, which is also what releases the Rflush --
+			 * lib9p holds it until the old request answers, so
+			 * without this the interrupted writer would sit in
+			 * its write until the model finished.
+			 */
+			s = sessget(QSID(path));
+			if(s != nil){
+				cancelprompt(s, old);
+				sessput(s);
 			}
 		}
 	}
@@ -1900,6 +2034,16 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 			s->gated = 0;
 		else
 			return "gate: expected on or off";
+	} else if(strcmp(cmd, "cancel") == 0){
+		/*
+		 * Stop the prompt in flight; the writer's own write
+		 * then fails with "prompt cancelled".  For clients that
+		 * are not blocked in that write (an acme Stop button);
+		 * one that is gets the same effect from interrupting
+		 * the write, via Tflush (see fsflush).
+		 */
+		if(!cancellocked(s))
+			return "cancel: no prompt in flight";
 	} else if(strcmp(cmd, "hangup") == 0){
 		*hangupp = 1;
 	} else if(strcmp(cmd, "reloadskills") == 0){
@@ -2194,7 +2338,7 @@ static void
 doprompt(Req *r, Session *s, char *data)
 {
 	char *reply, *err;
-	int autocont, round, ok;
+	int autocont, round, ok, skipped;
 	Gate *gate;
 	Usage u;
 	Fmt f;
@@ -2216,6 +2360,17 @@ doprompt(Req *r, Session *s, char *data)
 	gate = nil;
 	if(s->gated && s->conv->baseurl != nil)
 		gate = gateget(s->conv->baseurl);
+	/*
+	 * Register for cancellation, in the same critical section
+	 * that marks the session busy so a cancel can never see one
+	 * without the other.  The flag is cleared here, not at the
+	 * end of the previous prompt: only a cancel that arrives
+	 * while busy counts.
+	 */
+	s->conv->cancel = 0;
+	s->promptreq = r;
+	s->wtid = threadid();
+	s->waitgate = gate;
 	qunlock(&s->lk);
 	bumpgraph();
 
@@ -2225,18 +2380,27 @@ doprompt(Req *r, Session *s, char *data)
 	ok = 0;
 	err = nil;
 
-	/* gated: wait our turn behind other gated sessions on this baseurl */
-	if(gate != nil)
-		qlock(&gate->lk);
+	/*
+	 * gated: wait our turn behind other gated sessions on this
+	 * baseurl.  A cancel or hangup while queued wakes us and we
+	 * decline the gate, so no model run is started (see gateenter).
+	 * From here on, gate non-nil means "we hold it".
+	 */
+	skipped = 0;
+	if(gate != nil && !gateenter(gate, s)){
+		gate = nil;
+		skipped = 1;
+		err = estrdup(Cancelmsg " while queued");
+	}
 
-	for(round = 0; ; round++){
+	for(round = 0; !skipped; round++){
 		reply = claudeconverse(s->conv, &u, streamcb, s, &err);
 		if(reply != nil){
 			fmtprint(&f, "%s%s", round ? "\n" : "", reply);
 			free(reply);
 			ok = 1;
 		}
-		if(reply == nil || round >= autocont)
+		if(reply == nil || round >= autocont || s->conv->cancel)
 			break;
 		/*
 		 * Decide whether to auto-continue.  Two cases are
@@ -2285,7 +2449,7 @@ doprompt(Req *r, Session *s, char *data)
 	}
 
 	if(gate != nil)
-		qunlock(&gate->lk);
+		gateleave(gate);
 
 	streamfinish(s);
 	reply = fmtstrflush(&f);
@@ -2305,7 +2469,10 @@ doprompt(Req *r, Session *s, char *data)
 	 * last round's real one (tool_use / pause_turn) and is
 	 * left alone.
 	 */
-	if(err != nil || !ok){
+	if(cancelerr(err)){
+		free(u.stop_reason);
+		u.stop_reason = estrdup("cancelled");
+	}else if(err != nil || !ok){
 		if(err == nil || strstr(err, "loop limit reached") == nil){
 			free(u.stop_reason);
 			u.stop_reason = estrdup("error");
@@ -2314,10 +2481,37 @@ doprompt(Req *r, Session *s, char *data)
 
 	qlock(&s->lk);
 	s->busy = 0;
+	/*
+	 * Deregister before responding.  With wtid cleared under lk
+	 * no later cancel can threadint this thread, so nothing can
+	 * interrupt the blocking calls in respond() and lib9p's reply
+	 * path.
+	 */
+	s->promptreq = nil;
+	s->wtid = 0;
+	s->waitgate = nil;
 	s->lastact = time(0);
 	bumpgraph();
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
+	if(cancelerr(err)){
+		/*
+		 * Cancelled.  Not a failure and not a success: keep
+		 * what earlier rounds of this prompt produced (readable
+		 * from the prompt file; this round's partial text was
+		 * only streamed), record the cancel in the error file,
+		 * and fail the writer's write so it knows the answer is
+		 * incomplete.  If nobody is waiting on the write any
+		 * more (it was flushed) lib9p drops this response.
+		 */
+		free(s->lasterror);
+		s->lasterror = err;	/* ownership moves */
+		free(s->lastreply);
+		s->lastreply = reply;	/* ownership moves */
+		qunlock(&s->lk);
+		respond(r, Cancelmsg);
+		return;
+	}
 	if(!ok){
 		char errbuf[512];
 		if(err != nil)
@@ -2333,12 +2527,7 @@ doprompt(Req *r, Session *s, char *data)
 		 */
 		if(overlimiterr(errbuf)){
 			char *msg;
-			msg = esmprint("%s\n"
-				"context window exceeded; this session is wedged "
-				"until history shrinks.  Drop old exchanges with "
-				"'echo compact > ctl' (optionally 'compact N' to "
-				"keep N recent exchanges) and resend, or 'echo clear "
-				"> ctl' to start fresh.", errbuf);
+			msg = overlimitmsg(errbuf);
 			snprint(errbuf, sizeof errbuf, "%s", msg);
 			free(msg);
 		}
@@ -2360,8 +2549,20 @@ doprompt(Req *r, Session *s, char *data)
 	 * instead of silently passing off a truncated answer
 	 * as complete.
 	 */
-	if(err != nil)
-		s->lasterror = err;	/* ownership moves */
+	if(err != nil){
+		/*
+		 * A context overflow partway through a tool loop is the
+		 * usual way sessions hit the limit (history grows each
+		 * round), and lands here, not in the !ok branch above,
+		 * because earlier rounds produced text.  Give the same
+		 * advice; the session is just as wedged.
+		 */
+		if(overlimiterr(err)){
+			s->lasterror = overlimitmsg(err);
+			free(err);
+		}else
+			s->lasterror = err;	/* ownership moves */
+	}
 
 	free(s->lastreply);
 	s->lastreply = reply;
@@ -2436,8 +2637,15 @@ fswrite(Req *r)
 			respond(r, err);
 			break;
 		}
-		if(hangup)
+		if(hangup){
+			/*
+			 * Nobody can read the result of a session that is
+			 * going away: stop its round rather than let it run
+			 * to completion (or, if queued, start at all).
+			 */
+			cancelprompt(s, nil);
 			delsession(sid);
+		}
 		if(reload)
 			doreloadskills();
 		r->ofcall.count = r->ifcall.count;

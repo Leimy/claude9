@@ -623,7 +623,6 @@ openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 	char *s;
 	int i;
 
-	USED(c);
 	memset(&textbuf, 0, sizeof textbuf);
 	memset(stools, 0, sizeof stools);
 	nstools = 0;
@@ -631,7 +630,7 @@ openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 	done = 0;
 	err = 0;
 
-	while(!done && (line = Brdstr(bp, '\n', 1)) != nil){
+	while(!done && !cancelled(c) && (line = Brdstr(bp, '\n', 1)) != nil){
 		if(strncmp(line, "data:", 5) != 0){
 			free(line);
 			continue;
@@ -762,7 +761,10 @@ openaireadstream(Conv *c, Biobuf *bp, Usage *usage,
 
 out:
 	if(!done && !err){
-		werrstr("response stream ended unexpectedly (connection lost?)");
+		if(cancelled(c))
+			werrstr(Cancelmsg);
+		else
+			werrstr("response stream ended unexpectedly (connection lost?)");
 		err = 1;
 	}
 

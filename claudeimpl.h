@@ -143,6 +143,15 @@ Json*	toolschema(Tooldef *td);	/* JSON schema for td's parameters */
 void	toolfree(ToolCall *t);
 void	replyfree(Reply *r);
 /*
+ * True if c is non-nil and has been asked to stop (Conv.cancel).
+ * Nil-safe because the tests drive the stream readers with a nil
+ * Conv.  Every readstream loop must test this once per line and,
+ * when it fires, fail with werrstr(Cancelmsg) -- not the generic
+ * "stream ended unexpectedly" text, which callers treat as a
+ * real failure.
+ */
+int	cancelled(Conv *c);
+/*
  * Build the repaired neutral {role, content} messages array
  * from a Conv (see the doc comment in claude.c).  Anthropic
  * uses it as-is; OpenAI translates each entry.  Caller frees

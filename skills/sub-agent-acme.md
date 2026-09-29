@@ -201,6 +201,30 @@ Hang up the sub-agent session:
 
     create_file /mnt/claudesub/dizzy-monkey/ctl "hangup"
 
+Hangup also cancels a prompt that session still has running (or
+queued behind a gate), so it is safe to use on a sub-agent that has
+gone wrong; the pending `prompt` write fails with "prompt cancelled".
+
+### Stopping a sub-agent without destroying it
+
+    create_file /mnt/claudesub/dizzy-monkey/ctl "cancel"
+
+stops the prompt in flight and leaves the session, and its
+conversation, intact; the `prompt` write that was blocked on it fails
+with "prompt cancelled" and `usage` shows `stop_reason cancelled`.
+It is an error if the session is idle.  A coordinator normally
+cannot use this on its own sub-agent: its tool round is blocked
+until the `prompt` write returns, and a `cancel` batched into the
+same round races the write and usually arrives before the session is
+busy.  The realistic uses are a human (`echo cancel >
+/mnt/claudesub/NAME/ctl` from a shell) or a different session.
+Interrupting the coordinator's own outer prompt (DEL in claudetalk)
+does propagate when the sub-agent prompt is the turn's only tool
+call, since that write is then flushed in turn.  Tool calls the
+sub-agent already started (an `mk`, or several tools in one turn) are
+not interrupted and finish or must be killed by hand.  Cancelled
+rounds report no usage, so cost figures undercount them.
+
 ## Local models: one at a time
 
 Sub-agents on the local inference server (provider `openai`,

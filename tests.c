@@ -574,6 +574,232 @@ terrs(void)
 	}
 }
 
+/*
+ * --- claude.c: context-overflow detection and the compact advice.
+ *
+ * The advice ("echo compact > ctl") only appears if overlimiterr
+ * recognizes the backend's wording, and each backend words it
+ * differently.  A llama.cpp overflow silently missed the old
+ * patterns, so local-model sessions never got the advice.  Every
+ * string below is what the backend actually sends (after
+ * weberror/sseevent add their "API error: " prefix); add a line
+ * here whenever a new server's overflow wording is seen.
+ */
+static void
+toverlimit(void)
+{
+	static struct { char *err; char *name; } yes[] = {
+		{ "API error: prompt is too long: 210000 tokens > 200000 maximum",
+			"anthropic" },
+		{ "API error: This model's maximum context length is 128000 tokens. "
+		  "However, your messages resulted in 130001 tokens.",
+			"openai chat / vllm" },
+		{ "API error: context_length_exceeded",
+			"openai error code alone" },
+		{ "API error: Your input exceeds the context window of this model. "
+		  "Please adjust your input and try again.",
+			"openai responses" },
+		{ "API error: the request exceeds the available context size, "
+		  "try increasing it",
+			"llama.cpp prose" },
+		{ "API error: exceed_context_size_error",
+			"llama.cpp error type" },
+		{ "API error: Input would exceed the context length",
+			"legacy wording (exceed the context)" },
+	};
+	static char *no[] = {
+		"API error: overloaded",
+		"API error: rate limit exceeded",
+		"API error: max_completion_tokens is too large",
+		"tool loop limit reached (20 rounds)",
+		"response stream ended unexpectedly (connection lost?)",
+		"",
+	};
+	char *msg;
+	int i;
+
+	for(i = 0; i < nelem(yes); i++){
+		nrun++;
+		if(!overlimiterr(yes[i].err)){
+			fprint(2, "FAIL: overlimiterr misses %s wording\n", yes[i].name);
+			nfail++;
+		}
+	}
+	for(i = 0; i < nelem(no); i++){
+		nrun++;
+		if(overlimiterr(no[i])){
+			fprint(2, "FAIL: overlimiterr false positive on \"%s\"\n", no[i]);
+			nfail++;
+		}
+	}
+
+	/*
+	 * The advice itself: keeps the raw error (so the user still
+	 * sees what the server said) and names both remedies as the
+	 * exact ctl commands, so a wording edit cannot silently drop
+	 * them.  Checked for every recognized wording, not just one.
+	 */
+	for(i = 0; i < nelem(yes); i++){
+		msg = overlimitmsg(yes[i].err);
+		nrun++;
+		if(strstr(msg, yes[i].err) == nil
+		|| strstr(msg, "echo compact > ctl") == nil
+		|| strstr(msg, "echo clear > ctl") == nil
+		|| strstr(msg, "compact N") == nil){
+			fprint(2, "FAIL: overlimitmsg for %s lacks raw error or remedy\n",
+				yes[i].name);
+			nfail++;
+		}
+		free(msg);
+	}
+	msg = overlimitmsg(nil);
+	ok(msg != nil && strstr(msg, "echo compact > ctl") != nil,
+		"overlimitmsg tolerates a nil error");
+	free(msg);
+}
+
+/*
+ * --- cancellation (Conv.cancel).
+ *
+ * The server sets the flag (and threadint()s the worker) when a
+ * prompt write is flushed or "cancel" is written to ctl; these
+ * tests cover every place in the library that must notice it.
+ * None needs the network: a stream reader is fed a complete, valid
+ * canned stream with the flag already set and must refuse it, and
+ * the entry points that would otherwise dial webfs are called with
+ * the flag set and must return before doing any I/O.  Each reader
+ * also gets a control run with the flag clear, so a reader that
+ * fails for some unrelated reason cannot pass.
+ */
+static Reply*
+readcanned(Reply* (*rd)(Conv*, Biobuf*, Usage*, void (*)(char*, void*), void*),
+	Conv *c, char *sse)
+{
+	char *path;
+	Biobuf *bp;
+	Usage u;
+	Reply *r;
+
+	path = writetmpsse(sse);
+	if(path == nil)
+		return nil;
+	bp = Bopen(path, OREAD);
+	memset(&u, 0, sizeof u);
+	r = rd(c, bp, &u, nil, nil);
+	Bterm(bp);
+	remove(path);
+	free(path);
+	free(u.stop_reason);
+	return r;
+}
+
+static void
+tcancel(void)
+{
+	static struct {
+		char *name;
+		Reply* (*rd)(Conv*, Biobuf*, Usage*, void (*)(char*, void*), void*);
+		char *sse;
+	} rdr[] = {
+		{ "anthropic", anthropicreadstream,
+		  "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n"
+		  "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n"
+		  "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n"
+		  "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n"
+		  "data: {\"type\":\"message_stop\"}\n" },
+		{ "openai", openaireadstream,
+		  "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+		  "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+		  "data: [DONE]\n" },
+		{ "responses", responsesreadstream,
+		  "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\","
+		  "\"output\":[{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\","
+		  "\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}],"
+		  "\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n" },
+	};
+	Conv *c;
+	Reply *r;
+	ToolCall tc;
+	Usage u;
+	char eb[ERRMAX], *res, *err;
+	int i;
+
+	ok(!cancelled(nil), "cancelled: nil conv is not cancelled");
+	c = convnew("k", "m", 100, "s", nil);
+	ok(!cancelled(c), "cancelled: fresh conv is not cancelled");
+	c->cancel = 1;
+	ok(cancelled(c), "cancelled: flag is seen");
+	c->cancel = 0;
+
+	ok(cancelerr(Cancelmsg), "cancelerr matches Cancelmsg");
+	ok(cancelerr(Cancelmsg " while queued"), "cancelerr matches the queued wording");
+	ok(!cancelerr("API error: overloaded"), "cancelerr non-match");
+	ok(!cancelerr("response stream ended unexpectedly (connection lost?)"),
+		"cancelerr: a lost connection is not a cancel");
+	ok(!cancelerr(nil), "cancelerr nil");
+	ok(!toollimiterr(Cancelmsg) && !overlimiterr(Cancelmsg),
+		"a cancel is neither a loop limit nor an overflow");
+
+	/* every stream reader: clear -> parses; set -> Cancelmsg, not a lost-connection error */
+	for(i = 0; i < nelem(rdr); i++){
+		c->cancel = 0;
+		r = readcanned(rdr[i].rd, c, rdr[i].sse);
+		nrun++;
+		if(r == nil){
+			fprint(2, "FAIL: %s reader: control stream did not parse\n", rdr[i].name);
+			nfail++;
+		}else
+			replyfree(r);
+
+		c->cancel = 1;
+		werrstr("stale");
+		r = readcanned(rdr[i].rd, c, rdr[i].sse);
+		rerrstr(eb, sizeof eb);
+		nrun++;
+		if(r != nil){
+			fprint(2, "FAIL: %s reader ignored a set cancel flag\n", rdr[i].name);
+			nfail++;
+			replyfree(r);
+		}else if(!cancelerr(eb)){
+			fprint(2, "FAIL: %s reader: cancel reported as \"%s\"\n", rdr[i].name, eb);
+			nfail++;
+		}
+	}
+
+	/* sendonce and claudeconverse must stop before dialing anything */
+	memset(&u, 0, sizeof u);
+	c->cancel = 1;
+	werrstr("stale");
+	r = sendonce(c, &u, nil, nil);
+	rerrstr(eb, sizeof eb);
+	ok(r == nil && cancelerr(eb), "sendonce: cancelled before the request");
+
+	err = nil;
+	res = claudeconverse(c, &u, nil, nil, &err);
+	ok(res != nil, "claudeconverse: cancel still returns the text so far");
+	ok(cancelerr(err), "claudeconverse: cancel is reported through errp");
+	ok(c->msgs == nil, "claudeconverse: cancelled round appends nothing");
+	free(res);
+	free(err);
+
+	/* exectool: no new tool starts, but the call still gets a result */
+	memset(&tc, 0, sizeof tc);
+	tc.type = Aread;
+	tc.args[0] = "/dev/null";
+	res = exectool(c, &tc);
+	ok(res != nil && strncmp(res, "not executed", 12) == 0,
+		"exectool: cancelled tool is not run");
+	ok(res != nil && cancelerr(res), "exectool: refusal says why");
+	free(res);
+	c->cancel = 0;
+	res = exectool(c, &tc);
+	ok(res != nil && strncmp(res, "not executed", 12) != 0,
+		"exectool: control run executes");
+	free(res);
+
+	convfree(c);
+}
+
 /* --- claude.c: bounded model-facing file reads --- */
 
 static void
@@ -2258,6 +2484,8 @@ threadmain(int argc, char **argv)
 	tpathhash();
 	tsbuf();
 	terrs();
+	toverlimit();
+	tcancel();
 	treadlimit();
 	treplace();
 	tmkparents();

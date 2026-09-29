@@ -483,7 +483,6 @@ responsesreadstream(Conv *c, Biobuf *bp, Usage *usage,
 	int done, err, inthink;
 	Reply *r;
 
-	USED(c);
 	items = jarray();
 	status = nil;
 	reason = nil;
@@ -491,7 +490,7 @@ responsesreadstream(Conv *c, Biobuf *bp, Usage *usage,
 	err = 0;
 	inthink = 0;
 
-	while(!done && (line = Brdstr(bp, '\n', 1)) != nil){
+	while(!done && !cancelled(c) && (line = Brdstr(bp, '\n', 1)) != nil){
 		if(strncmp(line, "data:", 5) != 0){
 			free(line);
 			continue;
@@ -600,7 +599,10 @@ responsesreadstream(Conv *c, Biobuf *bp, Usage *usage,
 		cb("\n[/thinking]\n", aux);
 
 	if(!done && !err){
-		werrstr("response stream ended unexpectedly (connection lost?)");
+		if(cancelled(c))
+			werrstr(Cancelmsg);
+		else
+			werrstr("response stream ended unexpectedly (connection lost?)");
 		err = 1;
 	}
 	if(err){

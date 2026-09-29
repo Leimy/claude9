@@ -57,6 +57,13 @@ enum {
 	Defmaxrounds = 20,	/* default Conv.maxrounds (see claudeconverse) */
 };
 
+/*
+ * Error text for a prompt stopped by Conv.cancel.  A macro, not
+ * a variable, so every producer (the stream readers, sendonce,
+ * claudeconverse) and cancelerr agree on one spelling.
+ */
+#define Cancelmsg "prompt cancelled"
+
 /* growable string buffer */
 typedef struct Sbuf Sbuf;
 struct Sbuf {
@@ -125,6 +132,14 @@ struct Conv {
 				 * urlsearched in claude.c); convclear revokes
 				 * them with the message history */
 	int nsearchurls;
+	int cancel;	/* set by the server to stop the round in flight:
+			 * checked by the stream readers on every line, by
+			 * sendonce, by claudeconverse between rounds, and
+			 * by exectool before each tool.  The server pairs
+			 * it with threadint() so a read blocked in webfs
+			 * returns at once instead of waiting for the next
+			 * chunk.  Cleared by the server at the start of
+			 * each prompt, never here. */
 	char *basesys;	/* sysprompt before skills are appended */
 	char *sysprompt;	/* basesys + current skills: what's actually sent */
 	Msg *msgs;
@@ -187,6 +202,12 @@ long	convinputbytes(Conv *c);
  */
 int	overlimiterr(char *err);
 /*
+ * The user-facing text for such an error: the raw error plus the
+ * remedy ("echo compact > ctl", "echo clear > ctl").  Malloc'd;
+ * caller frees.  Lives in claude.c so tests.c can exercise it.
+ */
+char*	overlimitmsg(char *err);
+/*
  * True if an error string from claudeconverse is the specific
  * "tool loop limit reached" condition: the tool loop hit its
  * per-prompt round cap while the model was still calling tools.
@@ -201,6 +222,13 @@ int	overlimiterr(char *err);
  * protocol.
  */
 int	toollimiterr(char *err);
+/*
+ * True if an error string from claudeconverse says the prompt
+ * was stopped by Conv.cancel (Cancelmsg).  Not a failure: the
+ * conversation is well-formed and resumable, and callers must
+ * not auto-continue it.
+ */
+int	cancelerr(char *err);
 /*
  * Run the full tool loop: send the conversation, execute any
  * tool calls Claude makes, send the results back, repeat until
