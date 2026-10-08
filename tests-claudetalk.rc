@@ -1,0 +1,183 @@
+#!/bin/rc
+# tests-claudetalk.rc - tests for claudetalk's /effort, /reqlog,
+# and /requests commands.  Run from the source directory:
+#
+#	rc tests-claudetalk.rc [path/to/claudetalk]
+#
+# No claude9fs is needed: the setget, effortcmd, reqlogcmd,
+# requestscmd, and docmd functions are extracted from claudetalk
+# (each is an rc "fn" ending in a "}" in column 0) and driven
+# against a fake session directory whose effort, ctl, and
+# requests files are plain files.  A plain
+# file accepts any value, so this checks only what claudetalk
+# writes (and when it writes nothing); which levels the server
+# accepts is checked by the effortlevel tests in tests.c.
+#
+# Prints one FAIL line per failure and a summary; exit status
+# is "fail" if anything failed.
+
+rfork e
+
+src=claudetalk
+if(! ~ $#* 0)
+	src=$1
+tmp=/tmp/claudetalk.test.$pid
+mkdir -p $tmp/sess
+sed -n -e '/^fn setget /,/^}/p' -e '/^fn effortcmd /,/^}/p' \
+	-e '/^fn reqlogcmd /,/^}/p' -e '/^fn requestscmd /,/^}/p' \
+	-e '/^fn docmd /,/^}/p' $src > $tmp/fns
+. $tmp/fns
+for(f in setget effortcmd reqlogcmd requestscmd docmd){
+	if(! whatis $f >/dev/null >[2]/dev/null){
+		echo 'FAIL: could not extract fn '$f' from '$src >[1=2]
+		rm -rf $tmp
+		exit fail
+	}
+}
+
+sess=$tmp/sess
+nrun=()
+nfail=()
+
+# check name got want
+fn check {
+	nrun=($nrun x)
+	if(! ~ $2 $3){
+		echo 'FAIL: '$1': got "'$2'" want "'$3'"' >[1=2]
+		nfail=($nfail x)
+	}
+}
+
+fn effortfile {
+	got=`{cat $sess/effort}
+}
+
+# what the server would return for a fresh session
+echo -n default > $sess/effort
+
+# /effort: show, write nothing
+out=`{effortcmd >[2=1]}
+check '/effort shows the value' $"out 'effort: default'
+effortfile
+check '/effort leaves the file alone' $"got default
+
+# /effort low
+out=`{effortcmd low >[2=1]}
+effortfile
+check '/effort low writes low' $"got low
+check '/effort low reports it' $"out 'effort: low'
+
+# the other levels go through verbatim
+for(l in none medium high xhigh){
+	effortcmd $l >[2]/dev/null
+	effortfile
+	check '/effort '$l' writes '$l $"got $l
+}
+
+# /effort default writes "default", which the server takes as
+# "clear the override"
+effortcmd default >[2]/dev/null
+effortfile
+check '/effort default writes default' $"got default
+
+# too many arguments: usage, nothing written
+effortcmd low >[2]/dev/null
+out=`{effortcmd low high >[2=1]}
+effortfile
+check '/effort low high leaves the file alone' $"got low
+check '/effort low high prints usage' $"out 'usage: /effort [default|none|low|medium|high|xhigh]'
+
+# dispatch through docmd, the way the main loop calls it
+# (docmd $first, where first is the line's words)
+docmd /effort medium >[2]/dev/null
+effortfile
+check 'docmd /effort medium' $"got medium
+docmd /effort default >[2]/dev/null
+effortfile
+check 'docmd /effort default' $"got default
+out=`{docmd /effort >[2=1]}
+check 'docmd /effort shows' $"out 'effort: default'
+
+# --- /reqlog.  The fake ctl is a plain file: a write replaces it,
+# so after "/reqlog on" it holds "reqlog on", which reqlogcmd must
+# read back as on (a real ctl would say "reqlog 1").
+fn ctlfile {
+	got=`{cat $sess/ctl}
+}
+echo 'name t
+reqlog 0' > $sess/ctl
+out=`{reqlogcmd >[2=1]}
+check '/reqlog shows off' $"out 'reqlog: off'
+ctlfile
+check '/reqlog writes nothing' $"got 'name t reqlog 0'
+
+out=`{reqlogcmd on >[2=1]}
+ctlfile
+check '/reqlog on writes the ctl command' $"got 'reqlog on'
+check '/reqlog on reports on' $"out 'reqlog: on (read the log with /requests after a prompt)'
+
+echo 'reqlog 1' > $sess/ctl
+out=`{reqlogcmd >[2=1]}
+check '/reqlog reads a real ctl 1 as on' $"out 'reqlog: on (read the log with /requests after a prompt)'
+
+reqlogcmd off >[2]/dev/null
+ctlfile
+check '/reqlog off writes the ctl command' $"got 'reqlog off'
+
+echo 'reqlog 0' > $sess/ctl
+out=`{reqlogcmd bogus >[2=1]}
+ctlfile
+check '/reqlog bogus prints usage' $"out 'usage: /reqlog [on|off]'
+check '/reqlog bogus writes nothing' $"got 'reqlog 0'
+out=`{reqlogcmd on off >[2=1]}
+ctlfile
+check '/reqlog on off prints usage' $"out 'usage: /reqlog [on|off]'
+check '/reqlog on off writes nothing' $"got 'reqlog 0'
+
+echo 'name t' > $sess/ctl
+out=`{reqlogcmd >[2=1]}
+check '/reqlog on an old server says so' $"out 'reqlog: not supported by this claude9fs (mk install, then restart the servers)'
+
+docmd /reqlog on >[2]/dev/null
+ctlfile
+check 'docmd /reqlog on' $"got 'reqlog on'
+
+# --- /requests.  A log shaped like claude9fs writes it: the first
+# body sets effort low and carries an escaped "effort" inside a
+# message (which must NOT be reported), then a retry note, then a
+# body without the field.
+echo '--- request 1: openai POST http://h/v1/chat/completions (90 bytes)
+{"model":"q","reasoning_effort":"low","messages":[{"content":"say \"effort\":\"x\""}]}
+--- retry after: API error: reasoning_effort not supported
+--- request 2: openai POST http://h/v1/chat/completions (27 bytes)
+{"model":"q","messages":[]}' > $sess/requests
+out=`{requestscmd >[2=1]}
+check '/requests summary' $"out '--- request 1: openai POST http://h/v1/chat/completions (90 bytes) effort: "reasoning_effort":"low" --- retry after: API error: reasoning_effort not supported --- request 2: openai POST http://h/v1/chat/completions (27 bytes) effort: (no effort field)'
+
+out=`{requestscmd full >[2=1]}
+want=`{cat $sess/requests}
+check '/requests full prints the file' $"out $"want
+
+out=`{requestscmd junk >[2=1]}
+check '/requests junk prints usage' $"out 'usage: /requests [full]'
+
+# the server's "logging is off" text passes through untouched
+echo 'request logging is off; echo reqlog on > ctl, then send a prompt' > $sess/requests
+out=`{requestscmd >[2=1]}
+check '/requests passes the off notice through' $"out 'request logging is off; echo reqlog on > ctl, then send a prompt'
+
+# empty file: logging on, but the last prompt sent nothing
+echo -n > $sess/requests
+out=`{requestscmd >[2=1]}
+check '/requests on an empty log' $"out '(no requests recorded for the last prompt)'
+
+out=`{docmd /requests >[2=1]}
+check 'docmd /requests' $"out '(no requests recorded for the last prompt)'
+
+rm -rf $tmp
+if(! ~ $#nfail 0){
+	echo $#nfail' of '$#nrun' claudetalk tests FAILED' >[1=2]
+	exit fail
+}
+echo 'all '$#nrun' claudetalk tests passed'
+exit ''

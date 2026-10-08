@@ -1442,6 +1442,201 @@ topenaibuildreq(void)
 	convfree(c);
 }
 
+/*
+ * --- the effort setting end to end at the library level: the
+ * accepted levels, the acceptance scenario for a local
+ * OpenAI-compatible (llama.cpp) Qwen session -- "/effort low"
+ * puts "reasoning_effort":"low" in the request body, "/effort
+ * default" takes it out again -- and that Anthropic requests
+ * are untouched by an effort set outside adaptive thinking.
+ * claude9fs's wreffort is effortlevel() plus "default"/"-"
+ * clearing Conv.effort to nil, which is what is modelled here.
+ */
+static void
+teffort(void)
+{
+	static char *good[] = { "none", "low", "medium", "high", "xhigh" };
+	static char *bad[] = { "", "default", "-", "LOW", "low ", "extreme", "xxhigh", "max" };
+	Conv *c;
+	Json *req;
+	char *body, *liveerr;
+	int i;
+
+	for(i = 0; i < nelem(good); i++){
+		nrun++;
+		if(!effortlevel(good[i])){
+			fprint(2, "FAIL: effortlevel rejects \"%s\"\n", good[i]);
+			nfail++;
+		}
+	}
+	for(i = 0; i < nelem(bad); i++){
+		nrun++;
+		if(effortlevel(bad[i])){
+			fprint(2, "FAIL: effortlevel accepts \"%s\"\n", bad[i]);
+			nfail++;
+		}
+	}
+	ok(!effortlevel(nil), "effortlevel nil");
+
+	/* local llama.cpp Qwen session: openai provider, keyless, baseurl */
+	c = convnew("", "qwen3-coder", 4096, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->baseurl = estrdup("http://mac.local:8080/v1/chat/completions");
+	convappend(c, msgnew(Muser, "hi", nil));
+
+	/* no override: field absent, exactly as before */
+	req = openaibuildreq(c);
+	body = jsonstr(req);
+	ok(jget(req, "reasoning_effort") == nil, "effort: default sends no reasoning_effort");
+	ok(strstr(body, "reasoning_effort") == nil, "effort: default body has no reasoning_effort");
+	free(body);
+	jsonfree(req);
+
+	/* /effort low */
+	c->effort = estrdup("low");
+	req = openaibuildreq(c);
+	body = jsonstr(req);
+	okstr(jstr(req, "reasoning_effort"), "low", "effort: low sent");
+	ok(strstr(body, "\"reasoning_effort\":\"low\"") != nil,
+		"effort: body contains \"reasoning_effort\":\"low\"");
+	ok(jget(req, "tools") != nil, "effort: tools still sent with effort");
+	free(body);
+	jsonfree(req);
+
+	/* xhigh passes through verbatim */
+	free(c->effort);
+	c->effort = estrdup("xhigh");
+	req = openaibuildreq(c);
+	okstr(jstr(req, "reasoning_effort"), "xhigh", "effort: xhigh sent");
+	jsonfree(req);
+
+	/* /effort default */
+	free(c->effort);
+	c->effort = nil;
+	req = openaibuildreq(c);
+	body = jsonstr(req);
+	ok(jget(req, "reasoning_effort") == nil, "effort: default again omits reasoning_effort");
+	ok(strstr(body, "reasoning_effort") == nil, "effort: default again body has no reasoning_effort");
+	free(body);
+	jsonfree(req);
+
+	/*
+	 * Quirk ladder with an effort set in Thinkoff (the /effort
+	 * case): we did send a value, so the first rejection must
+	 * drop it (Romit), not jump to an explicit "none".
+	 */
+	liveerr =
+		"API error: Function tools with reasoning_effort are not "
+		"supported for qwen3-coder. To use function tools, do not "
+		"set reasoning_effort.";
+	c->effort = estrdup("low");
+	ok(c->thinkmode == Thinkoff, "effort quirk: Thinkoff");
+	ok(openaiquirk(c, liveerr), "effort quirk: retry requested");
+	ok(c->reasonquirk == Romit, "effort quirk: Thinkoff + effort -> Romit");
+	req = openaibuildreq(c);
+	ok(jget(req, "reasoning_effort") == nil, "effort quirk: field dropped, not \"none\"");
+	jsonfree(req);
+	convfree(c);
+
+	/* Anthropic: effort only in adaptive thinking, as before */
+	c = convnew("key", "claude-opus-4-8", 4096, "sys", nil);
+	convappend(c, msgnew(Muser, "hi", nil));
+	c->effort = estrdup("low");
+	req = anthropicbuildreq(c);
+	ok(jget(req, "output_config") == nil && jget(req, "thinking") == nil,
+		"effort: anthropic Thinkoff ignores effort");
+	ok(jget(req, "reasoning_effort") == nil, "effort: anthropic never sends reasoning_effort");
+	jsonfree(req);
+	c->thinkmode = Thinkadaptive;
+	req = anthropicbuildreq(c);
+	okstr(jstr(jget(req, "output_config"), "effort"), "low",
+		"effort: anthropic adaptive sends output_config.effort");
+	jsonfree(req);
+	convfree(c);
+}
+
+/*
+ * --- claude.c: the request log (Conv.logreqs, ctl "reqlog on").
+ * The log must hold the very string reqbody returns -- which is
+ * what sendonce1 POSTs -- so it can serve as evidence of what a
+ * setting put on the wire.  Off by default; never records
+ * headers (the key); bounded, keeping the newest request whole.
+ */
+static void
+treqlog(void)
+{
+	Conv *c;
+	Provider *p;
+	char *body, *big;
+	long i;
+
+	c = convnew("sekrit-key", "qwen", 4096, "sys", nil);
+	c->prov = providerlookup("openai");
+	c->baseurl = estrdup("http://192.0.2.7:9931/v1/chat/completions");
+	convappend(c, msgnew(Muser, "hi", nil));
+	p = provof(c);
+
+	/* off by default: nothing recorded */
+	body = reqbody(c, p);
+	ok(body != nil, "reqlog: body built");
+	ok(c->reqlog.s == nil && c->nreqlog == 0, "reqlog: off by default");
+	free(body);
+
+	/* on, effort low: the logged body is the posted body */
+	c->logreqs = 1;
+	c->effort = estrdup("low");
+	body = reqbody(c, p);
+	ok(body != nil && c->reqlog.s != nil, "reqlog: recorded when on");
+	if(body != nil && c->reqlog.s != nil){
+		ok(strstr(c->reqlog.s, body) != nil, "reqlog: log contains the exact body");
+		ok(strstr(c->reqlog.s,
+			"--- request 1: openai POST http://192.0.2.7:9931/v1/chat/completions") != nil,
+			"reqlog: header names provider and endpoint");
+		ok(strstr(c->reqlog.s, "\"reasoning_effort\":\"low\"") != nil,
+			"reqlog: effort low visible on the wire");
+		ok(strstr(c->reqlog.s, "\"stream\":true") != nil,
+			"reqlog: logged after stream is set");
+		ok(strstr(c->reqlog.s, "sekrit-key") == nil, "reqlog: API key never logged");
+	}
+	free(body);
+
+	/* a retry note, then the retried body without the field */
+	reqlognote(c, "retry after", "API error: reasoning_effort not supported");
+	c->reasonquirk = Romit;
+	body = reqbody(c, p);
+	ok(c->nreqlog == 2, "reqlog: second request counted");
+	ok(strstr(c->reqlog.s, "--- retry after: API error: reasoning_effort not supported\n") != nil,
+		"reqlog: retry reason recorded");
+	ok(strstr(c->reqlog.s, "--- request 2:") != nil, "reqlog: second header");
+	ok(body != nil && strstr(body, "reasoning_effort") == nil,
+		"reqlog: retried body drops the field");
+	free(body);
+
+	/* notes are silent when logging is off */
+	c->logreqs = 0;
+	i = c->reqlog.len;
+	reqlognote(c, "error", "x");
+	ok(c->reqlog.len == i, "reqlog: note ignored when off");
+	c->logreqs = 1;
+
+	/* over the cap: older entries go, the newest stays whole */
+	big = emalloc(Reqlogmax);
+	memset(big, 'a', Reqlogmax - 1);
+	big[Reqlogmax - 1] = '\0';
+	convclear(c);
+	convappend(c, msgnew(Muser, big, nil));
+	free(big);
+	body = reqbody(c, p);
+	ok(body != nil && strstr(c->reqlog.s, "earlier requests dropped") != nil,
+		"reqlog: cap drops older entries");
+	ok(strstr(c->reqlog.s, "--- request 1:") == nil, "reqlog: oldest request gone");
+	ok(body != nil && strstr(c->reqlog.s, body) != nil,
+		"reqlog: newest request kept whole past the cap");
+	free(body);
+
+	convfree(c);
+}
+
 /* --- openai.c: token-field quirk detection --- */
 
 static void
@@ -2494,6 +2689,8 @@ threadmain(int argc, char **argv)
 	twebfetch();
 	tadvisorstream();
 	topenaibuildreq();
+	teffort();
+	treqlog();
 	topenaiquirk();
 	topenaiquirkreasoning();
 	topenaiquirkreasoningoff();

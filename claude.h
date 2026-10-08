@@ -27,7 +27,7 @@ enum {
  * emits.  See openaiquirk in openai.c.
  */
 enum {
-	Reffort,	/* normal: send effort iff Thinkadaptive */
+	Reffort,	/* normal: send effort iff one is set */
 	Romit,		/* effort value rejected with tools: omit the field */
 	Rnone,		/* absence also rejected (server default reasoning):
 			 * send explicit reasoning_effort "none" */
@@ -116,7 +116,10 @@ struct Conv {
 			 * responsesquirk as the server complains */
 	int thinkmode;	/* Thinkoff, Thinkbudget, Thinkadaptive */
 	int thinking;	/* Thinkbudget: budget tokens; 1024 <= thinking < maxtokens */
-	char *effort;	/* Thinkadaptive: output_config.effort, nil = unset */
+	char *effort;	/* explicit reasoning effort, nil = unset (default:
+			 * no field sent).  openai: reasoning_effort;
+			 * responses: reasoning.effort; anthropic:
+			 * output_config.effort, Thinkadaptive only */
 	char *advisormodel;	/* Anthropic server-side advisor; nil = disabled */
 	int advisormaxuses;	/* 0 = omit/unlimited */
 	int advisormaxtokens;	/* 0 = omit/provider default */
@@ -140,6 +143,20 @@ struct Conv {
 			 * returns at once instead of waiting for the next
 			 * chunk.  Cleared by the server at the start of
 			 * each prompt, never here. */
+	int logreqs;	/* record every request body sent (ctl
+			 * "reqlog on"; see reqbody in claude.c).
+			 * Off by default. */
+	Sbuf reqlog;	/* the record: one "--- request N ..."
+			 * header line plus the exact JSON body per
+			 * request, and a "--- retry"/"--- error" line
+			 * for each failed attempt.  Headers (and so
+			 * the API key) are never recorded.  Appended
+			 * by the round in flight with no lock held;
+			 * the server must only touch it while the
+			 * session is idle (claude9fs empties it when a
+			 * prompt starts and moves it to the session's
+			 * requests file when the prompt ends). */
+	int nreqlog;	/* requests recorded in reqlog */
 	char *basesys;	/* sysprompt before skills are appended */
 	char *sysprompt;	/* basesys + current skills: what's actually sent */
 	Msg *msgs;
@@ -229,6 +246,12 @@ int	toollimiterr(char *err);
  * not auto-continue it.
  */
 int	cancelerr(char *err);
+/*
+ * True if s is an explicit reasoning-effort level the effort
+ * file accepts: none, low, medium, high, xhigh.  ("default",
+ * meaning no override, is handled by the caller.)
+ */
+int	effortlevel(char *s);
 /*
  * Run the full tool loop: send the conversation, execute any
  * tool calls Claude makes, send the results back, repeat until

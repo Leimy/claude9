@@ -40,6 +40,7 @@ enum {
 	Qprovider,
 	Qbaseurl,
 	Qadvisor,
+	Qrequests,
 };
 
 #define QPATH(sid, type)	((uvlong)(sid)<<8 | (type))
@@ -55,6 +56,7 @@ struct Session {
 	Conv *conv;
 	char *lastreply;
 	char *lasterror;
+	char *lastreqs;	/* request log of the last prompt (ctl reqlog), or nil */
 	Usage usage;
 	int ref;	/* held by users outside the list; guarded by sessionlk */
 	int unlinked;	/* removed from session list; guarded by sessionlk */
@@ -583,6 +585,7 @@ freesession(Session *s)
 	convfree(s->conv);
 	free(s->lastreply);
 	free(s->lasterror);
+	free(s->lastreqs);
 	free(s->name);
 	free(s->parent);
 	free(s->usage.stop_reason);
@@ -703,6 +706,7 @@ static char* rderror(Session*);
 static char* rdprovider(Session*);
 static char* rdbaseurl(Session*);
 static char* rdadvisor(Session*);
+static char* rdrequests(Session*);
 static char* wrmodel(Session*, char*);
 static char* wrtokens(Session*, char*);
 static char* wrthinking(Session*, char*);
@@ -733,6 +737,7 @@ static struct {
 	{ "provider",	Qprovider,	0666,	rdprovider,	wrprovider },
 	{ "baseurl",	Qbaseurl,	0666,	rdbaseurl,	wrbaseurl },
 	{ "advisor",	Qadvisor,	0666,	rdadvisor,	wradvisor },
+	{ "requests",	Qrequests,	0444,	rdrequests,	nil },
 };
 
 /*
@@ -1217,7 +1222,8 @@ rdctl(Session *s)
 		"provider %s\n"
 		"baseurl %s\n"
 		"advisor %s\n"
-		"gate %d\n",
+		"gate %d\n"
+		"reqlog %d\n",
 		s->name,
 		s->parent != nil && s->parent[0] != '\0' ? s->parent : "-",
 		s->conv->model,
@@ -1233,7 +1239,8 @@ rdctl(Session *s)
 		providername(s->conv->prov),
 		s->conv->baseurl != nil ? s->conv->baseurl : "-",
 		advisor,
-		s->gated);
+		s->gated,
+		s->conv->logreqs);
 	free(think);
 	free(advisor);
 	return text;
@@ -1275,27 +1282,58 @@ rdeffort(Session *s)
 	return estrdup(s->conv->effort != nil ? s->conv->effort : "default");
 }
 
+/*
+ * Explicit reasoning effort, independent of the thinking mode
+ * (the same Conv.effort that "thinking adaptive <effort>"
+ * sets).  "default" (or "-") clears it, so no effort field is
+ * sent at all and the provider/server default applies --
+ * exactly the behavior of a session that never set one.
+ * Called with data trimmed of trailing newlines by fswrite;
+ * surrounding blanks are trimmed here (data is our own copy).
+ */
 static char*
 wreffort(Session *s, char *data)
 {
 	Conv *c;
+	char *e;
 
 	c = s->conv;
+	while(*data == ' ' || *data == '\t')
+		data++;
+	e = data + strlen(data);
+	while(e > data && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'))
+		*--e = '\0';
 	if(strcmp(data, "default") == 0 || strcmp(data, "-") == 0){
 		free(c->effort);
 		c->effort = nil;
 		resetquirks(c);
 		return nil;
 	}
-	if(strcmp(data, "none") != 0 && strcmp(data, "low") != 0
-	&& strcmp(data, "medium") != 0 && strcmp(data, "high") != 0)
-		return "effort must be default, none, low, medium, or high";
+	if(!effortlevel(data))
+		return "effort must be default, none, low, medium, high, or xhigh";
 	/* Anthropic only emits effort while thinking is adaptive;
 	 * OpenAI emits an explicit effort independently. */
 	free(c->effort);
 	c->effort = estrdup(data);
 	resetquirks(c);
 	return nil;
+}
+
+/*
+ * The request log of the most recent finished prompt: every
+ * request body sent, exactly as serialized, with retries and
+ * errors between them (see reqbody in claude.c).  Published
+ * when the prompt ends, like usage, so while a prompt is in
+ * flight this still shows the previous one.
+ */
+static char*
+rdrequests(Session *s)
+{
+	if(s->lastreqs != nil)
+		return estrdup(s->lastreqs);
+	if(!s->conv->logreqs)
+		return estrdup("request logging is off; echo reqlog on > ctl, then send a prompt\n");
+	return estrdup("");
 }
 
 static char*
@@ -1981,6 +2019,8 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 		s->lastreply = nil;
 		free(s->lasterror);
 		s->lasterror = nil;
+		free(s->lastreqs);
+		s->lastreqs = nil;
 		free(s->usage.stop_reason);
 		memset(&s->usage, 0, sizeof s->usage);
 		streamclear(s, 1);
@@ -2034,6 +2074,23 @@ handlectl(Session *s, char *cmd, int *hangupp, int *reloadp)
 			s->gated = 0;
 		else
 			return "gate: expected on or off";
+	} else if(strncmp(cmd, "reqlog", 6) == 0
+	&& (cmd[6] == '\0' || cmd[6] == ' ')){
+		/*
+		 * Record the request bodies of each prompt in the
+		 * requests file (see rdrequests).  Takes effect from
+		 * the next prompt; a round in flight keeps logging or
+		 * not as it started (the worker only reads the flag).
+		 */
+		char *v;
+		v = cmd + 6;
+		while(*v == ' ') v++;
+		if(*v == '\0' || strcmp(v, "on") == 0)
+			s->conv->logreqs = 1;
+		else if(strcmp(v, "off") == 0)
+			s->conv->logreqs = 0;
+		else
+			return "reqlog: expected on or off";
 	} else if(strcmp(cmd, "cancel") == 0){
 		/*
 		 * Stop the prompt in flight; the writer's own write
@@ -2119,10 +2176,11 @@ static char newusage[] =
 	"  model ID\n"
 	"  tokens N             max output tokens\n"
 	"  thinking SPEC        0 | off | <budget> | adaptive [effort]\n"
-	"  effort E             default | none | low | medium | high\n"
+	"  effort E             default | none | low | medium | high | xhigh\n"
 	"  maxrounds N          tool-loop round cap per prompt\n"
 	"  autocontinue N       auto 'Continue.' rounds; 0 = off\n"
 	"  gate on|off          queue prompts behind other gated sessions on the same baseurl\n"
+	"  reqlog on|off        record each prompt's request bodies in the requests file\n"
 	"  system TEXT          must be last; TEXT runs to the end of the write\n"
 	"On any error nothing is created.  Then write the session's prompt file.\n";
 
@@ -2133,6 +2191,7 @@ struct Newspec {
 	int maxrounds;		/* 0 = default */
 	int autocont;		/* -1 = not given */
 	int gate;		/* -1 = not given */
+	int reqlog;		/* -1 = not given */
 };
 
 static int
@@ -2166,6 +2225,7 @@ parsenew(char *data, Newspec *sp)
 	memset(sp, 0, sizeof *sp);
 	sp->autocont = -1;
 	sp->gate = -1;
+	sp->reqlog = -1;
 	for(line = data; line != nil; line = next){
 		next = strchr(line, '\n');
 		if(next != nil)
@@ -2220,6 +2280,13 @@ parsenew(char *data, Newspec *sp)
 				sp->gate = 0;
 			else
 				return "gate: expected on or off";
+		}else if(strcmp(key, "reqlog") == 0){
+			if(strcmp(val, "on") == 0)
+				sp->reqlog = 1;
+			else if(strcmp(val, "off") == 0)
+				sp->reqlog = 0;
+			else
+				return "reqlog: expected on or off";
 		}else
 			return "new: unknown key (read the new file for the list)";
 	}
@@ -2258,6 +2325,8 @@ applynew(Session *s, Newspec *sp)
 		s->autocont = sp->autocont;
 	if(sp->gate >= 0)
 		s->gated = sp->gate;
+	if(sp->reqlog >= 0)
+		s->conv->logreqs = sp->reqlog;
 	if(sp->parent != nil && sp->parent[0] != '\0' && strcmp(sp->parent, "-") != 0){
 		free(s->parent);
 		s->parent = estrdup(sp->parent);
@@ -2368,6 +2437,13 @@ doprompt(Req *r, Session *s, char *data)
 	 * while busy counts.
 	 */
 	s->conv->cancel = 0;
+	/*
+	 * Start this prompt's request log empty.  Safe here: busy is
+	 * set and no round is running, so nothing else touches it.
+	 */
+	free(s->conv->reqlog.s);
+	memset(&s->conv->reqlog, 0, sizeof s->conv->reqlog);
+	s->conv->nreqlog = 0;
 	s->promptreq = r;
 	s->wtid = threadid();
 	s->waitgate = gate;
@@ -2492,6 +2568,17 @@ doprompt(Req *r, Session *s, char *data)
 	s->waitgate = nil;
 	s->lastact = time(0);
 	bumpgraph();
+	/*
+	 * Publish the request log (ownership moves; the round is
+	 * over, so the Conv's buffer is no longer being appended).
+	 * With logging off nothing was recorded; keep whatever an
+	 * earlier logged prompt left rather than blanking it.
+	 */
+	if(s->conv->logreqs || s->conv->reqlog.s != nil){
+		free(s->lastreqs);
+		s->lastreqs = s->conv->reqlog.s;
+		memset(&s->conv->reqlog, 0, sizeof s->conv->reqlog);
+	}
 	free(s->usage.stop_reason);
 	s->usage = u;	/* struct copy; stop_reason ownership moves */
 	if(cancelerr(err)){

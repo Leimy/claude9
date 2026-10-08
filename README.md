@@ -213,13 +213,15 @@ unavailable).
 			model     read/write the model name
 			tokens    read/write max output tokens per round
 			thinking  read/write extended thinking setting (0 = off)
-			effort    read/write reasoning effort (default/none/low/medium/high)
+			effort    read/write reasoning effort (default/none/low/medium/high/xhigh)
 			system    read/write the system prompt
 			provider  read/write provider (anthropic, openai, or responses)
 			baseurl   read/write endpoint override (- clears it)
 			advisor   Anthropic server-side advisor setting
 			usage     read token usage statistics
 			error     read last error message
+			requests  read the last prompt's request bodies, exactly as
+			          sent (needs ctl reqlog on; see Request Log)
 
 ### Creating a Session in One Write
 
@@ -243,7 +245,7 @@ no `/`, not a root file name, not already in use).  Every other key
 is optional and defaults exactly as a cloned session does:
 `parent`, `provider`, `baseurl`, `model`, `tokens`, `thinking`,
 `effort`, `maxrounds`, `autocontinue`, `gate` (`on` or `off`; see
-Prompt Gate), and `system`, which must be last because its value is the rest of the write, newlines included.
+Prompt Gate), `reqlog` (`on` or `off`; see Request Log), and `system`, which must be last because its value is the rest of the write, newlines included.
 Reading `new` returns this list.
 
 The write either creates the session fully configured or creates
@@ -270,6 +272,8 @@ is needed: write `new`, then write `<name>/prompt`.
 	maxrounds [n]      set the per-prompt tool-loop round cap; no n restores the default
 	gate [on|off]      queue this session's prompts behind other gated sessions
 	                   with the same baseurl; bare "gate" means on (see Prompt Gate)
+	reqlog [on|off]    record each prompt's request bodies in the requests
+	                   file; bare "reqlog" means on (see Request Log)
 	reloadskills       re-read the skills directory (see Skills)
 
 ### Defaults
@@ -286,6 +290,7 @@ New sessions start with:
 	autocontinue  off
 	maxrounds     20                (override with -r)
 	gate          off
+	reqlog        off
 
 The defaults are chosen to interlock: 16384 output tokens per
 round is enough that ordinary coding work never hits the cap,
@@ -750,6 +755,47 @@ hits EOF.
 To see the last round's text after the fact, read `prompt`
 instead.
 
+### Request Log
+
+To check what a setting actually puts on the wire -- whether
+`effort low` really sends `"reasoning_effort":"low"`, what a quirk
+retry changed -- turn on the request log and read `requests` after
+a prompt:
+
+	echo reqlog on > /mnt/claude/$n/ctl
+	echo 'hi' > /mnt/claude/$n/prompt
+	cat /mnt/claude/$n/requests
+
+Each request the prompt sent appears as a header line followed by
+the JSON body, byte for byte the string that was POSTed (it is
+recorded at the one place the body is serialized, after `stream` is
+set):
+
+	--- request 1: openai POST http://host:9931/v1/chat/completions (20311 bytes)
+	{"model":"...","max_completion_tokens":32768,...,"reasoning_effort":"low",...}
+
+A failed attempt adds `--- retry after: <error>` before the request
+that a quirk changed, or `--- error: <error>` when the prompt gave
+up.  So the effort retry ladder, for example, reads as the rejected
+body, the server's complaint, and the retried body in order.
+
+Details:
+
+- Off by default; `reqlog on|off` in `ctl`, or `reqlog on` in a `new`
+  spec.  `ctl` shows `reqlog 0|1`.
+- The file holds the last *finished* prompt (every round and retry
+  of it, auto-continue rounds included).  Like `usage`, it is
+  published when the prompt ends, so during a prompt it still shows
+  the previous one.  `clear` empties it; a prompt sent with logging
+  off leaves the previous log in place.
+- Headers are not recorded, so the API key never appears.  The
+  bodies do contain the full conversation, system prompt, and tool
+  results, so treat the file like the conversation itself.
+- Bounded at 4 MiB per prompt.  A long tool loop resends the whole
+  history every round, so past the cap older requests are dropped
+  (a `--- earlier requests dropped` line says so); the newest
+  request is always kept whole.
+
 ### Output Tokens: the Guillotine
 
 The `tokens` file sets the `max_tokens` parameter sent with
@@ -822,11 +868,25 @@ reasoning-effort control:
 	cat /mnt/claude/$n/effort
 	echo default > /mnt/claude/$n/effort
 
-It accepts `default`, `none`, `low`, `medium`, or `high`.
-`default` (also writable as `-`) clears the explicit value. For
-the `openai` provider an explicit value is sent as
+It accepts `default`, `none`, `low`, `medium`, `high`, or `xhigh`
+(surrounding blanks are ignored; anything else is refused).
+Reading it returns the current value, `default` when none is set.
+`default` (also writable as `-`) clears the explicit value, and
+then no effort field is sent at all, so the provider's or server's
+own default applies -- exactly as for a session that never set one.
+For the `openai` provider an explicit value is sent as
 `reasoning_effort`, and for `responses` as `reasoning.effort`,
-independently of the `thinking` mode. For Anthropic it is sent
+independently of the `thinking` mode.  This is the knob for local
+reasoning models served by llama.cpp, which honors the field:
+
+	echo low > /mnt/claude/$n/effort       # requests carry "reasoning_effort":"low"
+	echo default > /mnt/claude/$n/effort   # requests omit reasoning_effort again
+
+To confirm what was sent, enable the request log (`echo reqlog on >
+ctl`) and read the session's `requests` file after the prompt.
+
+(or `/effort low` and `/effort default` in claudetalk, or an
+`effort low` line in a `new` spec). For Anthropic it is sent
 as `output_config.effort` only when `thinking` is adaptive.  Not
 every model accepts every value (gpt-6-astra, for one, rejects
 `none`); a rejected value fails the round cleanly with the
@@ -1227,8 +1287,15 @@ file in the background while writing to `prompt`.
 	/thinking      show extended thinking setting
 	/thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)
 	/thinking adaptive [effort]  adaptive mode (fable)
-	/effort        show explicit reasoning effort
-	/effort <level> set default, none, low, medium, or high
+	/effort        show reasoning effort (default = no override)
+	/effort <level> set none, low, medium, high, or xhigh (see the
+	               effort file under Extended Thinking)
+	/effort default clear the override; no effort field is sent
+	/reqlog        show whether request logging is on
+	/reqlog on|off record each prompt's request bodies (see Request Log)
+	/requests      summarize the last prompt's requests: header lines,
+	               retry/error notes, and the effort field each body carried
+	/requests full print the whole log, JSON bodies included
 	/clear         clear conversation
 	/compact [n]   drop old exchanges, keeping the n most recent (default 4)
 	/status        show session info
@@ -1380,6 +1447,9 @@ can also drive them from rc without claudetalk:
 	claudetalk     rc interactive client and server bootstrap
 	claudegraph.c  libdraw viewer for the live session graph
 	tests.c        pure-logic and provider request/stream tests
+	               (mk tests, then ./tests)
+	tests-claudetalk.rc  claudetalk command-parsing tests
+	               (rc tests-claudetalk.rc; needs no server)
 	PROVIDERS.md   provider implementation notes and live-test history
 
 ## Dependencies

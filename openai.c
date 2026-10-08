@@ -134,11 +134,12 @@ openaiquirk(Conv *c, char *err)
 	 * Completions ladder (Conv.reasonquirk, see claude.h), one
 	 * rung per complaint:
 	 *
-	 *   Reffort  and we sent an effort value -> Romit:
+	 *   Reffort  and we sent an effort value (any thinking
+	 *            mode; see openaibuildreq) -> Romit:
 	 *            drop the field, retry (maybe the server has
 	 *            no default and just hates the value+tools).
-	 *   Reffort  and the field was absent (Thinkoff: the live
-	 *            case) -> Rnone directly: the server default
+	 *   Reffort  and the field was absent (no effort set: the
+	 *            live case) -> Rnone directly: the server default
 	 *            must be on; send "none", retry.
 	 *   Romit    (absence still rejected) -> Rnone: send
 	 *            "none", retry.
@@ -159,8 +160,13 @@ openaiquirk(Conv *c, char *err)
 			return 1;
 		switch(c->reasonquirk){
 		case Reffort:
-			if(c->thinkmode == Thinkadaptive
-			&& c->effort != nil && c->effort[0] != '\0'){
+			/*
+			 * "We sent a value" is exactly openaibuildreq's
+			 * test: an explicit effort is sent whatever the
+			 * thinking mode (the effort file sets it in
+			 * Thinkoff too), so do not consult thinkmode.
+			 */
+			if(c->effort != nil && c->effort[0] != '\0'){
 				c->reasonquirk = Romit;
 				return 1;
 			}
@@ -421,8 +427,13 @@ openaibuildreq(Conv *c)
 	}
 
 	/*
-	 * Thinkadaptive: map effort to reasoning_effort.
-	 * Thinkbudget: no OpenAI equivalent, silently ignored.
+	 * An explicit effort (the session's effort file, or
+	 * "thinking adaptive <effort>") is sent as reasoning_effort
+	 * whatever the thinking mode -- this is how a local
+	 * llama.cpp Qwen session gets "reasoning_effort":"low".
+	 * No effort set ("default"): the field is omitted and the
+	 * server's own default applies.  Thinkbudget has no OpenAI
+	 * equivalent and is silently ignored.
 	 *
 	 * The quirk ladder (Conv.reasonquirk, advanced by
 	 * openaiquirk when the server rejects tools+reasoning)

@@ -511,6 +511,7 @@ convfree(Conv *c)
 	free(c->effort);
 	free(c->advisormodel);
 	free(c->advisorcache);
+	free(c->reqlog.s);
 	free(c->basesys);
 	free(c->sysprompt);
 	free(c);
@@ -3222,22 +3223,77 @@ anthropicreadstream(Conv *c, Biobuf *bp, Usage *usage,
 }
 
 /*
- * One request/response round through the conversation's
- * provider: build the request, POST it, hand the streamed
- * body to the provider's reader.
+ * Request log (Conv.logreqs/reqlog; ctl "reqlog on" in
+ * claude9fs).  The point is verifiability: what a setting such
+ * as the effort file actually put on the wire, and what a quirk
+ * retry changed, without trusting the model's behavior as
+ * indirect evidence.  So the log holds the exact serialized
+ * body handed to webhttp -- the same string, not a rebuild --
+ * plus the endpoint and provider.  Headers are deliberately
+ * left out: they carry the API key.
+ *
+ * Bounded: a long tool loop resends the whole conversation
+ * every round, so the log grows quadratically.  Past Reqlogmax
+ * the older entries are dropped (with a note saying so) to
+ * make room, so the most recent request -- the one a failure
+ * is usually about -- is always kept whole, even if it alone
+ * exceeds the cap.
+ *
+ * Nothing here touches errstr (snprint and sbappend only), so
+ * logging a failure cannot clobber the error being reported.
  */
-static Reply*
-sendonce1(Conv *c, Usage *usage,
-	void (*cb)(char*, void*), void *aux)
+enum {
+	Reqlogmax = 4*1024*1024,
+};
+
+static void
+reqlogroom(Conv *c, long n)
+{
+	static char dropped[] = "--- earlier requests dropped (log over size cap)\n";
+
+	if(c->reqlog.len > 0 && c->reqlog.len + n > Reqlogmax){
+		c->reqlog.len = 0;
+		c->reqlog.s[0] = '\0';
+		sbappend(&c->reqlog, dropped, strlen(dropped));
+	}
+}
+
+static void
+reqlognote(Conv *c, char *what, char *msg)
+{
+	char hdr[64];
+	long n;
+
+	if(!c->logreqs)
+		return;
+	snprint(hdr, sizeof hdr, "--- %s: ", what);
+	n = strlen(msg);
+	reqlogroom(c, strlen(hdr) + n + 1);
+	sbappend(&c->reqlog, hdr, strlen(hdr));
+	sbappend(&c->reqlog, msg, n);
+	sbappend(&c->reqlog, "\n", 1);
+}
+
+static char*
+requrl(Conv *c, Provider *p)
+{
+	return c->baseurl != nil && c->baseurl[0] != '\0' ? c->baseurl : p->apiurl;
+}
+
+/*
+ * Build and serialize one request for the conversation's
+ * provider, recording it in the request log if enabled.
+ * Returns the malloc'd body (caller frees), or nil with errstr
+ * set.  Separate from sendonce1 so tests can check the logged
+ * text against the very string that would be POSTed.
+ */
+static char*
+reqbody(Conv *c, Provider *p)
 {
 	Json *req;
-	char *body;
-	Biobuf *bp;
-	int fd, clonefd;
-	Reply *r;
-	Provider *p;
+	char *body, *url, hdr[512];
+	long n;
 
-	p = provof(c);
 	req = p->buildreq(c);
 	if(req == nil)
 		return nil;	/* errstr set by buildreq */
@@ -3248,10 +3304,41 @@ sendonce1(Conv *c, Usage *usage,
 		werrstr("failed to serialize request");
 		return nil;
 	}
+	if(c->logreqs){
+		url = requrl(c, p);
+		n = strlen(body);
+		c->nreqlog++;
+		snprint(hdr, sizeof hdr, "--- request %d: %s POST %s (%ld bytes)\n",
+			c->nreqlog, p->name, url != nil ? url : "?", n);
+		reqlogroom(c, strlen(hdr) + n + 1);
+		sbappend(&c->reqlog, hdr, strlen(hdr));
+		sbappend(&c->reqlog, body, n);
+		sbappend(&c->reqlog, "\n", 1);
+	}
+	return body;
+}
 
-	fd = webhttp(p, c,
-		c->baseurl != nil && c->baseurl[0] != '\0' ? c->baseurl : p->apiurl,
-		body, 1, &clonefd);
+/*
+ * One request/response round through the conversation's
+ * provider: build the request, POST it, hand the streamed
+ * body to the provider's reader.
+ */
+static Reply*
+sendonce1(Conv *c, Usage *usage,
+	void (*cb)(char*, void*), void *aux)
+{
+	char *body;
+	Biobuf *bp;
+	int fd, clonefd;
+	Reply *r;
+	Provider *p;
+
+	p = provof(c);
+	body = reqbody(c, p);
+	if(body == nil)
+		return nil;
+
+	fd = webhttp(p, c, requrl(c, p), body, 1, &clonefd);
 	free(body);
 	if(fd < 0)
 		return nil;
@@ -3330,13 +3417,17 @@ sendonce(Conv *c, Usage *usage,
 			werrstr(Cancelmsg);
 			return nil;
 		}
-		if(p->quirk == nil || try >= Maxquirks)
-			return nil;
 		rerrstr(errbuf, sizeof errbuf);
+		if(p->quirk == nil || try >= Maxquirks){
+			reqlognote(c, "error", errbuf);
+			return nil;
+		}
 		if(!p->quirk(c, errbuf)){
+			reqlognote(c, "error", errbuf);
 			werrstr("%s", errbuf);	/* quirk may have clobbered errstr */
 			return nil;
 		}
+		reqlognote(c, "retry after", errbuf);
 		if(provof(c) != p)
 			fprint(2, "claude: %s: switching to %s after request-shape error: %s\n",
 				p->name, provof(c)->name, errbuf);
@@ -3430,6 +3521,33 @@ toollimiterr(char *err)
 	if(err == nil)
 		return 0;
 	return strstr(err, "tool loop limit reached") != nil;
+}
+
+/*
+ * The explicit reasoning-effort levels a session's effort file
+ * accepts (see wreffort in claude9fs.c).  The value is passed
+ * through verbatim: openai sends it as reasoning_effort,
+ * responses as reasoning.effort, anthropic as
+ * output_config.effort (Thinkadaptive only).  Whether a given
+ * model accepts a given level is the server's call; a refusal
+ * surfaces in the error file.  "default" is not a level: it is
+ * the absence of one (Conv.effort nil, field omitted).
+ */
+static char *effortlevels[] = {
+	"none", "low", "medium", "high", "xhigh",
+};
+
+int
+effortlevel(char *s)
+{
+	int i;
+
+	if(s == nil)
+		return 0;
+	for(i = 0; i < nelem(effortlevels); i++)
+		if(strcmp(s, effortlevels[i]) == 0)
+			return 1;
+	return 0;
 }
 
 int

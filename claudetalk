@@ -216,7 +216,7 @@ fn teardown {
 curmodel=`{cat $sess/model}
 curtokens=`{cat $sess/tokens}
 echo 'claude9 session '$n' - '$curmodel >[1=2]
-echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /effort [level] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
+echo 'commands: /sessions /models /model [name] /provider [name] /baseurl [url] /advisor [setting] /tokens [n] /thinking [n] /effort [level] /reqlog [on|off] /requests [full] /clear /compact [n] /status /usage /autocontinue [n] /noautocontinue /maxrounds [n] /reloadskills /graph /detach /help /quit' >[1=2]
 echo 'type message, end with ^D to send.  DEL cancels a reply in progress (or discards what you are typing); /quit or ^D on an empty line exits' >[1=2]
 if(~ $detach 1)
 	echo 'detach mode: session will persist on exit (reattach with -a '$n')' >[1=2]
@@ -730,6 +730,81 @@ fn setget {
 	}
 }
 
+# /effort [level]: show or set the session's reasoning effort.
+# No argument shows it; one argument is written to the effort
+# file verbatim -- claude9fs is the single authority on which
+# levels exist (default none low medium high xhigh) and rejects
+# anything else with a message naming them.  "default" clears
+# the override, so no effort field is sent at all.  More than
+# one argument is a usage error and changes nothing.  Kept as
+# its own function so tests-claudetalk.rc can drive it.
+fn effortcmd {
+	if(~ $#* 0 1)
+		setget $sess/effort effort $*
+	if not
+		echo 'usage: /effort [default|none|low|medium|high|xhigh]' >[1=2]
+}
+
+# /reqlog [on|off]: show or set request logging (ctl "reqlog").
+# Prints the resulting state as read back from ctl, so a server
+# that refused the command (or predates it) is visible.  Kept as
+# its own function so tests-claudetalk.rc can drive it.
+fn reqlogcmd {
+	rlok=1
+	if(~ $#* 1 && ~ $1 on off)
+		echo 'reqlog '$1 > $sess/ctl
+	if not if(! ~ $#* 0){
+		echo 'usage: /reqlog [on|off]' >[1=2]
+		rlok=0
+	}
+	if(~ $rlok 1){
+		rl=`{awk '$1 == "reqlog" { print $2 }' $sess/ctl >[2]/dev/null}
+		switch($"rl){
+		case 1 on
+			echo 'reqlog: on (read the log with /requests after a prompt)' >[1=2]
+		case 0 off
+			echo 'reqlog: off' >[1=2]
+		case *
+			echo 'reqlog: not supported by this claude9fs (mk install, then restart the servers)' >[1=2]
+		}
+	}
+}
+
+# /requests [full]: show the last prompt's request log.  With no
+# argument, a summary: every "--- " line (request headers, retry
+# and error notes) and, under each request, the effort fields its
+# body carried -- the thing the effort tests need to see -- or
+# "(no effort field)".  "full" prints the whole log, bodies and
+# all.  Bodies are one line each (the serializer escapes
+# newlines), and a quote inside a message is escaped too, so the
+# effort match only finds real top-level JSON keys.  Kept as its
+# own function so tests-claudetalk.rc can drive it.
+fn requestscmd {
+	if(~ $#* 1 && ~ $1 full)
+		cat $sess/requests >[1=2]
+	if not if(! ~ $#* 0)
+		echo 'usage: /requests [full]' >[1=2]
+	if not awk '
+		NR == 1 && !/^--- / { raw = 1 }
+		raw { print; next }
+		/^--- / { print; next }
+		{
+			e = ""
+			s = $0
+			while(match(s, /"(reasoning_)?effort":"[^"]*"/)){
+				e = e " " substr(s, RSTART, RLENGTH)
+				s = substr(s, RSTART + RLENGTH)
+			}
+			if(e == "")
+				e = " (no effort field)"
+			print "    effort:" e
+		}
+		END {
+			if(NR == 0)
+				print "(no requests recorded for the last prompt)"
+		}' $sess/requests >[1=2]
+}
+
 fn docmd {
 	cmd=$1
 	if(~ $cmd /clear){
@@ -842,7 +917,15 @@ fn docmd {
 	}
 	if not if(~ $cmd /effort){
 		shift
-		setget $sess/effort effort $*
+		effortcmd $*
+	}
+	if not if(~ $cmd /reqlog){
+		shift
+		reqlogcmd $*
+	}
+	if not if(~ $cmd /requests){
+		shift
+		requestscmd $*
 	}
 	if not if(~ $cmd /status){
 		cat $sess/ctl >[1=2]
@@ -880,8 +963,18 @@ fn docmd {
 		echo '  /thinking      show extended thinking setting' >[1=2]
 		echo '  /thinking <n>  budget mode, n tokens (opus etc.; 0 = off, min 1024)' >[1=2]
 		echo '  /thinking adaptive [effort]  adaptive mode (fable; effort e.g. low/medium/high)' >[1=2]
-		echo '  /effort        show explicit reasoning effort' >[1=2]
-		echo '  /effort <level> set default, none, low, medium, or high' >[1=2]
+		echo '  /effort        show reasoning effort (default = no override)' >[1=2]
+		echo '  /effort <level> set none, low, medium, high, or xhigh; openai' >[1=2]
+		echo '                 (e.g. local llama.cpp) sends it as reasoning_effort,' >[1=2]
+		echo '                 responses as reasoning.effort, anthropic only' >[1=2]
+		echo '                 with /thinking adaptive' >[1=2]
+		echo '  /effort default clear the override: send no effort field' >[1=2]
+		echo '  /reqlog        show whether request logging is on' >[1=2]
+		echo '  /reqlog on|off record (or stop recording) each prompt''s request' >[1=2]
+		echo '                 bodies, exactly as sent; headers and keys are not kept' >[1=2]
+		echo '  /requests      summarize the last prompt''s requests: endpoints,' >[1=2]
+		echo '                 retries, errors, and the effort field each carried' >[1=2]
+		echo '  /requests full print the whole log, JSON bodies included' >[1=2]
 		echo '  /clear         clear conversation' >[1=2]
 		echo '  /compact [n]   drop old exchanges, keep n recent (default 4)' >[1=2]
 		echo '  /status        show session info' >[1=2]
