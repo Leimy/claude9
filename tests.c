@@ -913,6 +913,275 @@ treplace(void)
 	free(path);
 }
 
+/* --- claude.c: batch_replace tool --- */
+
+static Json*
+batchedit(char *path, char *old, char *new)
+{
+	Json *e;
+
+	e = jobject();
+	jset(e, "path", jstring(path));
+	jset(e, "old_str", jstring(old));
+	jset(e, "new_str", jstring(new));
+	return e;
+}
+
+static int
+batchwrite(char *path, char *text)
+{
+	int fd, rc;
+
+	fd = create(path, OWRITE, 0666);
+	ok(fd >= 0, "batch: create fixture");
+	if(fd < 0)
+		return 0;
+	rc = writeall(fd, text, strlen(text));
+	close(fd);
+	ok(rc == 0, "batch: write fixture");
+	return rc == 0;
+}
+
+/* Consume edits and return the tool's result. */
+static char*
+batchrun(Json *edits)
+{
+	char *spec, *res;
+
+	spec = jsonstr(edits);
+	res = toolbatchreplace(spec);
+	free(spec);
+	jsonfree(edits);
+	return res;
+}
+
+/* Every rejected batch must leave both fixtures unchanged. */
+static void
+batchreject(Json *edits, char *a, char *b, char *name)
+{
+	char *res;
+
+	res = batchrun(edits);
+	ok(res != nil && strncmp(res, "error:", 6) == 0, name);
+	free(res);
+	res = toolread(a);
+	okstr(res, "alpha beta alpha", "batch rejection: first file unchanged");
+	free(res);
+	res = toolread(b);
+	okstr(res, "second", "batch rejection: second file unchanged");
+	free(res);
+}
+
+static void
+tbatchreplace(void)
+{
+	char *a, *b, *missing, *res, *big;
+	Json *edits, *e;
+	Dir d, *st;
+	int i;
+
+	a = esmprint("/tmp/claudetest.batch.a.%d", getpid());
+	b = esmprint("/tmp/claudetest.batch.b.%d", getpid());
+	missing = esmprint("/tmp/claudetest.batch.missing.%d", getpid());
+	if(!batchwrite(a, "alpha beta alpha") || !batchwrite(b, "second"))
+		goto done;
+
+	/* Later edits see earlier replacements; empty new_str deletes. */
+	nulldir(&d);
+	d.mode = 0751;
+	ok(dirwstat(a, &d) >= 0, "batch: set fixture mode");
+	edits = jarray();
+	jappend(edits, batchedit(a, "beta", "gamma"));
+	jappend(edits, batchedit(b, "second", "other"));
+	jappend(edits, batchedit(a, "gamma ", ""));
+	res = batchrun(edits);
+	ok(res != nil && strncmp(res, "applied", 7) == 0,
+		"batch: ordered multi-file edits succeed");
+	ok(res != nil && strstr(res, "applied 3 edits to 2 files") != nil,
+		"batch: summary counts edits and distinct files");
+	free(res);
+	res = toolread(a);
+	okstr(res, "alpha alpha", "batch: ordered replacement then deletion");
+	free(res);
+	res = toolread(b);
+	okstr(res, "other", "batch: second file edited");
+	free(res);
+	st = dirstat(a);
+	ok(st != nil && (st->mode & 0777) == 0751, "batch: preserves file mode");
+	free(st);
+	if(!batchwrite(a, "alpha beta alpha") || !batchwrite(b, "second"))
+		goto done;
+
+	/* A valid first edit must not commit if a later edit is invalid. */
+	edits = jarray();
+	jappend(edits, batchedit(a, "beta", "changed"));
+	jappend(edits, batchedit(b, "absent", "x"));
+	batchreject(edits, a, b, "batch: late missing match rejected");
+	edits = jarray();
+	jappend(edits, batchedit(b, "second", "changed"));
+	jappend(edits, batchedit(a, "alpha", "x"));
+	batchreject(edits, a, b, "batch: late ambiguous match rejected");
+	edits = jarray();
+	jappend(edits, batchedit(a, "beta", "changed"));
+	jappend(edits, batchedit(a, "beta", "again"));
+	batchreject(edits, a, b, "batch: matches checked against intermediate state");
+
+	edits = jarray();
+	jappend(edits, batchedit(a, "beta", "changed"));
+	jappend(edits, batchedit(missing, "x", "y"));
+	batchreject(edits, a, b, "batch: nonexistent file rejected");
+	st = dirstat(missing);
+	ok(st == nil, "batch: does not create missing file");
+	free(st);
+	edits = jarray();
+	jappend(edits, batchedit("/tmp", "x", "y"));
+	batchreject(edits, a, b, "batch: directory rejected");
+	edits = jarray();
+	jappend(edits, batchedit("relative", "x", "y"));
+	batchreject(edits, a, b, "batch: relative path rejected");
+	edits = jarray();
+	jappend(edits, batchedit(a, "", "y"));
+	batchreject(edits, a, b, "batch: empty old_str rejected");
+	edits = jarray();
+	e = batchedit(a, "beta", "y");
+	jdel(e, "new_str");
+	jappend(edits, e);
+	batchreject(edits, a, b, "batch: missing new_str rejected");
+	edits = jarray();
+	e = batchedit(a, "beta", "y");
+	jset(e, "new_str", jintval(1));
+	jappend(edits, e);
+	batchreject(edits, a, b, "batch: non-string new_str rejected");
+	edits = jarray();
+	jappend(edits, jstring("not an edit"));
+	batchreject(edits, a, b, "batch: non-object edit rejected");
+	batchreject(jarray(), a, b, "batch: empty array rejected");
+	batchreject(jobject(), a, b, "batch: non-array rejected");
+	res = toolbatchreplace("[");
+	ok(res != nil && strncmp(res, "error:", 6) == 0, "batch: malformed JSON rejected");
+	free(res);
+
+	/* Exact edit limit succeeds; one more is rejected before any writes. */
+	edits = jarray();
+	for(i = 0; i < Batchmaxedits; i++)
+		jappend(edits, batchedit(a, "beta", "beta"));
+	res = batchrun(edits);
+	ok(res != nil && strncmp(res, "applied", 7) == 0, "batch: 32 edits accepted");
+	free(res);
+	edits = jarray();
+	for(i = 0; i <= Batchmaxedits; i++)
+		jappend(edits, batchedit(a, "beta", "beta"));
+	batchreject(edits, a, b, "batch: 33 edits rejected");
+
+	big = emalloc(Batchmaxbytes + 2);
+	memset(big, 'x', Batchmaxbytes + 1);
+	big[Batchmaxbytes + 1] = '\0';
+	edits = jarray();
+	jappend(edits, batchedit(a, "beta", big));
+	batchreject(edits, a, b, "batch: excessive output size rejected");
+	if(batchwrite(missing, big)){
+		edits = jarray();
+		jappend(edits, batchedit(a, "beta", "changed"));
+		jappend(edits, batchedit(missing, "x", "y"));
+		batchreject(edits, a, b, "batch: excessive input size rejected");
+	}
+	free(big);
+
+done:
+	remove(a);
+	remove(b);
+	remove(missing);
+	free(a);
+	free(b);
+	free(missing);
+}
+
+static void
+tbatchfilelimit(void)
+{
+	char *paths[Batchmaxfiles + 1], *res;
+	Json *edits;
+	int i, n;
+
+	memset(paths, 0, sizeof paths);
+	n = 0;
+	for(i = 0; i < nelem(paths); i++){
+		paths[i] = esmprint("/tmp/claudetest.batch.limit.%d.%d", getpid(), i);
+		n++;
+		if(!batchwrite(paths[i], "before"))
+			goto done;
+	}
+	edits = jarray();
+	for(i = 0; i < Batchmaxfiles; i++)
+		jappend(edits, batchedit(paths[i], "before", "after"));
+	res = batchrun(edits);
+	ok(res != nil && strncmp(res, "applied", 7) == 0,
+		"batch: 16 distinct files accepted");
+	free(res);
+	for(i = 0; i < Batchmaxfiles; i++){
+		res = toolread(paths[i]);
+		okstr(res, "after", "batch: file at accepted limit edited");
+		free(res);
+	}
+
+	edits = jarray();
+	for(i = 0; i < nelem(paths); i++)
+		jappend(edits, batchedit(paths[i], i < Batchmaxfiles ? "after" : "before", "changed"));
+	res = batchrun(edits);
+	ok(res != nil && strstr(res, "more than 16 files") != nil,
+		"batch: 17 distinct files rejected");
+	free(res);
+	for(i = 0; i < nelem(paths); i++){
+		res = toolread(paths[i]);
+		okstr(res, i < Batchmaxfiles ? "after" : "before",
+			"batch: file limit failure changes no files");
+		free(res);
+	}
+
+done:
+	for(i = 0; i < n; i++){
+		remove(paths[i]);
+		free(paths[i]);
+	}
+}
+
+static void
+tbatchschema(void)
+{
+	Tooldef *td;
+	ToolCall *tc;
+	Json *schema, *prop, *item, *input, *parsed;
+
+	td = findtool("batch_replace");
+	ok(td != nil && td->type == Abatchreplace, "batch: tool lookup");
+	if(td == nil)
+		return;
+	schema = toolschema(td);
+	prop = jget(jget(schema, "properties"), "edits");
+	okstr(jstr(prop, "type"), "array", "batch schema: edits is an array");
+	ok(jint(prop, "minItems") == 1 && jint(prop, "maxItems") == Batchmaxedits,
+		"batch schema: edit count limits");
+	item = jget(prop, "items");
+	okstr(jstr(item, "type"), "object", "batch schema: edits contain objects");
+	ok(jget(item, "required") != nil && jget(item, "required")->nitem == 3,
+		"batch schema: three required fields");
+	jsonfree(schema);
+
+	input = jobject();
+	parsed = jarray();
+	jappend(parsed, batchedit("/tmp/f", "old", ""));
+	jset(input, "edits", parsed);
+	tc = emallocz(sizeof *tc, 1);
+	parseinput(tc, td, input);
+	parsed = jsonparse(tc->args[0]);
+	ok(parsed != nil && parsed->type == Jarray && parsed->nitem == 1,
+		"batch parseinput: structured edits preserved");
+	okstr(jstr(jidx(parsed, 0), "new_str"), "", "batch parseinput: deletion preserved");
+	jsonfree(parsed);
+	jsonfree(input);
+	toolfree(tc);
+}
+
 /* --- claude.c: parent directory creation --- */
 
 static void
@@ -1173,6 +1442,17 @@ twebfetch(void)
 	convfree(c);
 }
 
+/* Count the shared tool definitions, not a hard-coded snapshot. */
+static int
+ntooldefs(void)
+{
+	int n;
+
+	for(n = 0; tooldef(n) != nil; n++)
+		;
+	return n;
+}
+
 /* --- openai.c: request assembly --- */
 
 static void
@@ -1392,7 +1672,7 @@ topenaibuildreq(void)
 	if(req != nil){
 		tools = jget(req, "tools");
 		ok(tools != nil, "openai: tools array present");
-		ok(tools != nil && tools->nitem == 9, "openai: tools array has 9 entries");
+		ok(tools != nil && tools->nitem == ntooldefs(), "openai: tools array matches tool table");
 		if(tools != nil && tools->nitem > 0){
 			t = jidx(tools, 0);
 			okstr(jstr(t, "type"), "function", "openai: tools[0].type=function");
@@ -1981,7 +2261,7 @@ tresponsesbuildreq(void)
 	okstr(jstr(item, "content"), "hello", "responses: user item content");
 
 	tools = jget(req, "tools");
-	ok(tools != nil && tools->nitem == 9, "responses: 9 tools");
+	ok(tools != nil && tools->nitem == ntooldefs(), "responses: tools array matches tool table");
 	if(tools != nil && tools->nitem > 0){
 		t = jidx(tools, 0);
 		okstr(jstr(t, "type"), "function", "responses: tool type");
@@ -2683,6 +2963,9 @@ threadmain(int argc, char **argv)
 	tcancel();
 	treadlimit();
 	treplace();
+	tbatchreplace();
+	tbatchfilelimit();
+	tbatchschema();
 	tmkparents();
 	ttoolman();
 	twebsearch();

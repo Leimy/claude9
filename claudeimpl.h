@@ -19,6 +19,7 @@
 enum {
 	Acreate,	/* tool types */
 	Areplace,
+	Abatchreplace,
 	Aread,
 	Alist,
 	Adelete,
@@ -36,7 +37,8 @@ struct ToolCall {
 	char *id;		/* provider's tool call id */
 	char *name;		/* tool name for display */
 	int type;		/* Acreate, ...; -1 = unknown tool */
-	char *args[Maxargs];	/* values in Tooldef param order; args[0] is the path */
+	char *args[Maxargs];	/* values in Tooldef param order; args[0] is the path
+			 * except batch_replace, whose args[0] is raw edits JSON */
 	char *result;		/* result text after execution */
 	ToolCall *next;
 	ToolCall *bnext;	/* next call in the same hash bucket; see runtools */
@@ -47,7 +49,7 @@ struct ToolCall {
  * exposed to the model lives in claude.c (Tooldef tools[]);
  * providers reach it through tooldef(i).  Each tool takes up
  * to Maxargs string parameters, all required; params[0] is
- * always the path.
+ * normally the path. batch_replace takes an edits array instead.
  */
 typedef struct Toolparam Toolparam;
 struct Toolparam {

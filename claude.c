@@ -163,8 +163,9 @@ provof(Conv *c)
 /*
  * Single source of truth for the tools we expose to the model.
  *
- * Each tool takes up to Maxargs string parameters, all
- * required; params[0] is always the path.  The same table
+ * Most tools take up to Maxargs string parameters, all
+ * required; params[0] is normally the path. batch_replace
+ * instead takes one structured edits array.  The same table
  * drives the JSON schema (toolschema/mktools) and argument
  * extraction (parseinput); ToolCall.args holds the values in
  * params order.  findtool() maps API names to the Acreate/...
@@ -192,6 +193,21 @@ static Tooldef tools[] = {
 		 { "old_str", "The exact text to search for in the file. "
 			"Must match exactly once." },
 		 { "new_str", "The replacement text. Use empty string to delete." }}},
+
+	{ Abatchreplace, "batch_replace",
+		"Apply exact string replacements to existing files in one call. "
+		"Input is an edits array of {path, old_str, new_str} objects. "
+		"Each old_str must occur exactly once in the file state at "
+		"that step; edits to one file run in array order. Validate "
+		"every edit before writing any file. Files are staged before "
+		"installation, but Plan 9 cannot atomically commit several "
+		"files: an I/O or concurrent-change failure during commit "
+		"may leave earlier files changed. Inspect the error and files. "
+		"No commands are executed and no parent directories are created.",
+		{{ "edits", "Array of objects with string fields path, old_str, "
+			"new_str (empty new_str deletes text). Existing regular "
+			"files only; no NUL bytes. Maximum 32 edits, 16 files, "
+			"1 MiB total file contents." }}},
 
 	{ Adelete, "delete_file",
 		"Delete a file.",
@@ -289,9 +305,19 @@ parseinput(ToolCall *tc, Tooldef *td, Json *input)
 
 	for(i = 0; i < Maxargs; i++){
 		s = nil;
-		if(td != nil && td->params[i].name != nil)
-			s = jstr(input, td->params[i].name);
+		if(td != nil && td->params[i].name != nil){
+			if(td->type == Abatchreplace && i == 0){
+				Json *edits;
+				edits = jget(input, "edits");
+				if(edits != nil)
+					s = jsonstr(edits);
+			}
+			else
+				s = jstr(input, td->params[i].name);
+		}
 		tc->args[i] = estrdup(s ? s : "");
+		if(td != nil && td->type == Abatchreplace && i == 0)
+			free(s);
 	}
 }
 
@@ -653,7 +679,31 @@ toolschema(Tooldef *td)
 	req = jarray();
 	for(tp = td->params; tp < td->params + Maxargs && tp->name != nil; tp++){
 		p = jobject();
-		jset(p, "type", jstring("string"));
+		if(td->type == Abatchreplace && tp == td->params){
+			Json *item, *fields, *field, *required;
+			jset(p, "type", jstring("array"));
+			jset(p, "minItems", jintval(1));
+			jset(p, "maxItems", jintval(32));
+			item = jobject();
+			jset(item, "type", jstring("object"));
+			fields = jobject();
+			required = jarray();
+			{
+				char *names[] = { "path", "old_str", "new_str" };
+				int i;
+				for(i = 0; i < nelem(names); i++){
+					field = jobject();
+					jset(field, "type", jstring("string"));
+					jset(fields, names[i], field);
+					jappend(required, jstring(names[i]));
+				}
+			}
+			jset(item, "properties", fields);
+			jset(item, "required", required);
+			jset(item, "additionalProperties", jbool(0));
+			jset(p, "items", item);
+		}else
+			jset(p, "type", jstring("string"));
 		jset(p, "description", jstring(tp->desc));
 		jset(props, tp->name, p);
 		jappend(req, jstring(tp->name));
@@ -1867,6 +1917,175 @@ toolreplace(char *path, char *oldstr, char *newstr)
 }
 
 /*
+ * batch_replace validates the complete edit list in memory before
+ * touching disk. A failure in validation changes nothing. Installation
+ * uses installfile, which is not atomic across files on Plan 9; a late
+ * I/O failure may leave earlier files committed. Report this explicitly.
+ * This tool does not execute commands or create parent directories.
+ */
+enum {
+	Batchmaxedits = 32,
+	Batchmaxfiles = 16,
+	Batchmaxbytes = 1024*1024,
+};
+
+typedef struct Batchfile Batchfile;
+struct Batchfile {
+	char *path;
+	char *original;
+	char *data;
+	long len;
+	int changed;
+};
+
+static void
+batchfree(Batchfile *files, int n)
+{
+	int i;
+
+	for(i = 0; i < n; i++){
+		free(files[i].path);
+		free(files[i].original);
+		free(files[i].data);
+	}
+}
+
+static char*
+toolbatchreplace(char *spec)
+{
+	Batchfile files[Batchmaxfiles];
+	Json *edits, *edit, *v;
+	Dir *d;
+	char *path, *old, *new, *p, *match, *next, *err;
+	char *answer;
+	long total, oldlen, newlen, at;
+	int i, j, nf, fd, count;
+	Fmt f;
+
+	memset(files, 0, sizeof files);
+	nf = 0;
+	edits = jsonparse(spec);
+	if(edits == nil || edits->type != Jarray || edits->nitem < 1
+	|| edits->nitem > Batchmaxedits){
+		jsonfree(edits);
+		return estrdup("error: edits must be an array of 1 to 32 objects; no files changed");
+	}
+	total = 0;
+	for(i = 0; i < edits->nitem; i++){
+		edit = jidx(edits, i);
+		v = jget(edit, "path");
+		path = v != nil && v->type == Jstring ? v->str : nil;
+		v = jget(edit, "old_str");
+		old = v != nil && v->type == Jstring ? v->str : nil;
+		v = jget(edit, "new_str");
+		new = v != nil && v->type == Jstring ? v->str : nil;
+		if(path == nil || path[0] != '/' || old == nil || old[0] == '\0' || new == nil){
+			answer = esmprint("error: edit %d requires absolute path and string old_str (nonempty), new_str; no files changed", i+1);
+			goto fail;
+		}
+		for(j = 0; j < nf && strcmp(files[j].path, path) != 0; j++)
+			;
+		if(j == nf){
+			if(nf == Batchmaxfiles){
+				answer = estrdup("error: more than 16 files; no files changed");
+				goto fail;
+			}
+			d = dirstat(path);
+			if(d == nil || (d->qid.type & QTDIR)){
+				free(d);
+				answer = esmprint("error: edit %d: %s is not an existing regular file; no files changed", i+1, path);
+				goto fail;
+			}
+			if(d->length < 0 || d->length > Batchmaxbytes - total){
+				free(d);
+				answer = estrdup("error: total file contents exceed 1 MiB; no files changed");
+				goto fail;
+			}
+			free(d);
+			fd = open(path, OREAD);
+			if(fd < 0){
+				answer = esmprint("error: open %s: %r; no files changed", path);
+				goto fail;
+			}
+			files[nf].path = estrdup(path);
+			nf++;
+			files[j].original = readfilelimit(fd, Batchmaxbytes - total + 1, &count);
+			close(fd);
+			if(files[j].original == nil || count
+			|| strlen(files[j].original) > Batchmaxbytes - total){
+				answer = esmprint("error: read %s failed or exceeded 1 MiB total; no files changed", path);
+				goto fail;
+			}
+			files[j].len = strlen(files[j].original);
+			files[j].data = estrdup(files[j].original);
+			total += files[j].len;
+		}
+		oldlen = strlen(old);
+		newlen = strlen(new);
+		count = 0;
+		match = nil;
+		for(p = files[j].data; (p = strstr(p, old)) != nil; p += oldlen){
+			if(count++ == 0)
+				match = p;
+		}
+		if(count != 1){
+			answer = esmprint("error: edit %d: old_str matches %d times in %s; no files changed", i+1, count, path);
+			goto fail;
+		}
+		at = match - files[j].data;
+		if(newlen > Batchmaxbytes - total + oldlen){
+			answer = estrdup("error: resulting contents exceed 1 MiB; no files changed");
+			goto fail;
+		}
+		next = emalloc(files[j].len - oldlen + newlen + 1);
+		memmove(next, files[j].data, at);
+		memmove(next + at, new, newlen);
+		memmove(next + at + newlen, match + oldlen,
+			files[j].len - at - oldlen);
+		files[j].len += newlen - oldlen;
+		next[files[j].len] = '\0';
+		total += newlen - oldlen;
+		free(files[j].data);
+		files[j].data = next;
+		files[j].changed++;
+	}
+	/* Recheck all originals before the first write. No global lock
+	 * protects external writers between this check and installation. */
+	for(j = 0; j < nf; j++){
+		fd = open(files[j].path, OREAD);
+		if(fd < 0){
+			answer = esmprint("error: re-open %s: %r; no files changed", files[j].path);
+			goto fail;
+		}
+		p = readfilelimit(fd, Batchmaxbytes + 1, &count);
+		close(fd);
+		if(p == nil || count || strcmp(p, files[j].original) != 0){
+			free(p);
+			answer = esmprint("error: %s changed during validation; no files changed", files[j].path);
+			goto fail;
+		}
+		free(p);
+	}
+	for(j = 0; j < nf; j++){
+		err = installfile(files[j].path, files[j].data, files[j].len);
+		if(err != nil){
+			answer = esmprint("error: commit %s: %s; %d earlier file(s) may have changed; inspect files", files[j].path, err, j);
+			free(err);
+			goto fail;
+		}
+	}
+	fmtstrinit(&f);
+	fmtprint(&f, "applied %d edits to %d files", edits->nitem, nf);
+	for(j = 0; j < nf; j++)
+		fmtprint(&f, "\n%s: %d edits", files[j].path, files[j].changed);
+	answer = fmtstrflush(&f);
+fail:
+	batchfree(files, nf);
+	jsonfree(edits);
+	return answer;
+}
+
+/*
  * web_search: scrape a search engine's result page through
  * webfs and return a list of (title, URL) pairs.  There is no
  * search API that works without a key and without cost, so
@@ -2550,6 +2769,9 @@ exectool(Conv *c, ToolCall *tc)
 	case Areplace:
 		return toolreplace(path, tc->args[1], tc->args[2]);
 
+	case Abatchreplace:
+		return toolbatchreplace(path);
+
 	case Adelete:
 		if(remove(path) < 0)
 			return esmprint("error: remove %s: %r", path);
@@ -2719,10 +2941,13 @@ runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	Toolwork *w;
 	Channel *done;
 	char marker[256];
-	int n, nb, nw, i;
+	int n, nb, nw, i, hasbatch;
 
+	hasbatch = 0;
 	n = 0;
 	for(tc = calls; tc != nil; tc = tc->next){
+		if(tc->type == Abatchreplace)
+			hasbatch = 1;
 		if(cb != nil){
 			snprint(marker, sizeof marker,
 				"\n[running %s %s]\n",
@@ -2733,8 +2958,11 @@ runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	}
 	if(n == 0)
 		return;
-	if(n == 1){
-		calls->result = exectool(c, calls);
+	if(n == 1 || hasbatch){
+		/* A batch names multiple paths. Until there is cross-path
+		 * scheduling, serialize the entire turn to avoid races. */
+		for(tc = calls; tc != nil; tc = tc->next)
+			tc->result = exectool(c, tc);
 		return;
 	}
 
