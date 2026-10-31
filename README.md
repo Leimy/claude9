@@ -348,6 +348,14 @@ that server performs no auth -- Ollama's OpenAI-compatible endpoint
 	echo llama3 > /mnt/claude/$n/model
 	echo 'http://<mac-host>:11434/v1/chat/completions' > /mnt/claude/$n/baseurl
 
+In claudetalk the same three settings are one line; `-b` writes the
+session's `baseurl` (only if it does not already have one, so it
+does not clobber an existing override; `-P` and `-M` are server
+defaults for the fresh session, and `/provider`, `/model`, and
+`/baseurl` still change any of them later):
+
+	claudetalk -P openai -M llama3 -b 'http://<mac-host>:11434/v1/chat/completions'
+
 With `$OPENAI_API_KEY` unset, claude9fs sends the request with no
 `Authorization` header at all, rather than a malformed empty bearer
 token.  If `baseurl` is later pointed back at real api.openai.com
@@ -1241,7 +1249,7 @@ regular files are read.
 ## claudetalk - rc Shell Client
 
 	claudetalk [-d] [-g] [-a session] [-M model] [-P provider]
-	           [-t maxtokens] [-K skillsdir] [-n namepath]
+	           [-t maxtokens] [-K skillsdir] [-n namepath] [-b baseurl]
 
 Flags:
 
@@ -1253,6 +1261,8 @@ Flags:
 	-t n      positive default max tokens (passed through to claude9fs)
 	-K dir    skills directory (passed through to claude9fs)
 	-n path   name-server path (passed through to claude9fs)
+	-b url    set the session's endpoint override (baseurl) at startup;
+	          applied only if the session does not already have one
 
 When starting a new session without `-a`, supplying any server option
 (`-M`, `-P`, `-t`, `-K`, or `-n`) replaces already-posted main and
@@ -1278,7 +1288,8 @@ file in the background while writing to `prompt`.
 	/provider      show current provider
 	/provider <p>  switch provider (anthropic, openai, or responses)
 	/baseurl       show endpoint override
-	/baseurl <url> set endpoint override; '-' clears it
+	/baseurl <url> set endpoint override; '-' clears it (the -b
+	               startup flag does the same, once, if unset)
 	/advisor       show Anthropic advisor setting
 	/advisor off   disable it
 	/advisor <model> [max_uses=N] [max_tokens=N] [cache=5m|1h]

@@ -2873,6 +2873,93 @@ pathhash(char *path)
 	return h;
 }
 
+/*
+ * The "[running tool arg]" line the stream shows before a tool
+ * call runs.  args[0] is the path for every tool except
+ * batch_replace, whose args[0] is the raw edits JSON; a
+ * truncated blob of that tells the user nothing, so summarize
+ * it instead as the distinct paths named, each with its edit
+ * count when more than one.  This is the only place the user
+ * learns which files a batch touches, since the result text
+ * is for the model.  An unparsable edits argument is reported
+ * as such; toolbatchreplace produces the real error.
+ */
+static void
+runmarker(ToolCall *tc, void (*cb)(char*, void*), void *aux)
+{
+	Fmt f;
+	Json *edits;
+	char *s, *path, *p, marker[256];
+	int i, j, n, seen;
+
+	if(tc->type != Abatchreplace){
+		snprint(marker, sizeof marker, "\n[running %s %s]\n",
+			tc->name, tc->args[0]);
+		cb(marker, aux);
+		return;
+	}
+	fmtstrinit(&f);
+	fmtprint(&f, "\n[running %s:", tc->name);
+	edits = jsonparse(tc->args[0]);
+	if(edits == nil || edits->type != Jarray)
+		fmtprint(&f, " unparsable edits");
+	else{
+		fmtprint(&f, " %d edit%s:", edits->nitem,
+			edits->nitem == 1 ? "" : "s");
+		for(i = 0; i < edits->nitem; i++){
+			path = jstr(jidx(edits, i), "path");
+			if(path == nil)
+				continue;
+			/* report each path once, at its first edit */
+			seen = 0;
+			n = 0;
+			for(j = 0; j < edits->nitem; j++){
+				p = jstr(jidx(edits, j), "path");
+				if(p == nil || strcmp(p, path) != 0)
+					continue;
+				if(j < i){
+					seen = 1;
+					break;
+				}
+				n++;
+			}
+			if(seen)
+				continue;
+			fmtprint(&f, " %s", path);
+			if(n > 1)
+				fmtprint(&f, " (%d)", n);
+		}
+	}
+	jsonfree(edits);
+	fmtprint(&f, "]\n");
+	s = fmtstrflush(&f);
+	cb(s, aux);
+	free(s);
+}
+
+/*
+ * Shown after a batch_replace has run.  Every other tool's
+ * outcome is visible from its running line and what the model
+ * does next, but a batch either changes every named file,
+ * none (validation failed), or -- on a commit failure -- some
+ * of them, and only the result's first line says which.
+ * Results of other tools are not echoed: read_file and mk
+ * output would swamp the stream.
+ */
+static void
+donemarker(ToolCall *tc, void (*cb)(char*, void*), void *aux)
+{
+	char *s, *nl, marker[256];
+
+	if(tc->type != Abatchreplace)
+		return;
+	s = tc->result != nil ? tc->result : "ok";
+	nl = strchr(s, '\n');
+	snprint(marker, sizeof marker, "\n[%s: %.*s]\n", tc->name,
+		nl != nil ? (int)(nl - s) : (int)strlen(s), s);
+	cb(marker, aux);
+}
+
 /* one bucket of exectool() calls running in its own proc; see runtools */
 typedef struct Toolwork Toolwork;
 struct Toolwork {
@@ -2940,7 +3027,6 @@ runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	ToolCall *tc, **bucket, **btail;
 	Toolwork *w;
 	Channel *done;
-	char marker[256];
 	int n, nb, nw, i, hasbatch;
 
 	hasbatch = 0;
@@ -2948,12 +3034,8 @@ runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	for(tc = calls; tc != nil; tc = tc->next){
 		if(tc->type == Abatchreplace)
 			hasbatch = 1;
-		if(cb != nil){
-			snprint(marker, sizeof marker,
-				"\n[running %s %s]\n",
-				tc->name, tc->args[0]);
-			cb(marker, aux);
-		}
+		if(cb != nil)
+			runmarker(tc, cb, aux);
 		n++;
 	}
 	if(n == 0)
@@ -2961,8 +3043,11 @@ runtools(Conv *c, ToolCall *calls, void (*cb)(char*, void*), void *aux)
 	if(n == 1 || hasbatch){
 		/* A batch names multiple paths. Until there is cross-path
 		 * scheduling, serialize the entire turn to avoid races. */
-		for(tc = calls; tc != nil; tc = tc->next)
+		for(tc = calls; tc != nil; tc = tc->next){
 			tc->result = exectool(c, tc);
+			if(cb != nil)
+				donemarker(tc, cb, aux);
+		}
 		return;
 	}
 

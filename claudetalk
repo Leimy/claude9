@@ -8,7 +8,7 @@
 # start (rm /srv/claude /srv/claudesub to stop them); on exit
 # the session is hung up unless -d.
 #
-# usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath]
+# usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath] [-b baseurl]
 #   -a name       attach to existing session (skip server startup)
 #   -d            detach on exit: leave the session alive
 #   -g            also pop up a claudegraph window on the session graph
@@ -24,6 +24,9 @@
 #   -t maxtokens  default max tokens for claude9fs
 #   -K skillsdir  skills directory for claude9fs
 #   -n namepath   name server path for claude9fs
+#   -b baseurl    set this session's endpoint override at startup (its baseurl,
+#                 applied only if the session does not already have one; the
+#                 same write /baseurl <url> performs)
 #
 # Interrupting: DEL used to hang up the session and exit.  It now
 # cancels the reply in progress and returns to the prompt with the
@@ -61,9 +64,9 @@
 
 rfork e
 
-flagfmt='a:attach session,d:detach,g:graph,M:model name,P:provider name,t:maxtokens n,K:skills dir,n:namepath path'
+flagfmt='a:attach session,d:detach,g:graph,M:model name,P:provider name,t:maxtokens n,K:skills dir,n:namepath path,b:baseurl url'
 if(! ifs=() eval `{aux/getflags $*}){
-	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath]' >[1=2]
+	echo 'usage: claudetalk [-d] [-g] [-a session] [-M model] [-P provider] [-t maxtokens] [-K skillsdir] [-n namepath] [-b baseurl]' >[1=2]
 	exit usage
 }
 
@@ -730,6 +733,23 @@ fn setget {
 	}
 }
 
+# -b baseurl: apply the startup endpoint to this session's baseurl file,
+# but only if it does not already have one.  Reuses setget so the
+# confirmation line is exactly what /baseurl <url> would print.  A session
+# that already has a baseurl is left alone with a note, so reattaching with
+# -b (claudetalk -a name -b url) does not silently retarget a session that
+# was pointed somewhere on purpose.  $1 is the URL.  Kept as its own
+# function so tests-claudetalk.rc can drive it.
+fn applybaseurl {
+	cur=`{cat $sess/baseurl}
+	if(~ $#cur 0)
+		setget $sess/baseurl baseurl $1
+	if not
+		echo 'baseurl already set: '$cur' (use /baseurl to change)' >[1=2]
+}
+if(! ~ $#baseurl 0)
+	applybaseurl $baseurl
+
 # /effort [level]: show or set the session's reasoning effort.
 # No argument shows it; one argument is written to the effort
 # file verbatim -- claude9fs is the single authority on which
@@ -952,7 +972,7 @@ fn docmd {
 		echo '                 on newer OpenAI reasoning models -- openai switches' >[1=2]
 		echo '                 to it automatically when the server insists);' >[1=2]
 		echo '                 switch /model too - model names are per-provider' >[1=2]
-		echo '  /baseurl       show endpoint URL override' >[1=2]
+		echo '  /baseurl       show endpoint URL override (the -b flag sets it at startup, once)' >[1=2]
 		echo '  /baseurl <url> point an openai-compatible server (llama.cpp, vllm, ...)' >[1=2]
 		echo '  /baseurl -     clear the override (back to provider default)' >[1=2]
 		echo '  /advisor       show Anthropic server-side advisor setting' >[1=2]

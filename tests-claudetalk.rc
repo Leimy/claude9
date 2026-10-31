@@ -1,14 +1,15 @@
 #!/bin/rc
 # tests-claudetalk.rc - tests for claudetalk's /effort, /reqlog,
-# and /requests commands.  Run from the source directory:
+# /requests commands, and the -b baseurl startup flag.  Run from
+# the source directory:
 #
 #	rc tests-claudetalk.rc [path/to/claudetalk]
 #
-# No claude9fs is needed: the setget, effortcmd, reqlogcmd,
-# requestscmd, and docmd functions are extracted from claudetalk
-# (each is an rc "fn" ending in a "}" in column 0) and driven
-# against a fake session directory whose effort, ctl, and
-# requests files are plain files.  A plain
+# No claude9fs is needed: the setget, applybaseurl, effortcmd,
+# reqlogcmd, requestscmd, and docmd functions are extracted from
+# claudetalk (each is an rc "fn" ending in a "}" in column 0) and
+# driven against a fake session directory whose effort, baseurl,
+# ctl, and requests files are plain files.  A plain
 # file accepts any value, so this checks only what claudetalk
 # writes (and when it writes nothing); which levels the server
 # accepts is checked by the effortlevel tests in tests.c.
@@ -23,11 +24,11 @@ if(! ~ $#* 0)
 	src=$1
 tmp=/tmp/claudetalk.test.$pid
 mkdir -p $tmp/sess
-sed -n -e '/^fn setget /,/^}/p' -e '/^fn effortcmd /,/^}/p' \
-	-e '/^fn reqlogcmd /,/^}/p' -e '/^fn requestscmd /,/^}/p' \
-	-e '/^fn docmd /,/^}/p' $src > $tmp/fns
+sed -n -e '/^fn setget /,/^}/p' -e '/^fn applybaseurl /,/^}/p' \
+	-e '/^fn effortcmd /,/^}/p' -e '/^fn reqlogcmd /,/^}/p' \
+	-e '/^fn requestscmd /,/^}/p' -e '/^fn docmd /,/^}/p' $src > $tmp/fns
 . $tmp/fns
-for(f in setget effortcmd reqlogcmd requestscmd docmd){
+for(f in setget applybaseurl effortcmd reqlogcmd requestscmd docmd){
 	if(! whatis $f >/dev/null >[2]/dev/null){
 		echo 'FAIL: could not extract fn '$f' from '$src >[1=2]
 		rm -rf $tmp
@@ -173,6 +174,29 @@ check '/requests on an empty log' $"out '(no requests recorded for the last prom
 
 out=`{docmd /requests >[2=1]}
 check 'docmd /requests' $"out '(no requests recorded for the last prompt)'
+
+# --- -b baseurl startup flag.  A fresh session's baseurl file
+# reads empty, like the real server (wrbaseurl: nil or "-" means
+# provider default), so "no override" is the empty file.
+fn baseurlfile {
+	got=`{cat $sess/baseurl}
+}
+echo -n > $sess/baseurl
+out=`{applybaseurl http://host:9931/v1/chat/completions >[2=1]}
+baseurlfile
+check '-b on an unset baseurl writes the url' $"got 'http://host:9931/v1/chat/completions'
+check '-b on an unset baseurl reports it' $"out 'baseurl: http://host:9931/v1/chat/completions'
+
+# /baseurl is the same write; it overrides whatever -b left
+docmd /baseurl http://other:1234/v1/chat/completions >[2]/dev/null
+baseurlfile
+check '/baseurl after -b wins' $"got 'http://other:1234/v1/chat/completions'
+
+# a session that already has an override is left alone
+out=`{applybaseurl http://flag:1/v1 >[2=1]}
+baseurlfile
+check '-b does not clobber an existing baseurl' $"got 'http://other:1234/v1/chat/completions'
+check '-b on a set baseurl says so' $"out 'baseurl already set: http://other:1234/v1/chat/completions (use /baseurl to change)'
 
 rm -rf $tmp
 if(! ~ $#nfail 0){
